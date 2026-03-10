@@ -9,6 +9,7 @@ The model learns to:
 3. Structure answers clearly
 
 Uses Qwen2.5-0.5B-Instruct for fast CPU training.
+CPU thread control is enabled for efficient MacBook Pro training.
 """
 
 import re
@@ -124,6 +125,7 @@ def main():
     print("\nInitializing FlashRL trainer...")
     print(f"Model: Qwen/Qwen2.5-0.5B-Instruct")
     print(f"Prompts: {len(REASONING_PROMPTS)}")
+    print(f"CPU threads: 4 (limited for efficient MacBook Pro training)")
 
     flashrl = FlashRL(
         model="Qwen/Qwen2.5-0.5B-Instruct",
@@ -132,6 +134,7 @@ def main():
         learning_rate=1e-5,
         batch_size=4,
         max_epochs=3,
+        num_threads=4,  # Limit CPU usage for efficient MacBook Pro training
     )
 
     # Prepare dataset

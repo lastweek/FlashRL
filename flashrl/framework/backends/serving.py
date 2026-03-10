@@ -4,6 +4,7 @@ from typing import Any
 
 from flashrl.framework.config import ModelConfig
 from flashrl.framework.models.actor import ActorModel
+from flashrl.framework.models.device import set_num_threads
 
 
 class ServingBackend:
@@ -20,6 +21,10 @@ class ServingBackend:
             config: Model configuration.
         """
         self.config = config
+
+        # Set CPU thread limit before loading model
+        set_num_threads(config.num_threads)
+
         self.actor = ActorModel(config)
         self.actor.eval()  # Always in eval mode
 

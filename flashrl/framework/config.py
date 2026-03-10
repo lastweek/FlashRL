@@ -38,6 +38,7 @@ class ModelConfig(BaseModel):
     max_length: int = 2048
     load_in_8bit: bool = False
     trust_remote_code: bool = False
+    num_threads: int | None = None  # None = use all available cores
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     @classmethod

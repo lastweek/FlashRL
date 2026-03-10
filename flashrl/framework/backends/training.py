@@ -4,6 +4,7 @@ import torch
 
 from flashrl.framework.config import ModelConfig
 from flashrl.framework.models.actor import ActorModel
+from flashrl.framework.models.device import set_num_threads
 
 
 class TrainingBackend:
@@ -21,6 +22,10 @@ class TrainingBackend:
             learning_rate: Learning rate for optimizer.
         """
         self.config = config
+
+        # Set CPU thread limit before loading model
+        set_num_threads(config.num_threads)
+
         self.actor = ActorModel(config)
         self.actor.train()  # Always in training mode
         self.optimizer = torch.optim.Adam(
