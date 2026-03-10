@@ -65,14 +65,45 @@ class GRPOTrainer(BaseTrainer):
             self.current_epoch = epoch
             print(f"Epoch {epoch + 1}/{self.config.max_epochs}")
 
-            # TODO: Proper data loading and batching
-            # For now, assume dataset is list of prompts
-            for prompts in self._batch_prompts(dataset):
-                batch = self._create_batch(prompts)
-                metrics = self.step(batch)
+            # Batch the dataset
+            batch_size = self.config.batch_size
+            for i in range(0, len(dataset), batch_size):
+                prompts = dataset[i : i + batch_size]
 
+                # Generate rollouts using serving backend
+                rollouts = self.rollout_generator.generate(prompts)
+
+                # Compute rewards for each rollout
+                rewards = [self.reward_fn.compute(r) for r in rollouts]
+
+                # Create training batch
+                batch = TrainingBatch(
+                    prompts=prompts,
+                    conversations=[r.conversation for r in rollouts],
+                    rollouts=rollouts,
+                    rewards=rewards,
+                )
+
+                # Compute group-based advantages
+                reward_values = torch.tensor(
+                    [r.reward for r in rewards],
+                    dtype=torch.float32,
+                )
+                mean = reward_values.mean()
+                std = reward_values.std(dim=0, keepdim=True)
+                advantages = (reward_values - mean) / (std + 1e-8)
+
+                # Compute GRPO loss
+                loss_dict = self._compute_grpo_loss(batch, advantages)
+
+                # Optimization step
+                self.training_backend.optimizer.zero_grad()
+                loss_dict["loss"].backward()
+                self.training_backend.optimizer.step()
+
+                # Log progress
                 if self.total_steps % 10 == 0:
-                    print(f"Step {self.total_steps}: loss={metrics.get('loss', 0):.4f}")
+                    print(f"Step {self.total_steps}: loss={loss_dict['loss'].item():.4f}")
 
                 self.total_steps += 1
 
