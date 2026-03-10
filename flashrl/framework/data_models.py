@@ -1,0 +1,84 @@
+"""Core data models used across all components."""
+
+from typing import Any
+from pydantic import BaseModel, Field
+
+
+class Prompt(BaseModel):
+    """Input prompt for the system."""
+
+    text: str
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Message(BaseModel):
+    """A single message in a conversation."""
+
+    role: str  # "user", "assistant", "system", "tool"
+    content: str
+    tool_calls: list["ToolCall"] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ToolCall(BaseModel):
+    """A tool invocation request."""
+
+    name: str
+    arguments: dict[str, Any]
+    tool_id: str | None = None
+
+
+class ToolResult(BaseModel):
+    """Output from tool execution."""
+
+    content: str
+    error: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class Conversation(BaseModel):
+    """An ordered list of messages (multi-turn)."""
+
+    messages: list[Message]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def add_message(self, message: Message) -> None:
+        """Add a message to the conversation."""
+        self.messages.append(message)
+
+    def last_user_message(self) -> Message | None:
+        """Get the last user message."""
+        for msg in reversed(self.messages):
+            if msg.role == "user":
+                return msg
+        return None
+
+
+class RolloutOutput(BaseModel):
+    """Output from rollout generation."""
+
+    text: str
+    log_prob: float
+    conversation: Conversation
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class RewardOutput(BaseModel):
+    """Reward signal and metadata."""
+
+    reward: float
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class TrainingBatch(BaseModel):
+    """Batch of data for a training step."""
+
+    prompts: list[Prompt]
+    conversations: list[Conversation]
+    rollouts: list[RolloutOutput]
+    rewards: list[RewardOutput]
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def __len__(self) -> int:
+        """Return batch size."""
+        return len(self.prompts)
