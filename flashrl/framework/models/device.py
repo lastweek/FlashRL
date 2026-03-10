@@ -32,7 +32,7 @@ def get_device(device: str | None = None) -> torch.device:
     return DEFAULT_DEVICE
 
 
-def set_num_threads(num_threads: int | None) -> None:
+def set_num_threads(num_threads: int | None = None) -> None:
     """Set the number of CPU threads PyTorch uses.
 
     This controls PyTorch's CPU parallelism and can help limit CPU usage

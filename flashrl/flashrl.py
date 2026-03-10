@@ -52,7 +52,7 @@ class FlashRL:
             learning_rate=1e-5,
             batch_size=4,
             max_epochs=2,
-            num_threads=4,  # Limit CPU usage (useful for MacBook Pro)
+            num_threads=4,  # Use 4 CPU threads for faster training
         )
 
         dataset = [Prompt(text=p) for p in my_prompts]
@@ -70,7 +70,7 @@ class FlashRL:
         kl_coefficient: float = 0.1,
         device: str | None = None,
         max_length: int = 2048,
-        num_threads: int | None = None,
+        num_threads: int = 1,
     ) -> None:
         """Initialize FlashRL trainer.
 
@@ -86,8 +86,8 @@ class FlashRL:
             kl_coefficient: KL divergence penalty coefficient.
             device: Device to use (None = auto-detect).
             max_length: Maximum sequence length.
-            num_threads: Number of CPU threads to use (None = all available cores).
-                Useful for limiting CPU usage on systems with many cores.
+            num_threads: Number of CPU threads to use (default: 1).
+                Increase for faster training on multi-core systems.
         """
         # Store user functions
         self.rollout_fn = rollout_fn
