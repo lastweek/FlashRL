@@ -6,6 +6,9 @@ import torch
 # Default device (auto-detected on import)
 DEFAULT_DEVICE = None
 
+# Track whether interop threads have been set (can only be set once)
+_INTEROP_THREADS_SET = False
+
 
 def get_device(device: str | None = None) -> torch.device:
     """Get the best available device.
@@ -42,8 +45,17 @@ def set_num_threads(num_threads: int | None = None) -> None:
     Args:
         num_threads: Number of threads to use. None uses all available cores.
     """
+    global _INTEROP_THREADS_SET
+
     if num_threads is not None:
         torch.set_num_threads(num_threads)
-        torch.set_num_interop_threads(max(1, num_threads // 2))
+        # Interop threads can only be set once per process
+        if not _INTEROP_THREADS_SET:
+            try:
+                torch.set_num_interop_threads(max(1, num_threads // 2))
+                _INTEROP_THREADS_SET = True
+            except RuntimeError:
+                # Already set, ignore
+                _INTEROP_THREADS_SET = True
         os.environ["OMP_NUM_THREADS"] = str(num_threads)
         os.environ["MKL_NUM_THREADS"] = str(num_threads)
