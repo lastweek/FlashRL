@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import time
 from typing import TYPE_CHECKING, Any, Callable
 
 from flashrl.framework.backends.serving import ServingBackend
@@ -91,91 +90,24 @@ class FlashRL:
         self._initialize_runtime()
 
     def _initialize_runtime(self) -> None:
-        """Build the one-time runtime object graph eagerly."""
-        startup_started_at = time.perf_counter()
-        bootstrap_events: list[dict[str, Any]] = [
-            {
-                "component": "training_backend",
-                "status": "started",
-                "cpu_threads": self.model_config.num_threads,
-            }
-        ]
-        bootstrap_totals: dict[str, float] = {}
-
-        training_started_at = time.perf_counter()
+        """Initialize training and serving backends, and reference model if needed."""
+        # Create training and serving backends
         self._training_backend = TrainingBackend(
             self.model_config,
             learning_rate=self.trainer_config.learning_rate,
         )
-        training_duration = time.perf_counter() - training_started_at
-        bootstrap_totals["startup_training_backend_seconds"] = training_duration
-        bootstrap_events.append(
-            {
-                "component": "training_backend",
-                "status": "completed",
-                "device": str(self._training_backend.actor.device),
-                "cpu_threads": self.model_config.num_threads,
-                "duration_seconds": training_duration,
-            }
-        )
-        bootstrap_events.append(
-            {
-                "component": "serving_backend",
-                "status": "started",
-                "cpu_threads": self.model_config.num_threads,
-            }
-        )
-
-        serving_started_at = time.perf_counter()
         self._serving_backend = ServingBackend(self.model_config)
-        serving_duration = time.perf_counter() - serving_started_at
-        bootstrap_totals["startup_serving_backend_seconds"] = serving_duration
-        bootstrap_events.append(
-            {
-                "component": "serving_backend",
-                "status": "completed",
-                "device": str(self._serving_backend.actor.device),
-                "cpu_threads": self.model_config.num_threads,
-                "duration_seconds": serving_duration,
-            }
-        )
 
+        # Create reference model if enabled
         if self.reference_enabled:
             reference_config = self.model_config.model_copy(
-                update={
-                    "device": self.reference_device or self.model_config.device,
-                }
+                update={"device": self.reference_device or self.model_config.device}
             )
-            bootstrap_events.append(
-                {
-                    "component": "reference_model",
-                    "status": "started",
-                    "cpu_threads": reference_config.num_threads,
-                }
-            )
-            reference_started_at = time.perf_counter()
             self._reference = ReferenceModel(reference_config)
-            reference_duration = time.perf_counter() - reference_started_at
-            bootstrap_totals["startup_reference_model_seconds"] = reference_duration
-            bootstrap_events.append(
-                {
-                    "component": "reference_model",
-                    "status": "completed",
-                    "device": str(self._reference.device),
-                    "cpu_threads": reference_config.num_threads,
-                    "duration_seconds": reference_duration,
-                }
-            )
         else:
             self._reference = None
 
-        bootstrap_totals["startup_total_seconds"] = time.perf_counter() - startup_started_at
-        self._runtime_bootstrap_events = bootstrap_events
-        self._runtime_bootstrap_totals = bootstrap_totals
-
-        assert self._serving_backend is not None
-        assert self._training_backend is not None
-
+        # Create rollout and reward wrappers
         self._rollout_generator = UserDefinedRollout(
             rollout_fn=self.rollout_fn,
             actor=self._serving_backend.actor,
@@ -185,6 +117,8 @@ class FlashRL:
             reward_fn=self.reward_fn,
             config=self.reward_config,
         )
+
+        # Create trainer
         self._trainer = GRPOTrainer(
             config=self.trainer_config,
             training_backend=self._training_backend,
@@ -194,21 +128,6 @@ class FlashRL:
             rollout_generator=self._rollout_generator,
             run_logger=None,
         )
-
-    def _replay_runtime_bootstrap_logs(self) -> None:
-        """Replay cached runtime bootstrap events into the current run logger."""
-        if self._run_logger is None:
-            return
-        for event in self._runtime_bootstrap_events:
-            self._run_logger.log_model_load(
-                event["component"],
-                event["status"],
-                {
-                    key: value
-                    for key, value in event.items()
-                    if key not in {"component", "status"}
-                },
-            )
 
     def train(self, dataset: list[Prompt]) -> None:
         """Train on dataset."""
@@ -237,7 +156,6 @@ class FlashRL:
             reference_enabled=self.reference_enabled,
             reference_device=self.reference_device or self.model_config.device or "auto",
         )
-        self._replay_runtime_bootstrap_logs()
 
         status = "completed"
         assert self._trainer is not None

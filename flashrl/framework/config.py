@@ -6,7 +6,23 @@ import yaml
 from pydantic import BaseModel, Field
 
 
-class TrainerConfig(BaseModel):
+class BaseConfig(BaseModel):
+    """Base configuration class with common loading methods."""
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "BaseConfig":
+        """Load config from YAML file."""
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "BaseConfig":
+        """Load config from dictionary."""
+        return cls(**data)
+
+
+class TrainerConfig(BaseConfig):
     """Configuration for the trainer."""
 
     learning_rate: float = 1e-5
@@ -16,20 +32,8 @@ class TrainerConfig(BaseModel):
     gamma: float = 1.0  # Discount factor
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "TrainerConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "TrainerConfig":
-        """Load config from dictionary."""
-        return cls(**data)
-
-
-class ModelConfig(BaseModel):
+class ModelConfig(BaseConfig):
     """Configuration for model loading."""
 
     model_name: str
@@ -41,20 +45,8 @@ class ModelConfig(BaseModel):
     num_threads: int = 1  # Default to 1 CPU thread
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "ModelConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "ModelConfig":
-        """Load config from dictionary."""
-        return cls(**data)
-
-
-class RolloutConfig(BaseModel):
+class RolloutConfig(BaseConfig):
     """Configuration for rollout generation."""
 
     max_new_tokens: int = 512
@@ -65,20 +57,8 @@ class RolloutConfig(BaseModel):
     num_return_sequences: int = 1
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "RolloutConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RolloutConfig":
-        """Load config from dictionary."""
-        return cls(**data)
-
-
-class RewardConfig(BaseModel):
+class RewardConfig(BaseConfig):
     """Configuration for reward computation."""
 
     reward_model_name: str | None = None
@@ -86,20 +66,8 @@ class RewardConfig(BaseModel):
     normalize: bool = False
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "RewardConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
 
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "RewardConfig":
-        """Load config from dictionary."""
-        return cls(**data)
-
-
-class LoggingConfig(BaseModel):
+class LoggingConfig(BaseConfig):
     """Configuration for run logging and terminal UX."""
 
     level: str = "INFO"
@@ -109,15 +77,3 @@ class LoggingConfig(BaseModel):
     console: bool = True
     file: bool = True
     rich_progress: bool = False
-
-    @classmethod
-    def from_yaml(cls, path: str | Path) -> "LoggingConfig":
-        """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        return cls(**data)
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "LoggingConfig":
-        """Load config from dictionary."""
-        return cls(**data)
