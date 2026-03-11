@@ -117,16 +117,6 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
 
 def main():
     """Train a model to use reasoning format."""
-    print("=" * 60)
-    print("DeepSeek-R1 Style Reasoning Training")
-    print("=" * 60)
-
-    # Create FlashRL trainer
-    print("\nInitializing FlashRL trainer...")
-    print(f"Model: Qwen/Qwen2.5-0.5B-Instruct")
-    print(f"Prompts: {len(REASONING_PROMPTS)}")
-    print(f"CPU threads: 4")
-
     flashrl = FlashRL(
         model="Qwen/Qwen2.5-0.5B-Instruct",
         rollout_fn=reasoning_rollout_fn,
@@ -134,29 +124,19 @@ def main():
         learning_rate=1e-5,
         batch_size=4,
         max_epochs=3,
-        num_threads=4,  # Use 4 CPU threads for faster training
+        # The local tutorial path keeps the frozen reference model disabled by
+        # default so Mac runs stay lighter. Enable it only for KL-regularized GRPO.
+        reference_enabled=False,
     )
 
     # Prepare dataset
     dataset = [Prompt(text=p) for p in REASONING_PROMPTS]
 
-    # Train
-    print("\nStarting training...")
-    print("The model will learn to use <reason> tags for step-by-step reasoning.\n")
-
     try:
         flashrl.train(dataset)
 
-        # Save checkpoint
         checkpoint_path = "/tmp/flashrl_reasoning_checkpoint.pt"
-        print(f"\nSaving checkpoint to {checkpoint_path}")
         flashrl.save_checkpoint(checkpoint_path)
-
-        print("\n" + "=" * 60)
-        print("✓ Training complete!")
-        print("=" * 60)
-        print("\nThe model has been trained to use <reason> tags.")
-        print("You can now use it to generate reasoning responses.")
 
     except Exception as e:
         print(f"\n✗ Error during training: {e}")

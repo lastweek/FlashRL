@@ -3,6 +3,7 @@
 from flashrl.framework.backends.training import TrainingBackend
 from flashrl.framework.backends.serving import ServingBackend
 from flashrl.framework.config import (
+    LoggingConfig,
     ModelConfig,
     RewardConfig,
     RolloutConfig,
@@ -25,6 +26,7 @@ __all__ = [
     "ModelConfig",
     "RolloutConfig",
     "RewardConfig",
+    "LoggingConfig",
     # Data models
     "Prompt",
     "Message",

@@ -19,10 +19,11 @@ class ActorModel:
         """
         self.config = config
         self.device = get_device(config.device)
+        dtype = getattr(torch, config.dtype)
 
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=torch.float32,
+            dtype=dtype,
             device_map=None,
             trust_remote_code=config.trust_remote_code,
         )

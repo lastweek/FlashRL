@@ -5,18 +5,34 @@ from typing import Any
 
 from flashrl.framework.config import TrainerConfig
 from flashrl.framework.data_models import TrainingBatch
+from flashrl.framework.run_logger import RunLogger
 
 
 class BaseTrainer(ABC):
     """Abstract base class for trainers."""
 
-    def __init__(self, config: TrainerConfig) -> None:
+    def __init__(
+        self,
+        config: TrainerConfig,
+        run_logger: RunLogger | None = None,
+    ) -> None:
         """Initialize the trainer.
 
         Args:
             config: Trainer configuration.
+            run_logger: Optional run-scoped logger.
         """
         self.config = config
+        self.run_logger = run_logger
+        self.current_epoch = 0
+        self.total_steps = 0
+
+    def attach_run_logger(self, run_logger: RunLogger | None) -> None:
+        """Attach or clear the current run-scoped logger."""
+        self.run_logger = run_logger
+
+    def reset_state(self) -> None:
+        """Reset per-run trainer state."""
         self.current_epoch = 0
         self.total_steps = 0
 

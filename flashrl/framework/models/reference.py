@@ -1,4 +1,4 @@
-"""Reference model wrapper for KL divergence computation."""
+"""Reference model wrapper for optional KL regularization."""
 
 from typing import Any
 import torch
@@ -9,7 +9,7 @@ from flashrl.framework.models.device import get_device
 
 
 class ReferenceModel:
-    """Wrapper for the reference model (used for KL divergence)."""
+    """Frozen reference model used for KL-regularized GRPO."""
 
     def __init__(self, config: ModelConfig) -> None:
         """Initialize the reference model.
@@ -19,10 +19,11 @@ class ReferenceModel:
         """
         self.config = config
         self.device = get_device(config.device)
+        dtype = getattr(torch, config.dtype)
 
         self.model = AutoModelForCausalLM.from_pretrained(
             config.model_name,
-            torch_dtype=torch.float32,
+            dtype=dtype,
             device_map=None,
             trust_remote_code=config.trust_remote_code,
         )

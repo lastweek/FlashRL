@@ -31,3 +31,5 @@ dist/
 build/
 *.egg-info/
 .env
+
+.flashrl-runs/

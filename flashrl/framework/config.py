@@ -12,7 +12,7 @@ class TrainerConfig(BaseModel):
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10
-    kl_coefficient: float = 0.1
+    kl_coefficient: float = 0.0
     gamma: float = 1.0  # Discount factor
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -95,5 +95,29 @@ class RewardConfig(BaseModel):
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "RewardConfig":
+        """Load config from dictionary."""
+        return cls(**data)
+
+
+class LoggingConfig(BaseModel):
+    """Configuration for run logging and terminal UX."""
+
+    level: str = "INFO"
+    log_dir: str | Path = ".flashrl-runs"
+    log_every_steps: int = 1
+    sample_every_steps: int = 10
+    console: bool = True
+    file: bool = True
+    rich_progress: bool = False
+
+    @classmethod
+    def from_yaml(cls, path: str | Path) -> "LoggingConfig":
+        """Load config from YAML file."""
+        with open(path) as f:
+            data = yaml.safe_load(f)
+        return cls(**data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "LoggingConfig":
         """Load config from dictionary."""
         return cls(**data)
