@@ -1,6 +1,5 @@
 """Reward computation."""
 
-from flashrl.framework.reward.base import BaseReward
 from flashrl.framework.reward.user_defined import UserDefinedReward
 
-__all__ = ["BaseReward", "UserDefinedReward"]
+__all__ = ["UserDefinedReward"]

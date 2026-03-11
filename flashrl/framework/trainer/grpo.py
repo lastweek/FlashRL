@@ -16,9 +16,10 @@ from flashrl.framework.data_models import (
     TrainingBatch,
 )
 from flashrl.framework.models.reference import ReferenceModel
-from flashrl.framework.reward.base import BaseReward
-from flashrl.framework.rollout.base import BaseRollout
-from flashrl.framework.trainer.base import BaseTrainer
+# Using concrete reward and rollout classes
+from flashrl.framework.reward.user_defined import UserDefinedReward
+from flashrl.framework.rollout.user_defined import UserDefinedRollout
+# Removed BaseTrainer inheritance - using direct class
 
 if TYPE_CHECKING:
     from flashrl.framework.backends.serving import ServingBackend
@@ -80,7 +81,7 @@ PHASE_GROUP_SPECS = [
 ]
 
 
-class GRPOTrainer(BaseTrainer):
+class GRPOTrainer:
     """GRPO trainer implementation.
 
     The local path can run with or without a frozen reference model. When the
@@ -94,17 +95,29 @@ class GRPOTrainer(BaseTrainer):
         training_backend: "TrainingBackend",
         serving_backend: "ServingBackend",
         reference: ReferenceModel | None,
-        reward_fn: BaseReward,
-        rollout_generator: BaseRollout,
+        reward_fn: UserDefinedReward,
+        rollout_generator: UserDefinedRollout,
         run_logger: "RunLogger | None" = None,
     ) -> None:
         """Initialize GRPO trainer."""
-        super().__init__(config, run_logger=run_logger)
+        self.config = config
+        self.run_logger = run_logger
+        self.current_epoch = 0
+        self.total_steps = 0
         self.training_backend = training_backend
         self.serving_backend = serving_backend
         self.reference = reference
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
+
+    def attach_run_logger(self, run_logger: "RunLogger | None") -> None:
+        """Attach or clear the current run-scoped logger."""
+        self.run_logger = run_logger
+
+    def reset_state(self) -> None:
+        """Reset per-run trainer state."""
+        self.current_epoch = 0
+        self.total_steps = 0
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""

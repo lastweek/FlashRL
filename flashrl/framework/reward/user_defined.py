@@ -6,7 +6,6 @@ Allows users to pass simple functions instead of creating classes.
 from typing import Callable
 
 from flashrl.framework.config import RewardConfig
-from flashrl.framework.reward.base import BaseReward
 from flashrl.framework.data_models import (
     RewardOutput,
     RolloutOutput,
@@ -14,11 +13,11 @@ from flashrl.framework.data_models import (
 )
 
 
-class UserDefinedReward(BaseReward):
+class UserDefinedReward:
     """Reward function that wraps a user-provided function.
 
     This allows users to pass simple functions for reward computation
-    instead of creating full classes that inherit from BaseReward.
+    without needing to inherit from base classes.
 
     Example:
         def my_reward_fn(rollout):
@@ -41,7 +40,7 @@ class UserDefinedReward(BaseReward):
                 Takes RolloutOutput and returns RewardOutput.
             config: Reward configuration.
         """
-        super().__init__(config)
+        self.config = config
         self.reward_fn = reward_fn
 
     def compute(self, rollout: RolloutOutput) -> RewardOutput:

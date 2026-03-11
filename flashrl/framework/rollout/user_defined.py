@@ -6,7 +6,7 @@ Allows users to pass simple functions instead of creating classes.
 from typing import Callable
 
 from flashrl.framework.config import RolloutConfig
-from flashrl.framework.rollout.base import BaseRollout
+# Removed BaseRollout inheritance - using direct class
 from flashrl.framework.data_models import (
     Prompt,
     RolloutOutput,
@@ -15,11 +15,11 @@ from flashrl.framework.data_models import (
 from flashrl.framework.models.actor import ActorModel
 
 
-class UserDefinedRollout(BaseRollout):
+class UserDefinedRollout:
     """Rollout generator that wraps a user-provided function.
 
     This allows users to pass simple functions for rollout generation
-    instead of creating full classes that inherit from BaseRollout.
+    without needing to inherit from base classes.
 
     Example:
         def my_rollout_fn(prompts, actor):
@@ -43,7 +43,7 @@ class UserDefinedRollout(BaseRollout):
             actor: Actor model to use for generation.
             config: Rollout configuration.
         """
-        super().__init__(config)
+        self.config = config
         self.rollout_fn = rollout_fn
         self.actor = actor
 
