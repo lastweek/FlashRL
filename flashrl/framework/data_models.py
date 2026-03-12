@@ -77,6 +77,7 @@ class TrainingBatch(BaseModel):
     conversations: list[Conversation]
     rollouts: list[RolloutOutput]
     rewards: list[RewardOutput]
+    rollout_response_log_probs: list[list[float]] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def __len__(self) -> int:

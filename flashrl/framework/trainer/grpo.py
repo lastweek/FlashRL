@@ -2,18 +2,16 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 import math
-from typing import TYPE_CHECKING, Any
+import time
+from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 import torch.nn.functional as F
 
 from flashrl.framework.config import TrainerConfig
-from flashrl.framework.data_models import (
-    Prompt,
-    RewardOutput,
-    TrainingBatch,
-)
+from flashrl.framework.data_models import Prompt, RewardOutput, TrainingBatch
 from flashrl.framework.models.reference import ReferenceModel
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
@@ -21,16 +19,62 @@ from flashrl.framework.rollout.user_defined import UserDefinedRollout
 if TYPE_CHECKING:
     from flashrl.framework.backends.serving import ServingBackend
     from flashrl.framework.backends.training import TrainingBackend
+    from flashrl.framework.metrics import PrometheusMetricsSink
     from flashrl.framework.run_logger import RunLogger
 
 
-class GRPOTrainer:
-    """GRPO trainer implementation.
+STAGE_ORDER = (
+    "rollout",
+    "reward",
+    "advantage",
+    "tokenize_full",
+    "tokenize_prompt",
+    "actor_forward",
+    "reference_forward",
+    "loss_assembly",
+    "backward",
+    "optimizer",
+    "sync",
+)
 
-    The local path can run with or without a frozen reference model. When the
-    reference is disabled, FlashRL uses a simplified no-KL objective so the
-    tutorial path stays lightweight on a Mac.
-    """
+
+@dataclass(frozen=True)
+class StepContext:
+    """Stable metadata shared by all events in a training step."""
+
+    step: int
+    epoch: int
+    total_epochs: int
+    batch_index: int
+    batches_in_epoch: int
+    batch_size: int
+
+    def payload(self) -> dict[str, int]:
+        """Return the event payload fields shared by all step-stage logs."""
+        return {
+            "step": self.step,
+            "epoch": self.epoch,
+            "total_epochs": self.total_epochs,
+            "batch_index": self.batch_index,
+            "batches_in_epoch": self.batches_in_epoch,
+            "batch_size": self.batch_size,
+        }
+
+
+@dataclass
+class OptimizationResult:
+    """Result of the optimize portion of a GRPO step."""
+
+    loss: float
+    policy_loss: float
+    kl_divergence: float
+    stage_timings: dict[str, float]
+    response_tokens_total: int
+    reference_active: bool
+
+
+class GRPOTrainer:
+    """GRPO trainer implementation with detailed step logging."""
 
     def __init__(
         self,
@@ -41,10 +85,12 @@ class GRPOTrainer:
         reward_fn: UserDefinedReward,
         rollout_generator: UserDefinedRollout,
         run_logger: "RunLogger | None" = None,
+        metrics_sink: "PrometheusMetricsSink | None" = None,
     ) -> None:
         """Initialize GRPO trainer."""
         self.config = config
         self.run_logger = run_logger
+        self.metrics_sink = metrics_sink
         self.current_epoch = 0
         self.total_steps = 0
         self.training_backend = training_backend
@@ -66,11 +112,12 @@ class GRPOTrainer:
         """Train on the given dataset."""
         batch_size = self.config.batch_size
         batches_in_epoch = math.ceil(len(dataset) / batch_size) if len(dataset) else 0
-        start_epoch = self.current_epoch
 
-        for epoch in range(start_epoch, self.config.max_epochs):
+        for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
             epoch_number = epoch + 1
+            epoch_started_at = time.perf_counter()
+            epoch_step_payloads: list[dict[str, Any]] = []
 
             if self.run_logger is not None:
                 self.run_logger.log_epoch_start(
@@ -80,65 +127,618 @@ class GRPOTrainer:
                 )
 
             for batch_index, prompts in enumerate(self._batch_prompts(dataset, batch_size), start=1):
-                step = self.total_steps + 1
-
-                # Generate rollouts
-                rollouts = self.rollout_generator.generate(prompts)
-
-                # Compute rewards
-                rewards = [self.reward_fn.compute(rollout) for rollout in rollouts]
-
-                # Create training batch
-                batch = TrainingBatch(
-                    prompts=prompts,
-                    conversations=[rollout.conversation for rollout in rollouts],
-                    rollouts=rollouts,
-                    rewards=rewards,
+                next_step = self.total_steps + 1
+                context = StepContext(
+                    step=next_step,
+                    epoch=epoch_number,
+                    total_epochs=self.config.max_epochs,
+                    batch_index=batch_index,
+                    batches_in_epoch=batches_in_epoch,
+                    batch_size=len(prompts),
                 )
+                step_payload = self._run_logged_step(prompts, context)
+                epoch_step_payloads.append(step_payload)
+                self.total_steps = context.step
 
-                # Compute advantages
-                advantages = self._compute_advantages(batch.rewards)
+            if self.run_logger is not None:
+                epoch_duration_seconds = time.perf_counter() - epoch_started_at
+                epoch_summary = self._build_epoch_summary(
+                    epoch=epoch_number,
+                    total_epochs=self.config.max_epochs,
+                    duration_seconds=epoch_duration_seconds,
+                    step_payloads=epoch_step_payloads,
+                )
+                self.run_logger.log_epoch_summary(epoch_summary)
 
-                # Compute loss
-                loss_dict = self._compute_grpo_loss(batch, advantages)
+    def _run_logged_step(
+        self,
+        prompts: list[Prompt],
+        context: StepContext,
+    ) -> dict[str, Any]:
+        """Run one full training step and emit detailed stage logs."""
+        actor = self.training_backend.actor
+        step_started_at = time.perf_counter()
 
-                # Optimize
-                self.training_backend.optimizer.zero_grad()
-                loss_dict["loss"].backward()
-                self.training_backend.optimizer.step()
-                self.training_backend.sync_weights_to(self.serving_backend)
+        rollout_started_at = time.perf_counter()
+        rollouts = self.rollout_generator.generate(prompts)
+        prompt_texts = [prompt.text for prompt in prompts]
+        response_texts = [rollout.text for rollout in rollouts]
+        rollout_response_log_probs = self._compute_rollout_response_log_probs(
+            prompt_texts,
+            response_texts,
+        )
+        rollout_seconds = time.perf_counter() - rollout_started_at
+        prompt_lengths = self._text_lengths(actor, prompt_texts)
+        response_lengths = self._text_lengths(actor, response_texts)
+        self._log_stage(
+            context,
+            "rollout",
+            rollout_seconds,
+            {
+                "prompt_tokens_mean": self._mean(prompt_lengths),
+                "prompt_tokens_max": max(prompt_lengths, default=0),
+                "response_tokens_mean": self._mean(response_lengths),
+                "response_tokens_max": max(response_lengths, default=0),
+            },
+        )
 
-                # Log progress
-                if self.run_logger is not None:
-                    metrics = {
-                        "loss": float(loss_dict["loss"].item()),
-                        "policy_loss": float(loss_dict["policy_loss"].item()),
-                        "kl_divergence": float(loss_dict["kl_divergence"].item()),
-                    }
-                    self.run_logger.log_step(step, epoch_number, metrics)
+        rewards, reward_seconds = self._compute_rewards(context, prompts, rollouts)
+        reward_values = [reward.reward for reward in rewards]
+        reward_stats = self._summary_stats("reward", reward_values)
+        reward_per_item_mean_seconds = reward_seconds / len(rewards) if rewards else 0.0
+        self._log_stage(
+            context,
+            "reward",
+            reward_seconds,
+            {
+                **reward_stats,
+                "reward_per_item_mean_seconds": reward_per_item_mean_seconds,
+            },
+        )
+        if self.run_logger is not None:
+            self.run_logger.log_rollout_batch(
+                step=context.step,
+                epoch=context.epoch,
+                batch_index=context.batch_index,
+                batches_in_epoch=context.batches_in_epoch,
+                prompts=prompts,
+                rollouts=rollouts,
+                rewards=rewards,
+            )
 
-                self.total_steps = step
+        batch = TrainingBatch(
+            prompts=prompts,
+            conversations=[rollout.conversation for rollout in rollouts],
+            rollouts=rollouts,
+            rewards=rewards,
+            rollout_response_log_probs=rollout_response_log_probs,
+        )
 
-    def step(self, batch: TrainingBatch) -> dict[str, float]:
-        """Perform one GRPO training step."""
-        advantages = self._compute_advantages(batch.rewards)
-        loss_dict = self._compute_grpo_loss(batch, advantages)
+        advantages, advantage_seconds = self._measure(
+            lambda: self._compute_advantages(batch.rewards)
+        )
+        advantage_values = [float(value) for value in advantages.tolist()]
+        advantage_stats = self._summary_stats("advantage", advantage_values)
+        self._log_stage(
+            context,
+            "advantage",
+            advantage_seconds,
+            advantage_stats,
+        )
 
-        self.training_backend.optimizer.zero_grad()
-        loss_dict["loss"].backward()
-        self.training_backend.optimizer.step()
-        self.training_backend.sync_weights_to(self.serving_backend)
+        result = self._optimize_batch(batch, advantages, context)
+        stage_timings = {
+            "rollout": rollout_seconds,
+            "reward": reward_seconds,
+            "advantage": advantage_seconds,
+            **result.stage_timings,
+        }
+        step_duration_seconds = time.perf_counter() - step_started_at
+        response_tokens_total = int(sum(response_lengths))
+        if step_duration_seconds > 0.0:
+            tokens_per_second = response_tokens_total / step_duration_seconds
+        else:
+            tokens_per_second = 0.0
 
-        return {
-            "loss": float(loss_dict["loss"].item()),
-            "policy_loss": float(loss_dict["policy_loss"].item()),
-            "kl_divergence": float(loss_dict["kl_divergence"].item()),
+        stage_order: list[str] = []
+        for stage in STAGE_ORDER:
+            if stage == "reference_forward" and not result.reference_active:
+                continue
+            stage_order.append(stage)
+
+        if stage_timings:
+            dominant_stage = max(stage_timings.items(), key=lambda item: item[1])[0]
+        else:
+            dominant_stage = "n/a"
+
+        reward_mean = self._mean(reward_values)
+        reference_enabled = self.reference is not None
+
+        payload = {
+            **context.payload(),
+            "loss": result.loss,
+            "policy_loss": result.policy_loss,
+            "kl_divergence": result.kl_divergence,
+            "reward_mean": reward_mean,
+            "response_tokens_total": response_tokens_total,
+            "tokens_per_second": tokens_per_second,
+            "step_duration_seconds": step_duration_seconds,
+            "stage_timings": stage_timings,
+            "stage_order": stage_order,
+            "reference_enabled": reference_enabled,
+            "reference_active": result.reference_active,
+            "dominant_stage": dominant_stage,
         }
 
-    def _compute_advantages(
+        if self.run_logger is not None:
+            self.run_logger.log_step_done(payload)
+            self.run_logger.log_sample_preview(
+                step=context.step,
+                prompt=prompts[0].text if prompts else "",
+                response=rollouts[0].text if rollouts else "",
+                reward=reward_values[0] if reward_values else 0.0,
+            )
+        if self.metrics_sink is not None:
+            self.metrics_sink.observe_step(
+                loss=result.loss,
+                reward_mean=reward_mean,
+                kl_mean=result.kl_divergence,
+                step_duration_seconds=step_duration_seconds,
+            )
+            self.metrics_sink.push()
+
+        return payload
+
+    def _compute_rewards(
         self,
-        rewards: list[RewardOutput],
+        context: StepContext,
+        prompts: list[Prompt],
+        rollouts: list[Any],
+    ) -> tuple[list[RewardOutput], float]:
+        """Compute rewards and attach prompt/response context on failure."""
+        started_at = time.perf_counter()
+        try:
+            rewards = [self.reward_fn.compute(rollout) for rollout in rollouts]
+        except Exception as exc:
+            if self.run_logger is not None:
+                self.run_logger.log_exception(
+                    exc,
+                    context={
+                        "stage": "reward",
+                        "epoch": context.epoch,
+                        "step": context.step,
+                        "batch_index": context.batch_index,
+                        "prompt_preview": self._truncate(prompts[0].text if prompts else ""),
+                        "response_preview": self._truncate(rollouts[0].text if rollouts else ""),
+                    },
+                )
+            raise
+        return rewards, time.perf_counter() - started_at
+
+    def _optimize_batch(
+        self,
+        batch: TrainingBatch,
+        advantages: torch.Tensor,
+        context: StepContext | None,
+    ) -> OptimizationResult:
+        """Run tokenize, forward, loss, backward, step, and sync."""
+        actor = self.training_backend.actor
+        device = actor.device
+        rollout_response_log_probs = batch.rollout_response_log_probs
+        if rollout_response_log_probs is None:
+            raise ValueError(
+                "TrainingBatch.rollout_response_log_probs is required for exact GRPO optimization."
+            )
+
+        prompts = [prompt.text for prompt in batch.prompts]
+        responses = [rollout.text for rollout in batch.rollouts]
+        full_texts = [prompt + response for prompt, response in zip(prompts, responses)]
+
+        full_inputs, full_lengths, full_seconds = self._tokenize(actor, full_texts)
+        input_ids = full_inputs["input_ids"].to(device)
+        attention_mask = full_inputs["attention_mask"].to(device)
+        full_tokens_total = int(sum(full_lengths))
+        self._log_stage(
+            context,
+            "tokenize_full",
+            full_seconds,
+            {
+                "full_tokens_mean": self._mean(full_lengths),
+                "full_tokens_max": max(full_lengths, default=0),
+            },
+        )
+
+        prompt_inputs, prompt_lengths_list, prompt_seconds = self._tokenize(actor, prompts)
+        prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+        self._log_stage(
+            context,
+            "tokenize_prompt",
+            prompt_seconds,
+            {
+                "prompt_tokens_mean": self._mean(prompt_lengths_list),
+                "prompt_tokens_max": max(prompt_lengths_list, default=0),
+            },
+        )
+
+        actor_logits, actor_forward_seconds = self._measure(
+            lambda: actor.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+        )
+        self._log_stage(
+            context,
+            "actor_forward",
+            actor_forward_seconds,
+            {"full_tokens_total": full_tokens_total},
+        )
+
+        reference_active = self.reference is not None and self.config.kl_coefficient > 0.0
+        if reference_active:
+            ref_logits, reference_forward_seconds = self._measure(
+                lambda: self._reference_logits(input_ids, attention_mask)
+            )
+            self._log_stage(
+                context,
+                "reference_forward",
+                reference_forward_seconds,
+                {"full_tokens_total": full_tokens_total},
+            )
+        else:
+            ref_logits = None
+            reference_forward_seconds = 0.0
+
+        loss_result, loss_seconds = self._measure(
+            lambda: self._assemble_loss(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                prompt_lengths=prompt_lengths,
+                actor_logits=actor_logits,
+                ref_logits=ref_logits,
+                rollout_response_log_probs=rollout_response_log_probs,
+                advantages=advantages,
+                kl_coefficient=self.config.kl_coefficient,
+                clip_epsilon=self.config.clip_epsilon,
+            )
+        )
+        loss, policy_loss, kl_divergence, response_tokens_total = loss_result
+        self._log_stage(
+            context,
+            "loss_assembly",
+            loss_seconds,
+            {
+                "loss": float(loss.item()),
+                "policy_loss": float(policy_loss.item()),
+                "kl_divergence": float(kl_divergence.item()),
+                "response_tokens_total": response_tokens_total,
+            },
+        )
+
+        _, backward_seconds = self._measure(self._backward_step(loss))
+        self._log_stage(
+            context,
+            "backward",
+            backward_seconds,
+            {"loss": float(loss.item())},
+        )
+
+        _, optimizer_seconds = self._measure(self.training_backend.optimizer.step)
+        self._log_stage(
+            context,
+            "optimizer",
+            optimizer_seconds,
+            {"learning_rate": float(self.training_backend.optimizer.param_groups[0]["lr"])},
+        )
+
+        _, sync_seconds = self._measure(
+            lambda: self.training_backend.sync_weights_to(self.serving_backend)
+        )
+        stage_timings = {
+            "tokenize_full": full_seconds,
+            "tokenize_prompt": prompt_seconds,
+            "actor_forward": actor_forward_seconds,
+            "reference_forward": reference_forward_seconds,
+            "loss_assembly": loss_seconds,
+            "backward": backward_seconds,
+            "optimizer": optimizer_seconds,
+            "sync": sync_seconds,
+        }
+        if context is not None:
+            partial_step_seconds = sum(stage_timings.values())
+            tokens_per_second = (
+                response_tokens_total / partial_step_seconds
+                if partial_step_seconds > 0.0
+                else 0.0
+            )
+            self._log_stage(
+                context,
+                "sync",
+                sync_seconds,
+                {
+                    "step_duration_seconds": partial_step_seconds,
+                    "tokens_per_second": tokens_per_second,
+                },
+            )
+
+        return OptimizationResult(
+            loss=float(loss.item()),
+            policy_loss=float(policy_loss.item()),
+            kl_divergence=float(kl_divergence.item()),
+            stage_timings=stage_timings,
+            response_tokens_total=response_tokens_total,
+            reference_active=reference_active,
+        )
+
+    def _reference_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> torch.Tensor:
+        """Run the frozen reference model without gradients."""
+        assert self.reference is not None
+        with torch.no_grad():
+            return self.reference.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+    def _assemble_loss(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        prompt_lengths: torch.Tensor,
+        actor_logits: torch.Tensor,
+        ref_logits: torch.Tensor | None,
+        rollout_response_log_probs: list[list[float]],
+        advantages: torch.Tensor,
+        kl_coefficient: float,
+        clip_epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+        """Assemble the response-only GRPO objective and count response tokens.
+
+        We optimize the sampled response tokens with the paper-style GRPO split:
+
+            L(theta) = L_policy(theta) + beta * L_KL(theta)
+
+            L_policy(theta)
+              = -mean_t min(r_t * A_i, clip(r_t, 1 - clip_epsilon, 1 + clip_epsilon) * A_i)
+            r_t = exp(log_pi_theta - log_pi_old)
+
+            L_KL(theta)
+              = mean_t [exp(log_pi_ref - log_pi_theta) - (log_pi_ref - log_pi_theta) - 1]
+
+        where:
+        - log_pi_theta is the current actor log-prob of the sampled response token
+        - log_pi_old is the rollout-policy log-prob captured at sample time
+        - log_pi_ref is the frozen reference log-prob of that sampled token
+        - A_i is the group-normalized advantage for sample i, reused for every
+          response token in that sample
+        - beta is `kl_coefficient`
+
+        Prompt tokens only provide context. All reductions are over response
+        tokens selected by `response_mask`.
+        """
+        shift_ids = input_ids[:, 1:]
+        shift_mask = attention_mask[:, 1:].float()
+
+        # 1. Current policy log-probs for the sampled next tokens.
+        actor_token_log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
+        log_pi_theta = torch.gather(
+            actor_token_log_probs,
+            dim=-1,
+            index=shift_ids.unsqueeze(-1),
+        ).squeeze(-1)
+
+        # 2. Response-only mask. Prompt tokens stay out of the objective.
+        response_mask = torch.zeros_like(shift_mask)
+        for index, prompt_length in enumerate(prompt_lengths.tolist()):
+            prompt_start = max(int(prompt_length) - 1, 0)
+            response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
+        response_token_count = response_mask.sum().clamp(min=1)
+        response_tokens_total = int(response_mask.sum().item())
+
+        # 3. Fixed rollout-policy log-probs captured when the samples were generated.
+        if len(rollout_response_log_probs) != response_mask.shape[0]:
+            raise ValueError(
+                "TrainingBatch.rollout_response_log_probs must match the batch size."
+            )
+
+        log_pi_old = torch.zeros(
+            response_mask.shape,
+            dtype=log_pi_theta.dtype,
+            device=log_pi_theta.device,
+        )
+        response_mask_bool = response_mask.to(dtype=torch.bool)
+        for index, sample_log_probs in enumerate(rollout_response_log_probs):
+            expected_tokens = int(response_mask_bool[index].sum().item())
+            if len(sample_log_probs) != expected_tokens:
+                raise ValueError(
+                    "Each rollout_response_log_probs entry must match that sample's "
+                    "response-token count."
+                )
+            if expected_tokens == 0:
+                continue
+            sample_tensor = torch.tensor(
+                sample_log_probs,
+                dtype=log_pi_theta.dtype,
+                device=log_pi_theta.device,
+            )
+            log_pi_old[index, response_mask_bool[index]] = sample_tensor
+
+        # 4. Clipped GRPO surrogate. Each sample-level A_i is reused for every
+        # response token in that sample because this trainer uses outcome-level rewards.
+        sample_advantages = advantages.to(
+            device=log_pi_theta.device,
+            dtype=log_pi_theta.dtype,
+        ).unsqueeze(-1)
+        expanded_advantages = sample_advantages.expand_as(response_mask)
+        ratio = torch.exp(log_pi_theta - log_pi_old)
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        surrogate_unclipped = ratio * expanded_advantages
+        surrogate_clipped = clipped_ratio * expanded_advantages
+        surrogate_objective = torch.minimum(surrogate_unclipped, surrogate_clipped)
+        masked_surrogate = surrogate_objective * response_mask
+        policy_loss = -masked_surrogate.sum() / response_token_count
+
+        # 5. Separate reference regularization term.
+        if ref_logits is not None:
+            reference_token_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
+            log_pi_ref = torch.gather(
+                reference_token_log_probs,
+                dim=-1,
+                index=shift_ids.unsqueeze(-1),
+            ).squeeze(-1)
+            reference_log_gap = log_pi_ref - log_pi_theta
+            kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
+            masked_kl = kl_terms * response_mask
+            kl_divergence = masked_kl.sum() / response_token_count
+        else:
+            kl_divergence = torch.zeros(
+                (),
+                device=log_pi_theta.device,
+                dtype=log_pi_theta.dtype,
+            )
+
+        # 6. Final objective used for backprop.
+        loss = policy_loss + kl_coefficient * kl_divergence
+        return loss, policy_loss, kl_divergence, response_tokens_total
+
+    def _compute_rollout_response_log_probs(
+        self,
+        prompt_texts: list[str],
+        response_texts: list[str],
+    ) -> list[list[float]]:
+        """Score sampled response tokens under the rollout policy."""
+        if not prompt_texts:
+            return []
+
+        actor = self.serving_backend.actor
+        full_texts = [
+            prompt + response
+            for prompt, response in zip(prompt_texts, response_texts, strict=True)
+        ]
+
+        full_inputs, _, _ = self._tokenize(actor, full_texts)
+        prompt_inputs, _, _ = self._tokenize(actor, prompt_texts)
+
+        input_ids = full_inputs["input_ids"].to(actor.device)
+        attention_mask = full_inputs["attention_mask"].to(actor.device)
+        prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+        shift_ids = input_ids[:, 1:]
+        shift_mask = attention_mask[:, 1:].float()
+        response_mask = torch.zeros_like(shift_mask)
+        for index, prompt_length in enumerate(prompt_lengths.tolist()):
+            prompt_start = max(int(prompt_length) - 1, 0)
+            response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
+
+        with torch.no_grad():
+            rollout_logits = actor.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+        rollout_token_log_probs = F.log_softmax(rollout_logits[:, :-1, :], dim=-1)
+        selected_rollout_log_probs = torch.gather(
+            rollout_token_log_probs,
+            dim=-1,
+            index=shift_ids.unsqueeze(-1),
+        ).squeeze(-1)
+        response_log_probs: list[list[float]] = []
+        token_log_probs_cpu = selected_rollout_log_probs.detach().cpu()
+        response_mask_cpu = response_mask.detach().to(dtype=torch.bool).cpu()
+        for sample_log_probs, sample_mask in zip(
+            token_log_probs_cpu,
+            response_mask_cpu,
+            strict=True,
+        ):
+            values = sample_log_probs[sample_mask].tolist()
+            response_log_probs.append([float(value) for value in values])
+        return response_log_probs
+
+    def _backward_step(self, loss: torch.Tensor) -> Callable[[], None]:
+        """Return the backward closure used in timing."""
+
+        def run() -> None:
+            self.training_backend.optimizer.zero_grad()
+            loss.backward()
+
+        return run
+
+    def _tokenize(
+        self,
+        actor: Any,
+        texts: list[str],
+    ) -> tuple[dict[str, torch.Tensor], list[int], float]:
+        """Tokenize texts and return inputs, token lengths, and latency."""
+        inputs, duration_seconds = self._measure(
+            lambda: actor.tokenizer(
+                texts,
+                padding=True,
+                truncation=True,
+                max_length=actor.config.max_length,
+                return_tensors="pt",
+            )
+        )
+        lengths = [int(value) for value in inputs["attention_mask"].sum(dim=1).tolist()]
+        return inputs, lengths, duration_seconds
+
+    def _build_epoch_summary(
+        self,
+        epoch: int,
+        total_epochs: int,
+        duration_seconds: float,
+        step_payloads: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Aggregate per-step payloads into an epoch summary."""
+        if not step_payloads:
+            return {
+                "epoch": epoch,
+                "total_epochs": total_epochs,
+                "loss": 0.0,
+                "reward": 0.0,
+                "kl_divergence": 0.0,
+                "tokens_per_second": 0.0,
+                "duration_seconds": duration_seconds,
+                "stage_totals": {},
+            }
+
+        stage_totals: dict[str, float] = {}
+        for payload in step_payloads:
+            self._accumulate_totals(stage_totals, payload["stage_timings"])
+
+        return {
+            "epoch": epoch,
+            "total_epochs": total_epochs,
+            "loss": self._mean([payload["loss"] for payload in step_payloads]),
+            "reward": self._mean([payload["reward_mean"] for payload in step_payloads]),
+            "kl_divergence": self._mean([payload["kl_divergence"] for payload in step_payloads]),
+            "tokens_per_second": self._mean([payload["tokens_per_second"] for payload in step_payloads]),
+            "duration_seconds": duration_seconds,
+            "stage_totals": stage_totals,
+        }
+
+    def _log_stage(
+        self,
+        context: StepContext | None,
+        stage: str,
+        latency_seconds: float,
+        extra: dict[str, Any],
+    ) -> None:
+        """Emit one step-stage event if a run logger and context are available."""
+        if context is None:
+            return
+        payload = {
+            **context.payload(),
+            "stage": stage,
+            "latency_seconds": latency_seconds,
+            **extra,
+        }
+        if self.run_logger is not None:
+            self.run_logger.log_step_stage(payload)
+        if self.metrics_sink is not None:
+            self.metrics_sink.observe_stage(stage, latency_seconds)
+
+    def _compute_advantages(self, rewards: list[RewardOutput]) -> torch.Tensor:
         """Compute group-based relative advantages."""
         reward_values = torch.tensor(
             [reward.reward for reward in rewards],
@@ -148,105 +748,66 @@ class GRPOTrainer:
         std = reward_values.std(unbiased=False)
         return (reward_values - mean) / (std + 1e-8)
 
-    def _compute_grpo_loss(
-        self,
-        batch: TrainingBatch,
-        advantages: torch.Tensor,
-    ) -> dict[str, torch.Tensor]:
-        """Compute GRPO loss with optional KL regularization."""
-        actor = self.training_backend.actor
-        device = actor.device
-
-        prompts = [prompt.text for prompt in batch.prompts]
-        responses = [rollout.text for rollout in batch.rollouts]
-        full_texts = [prompt + response for prompt, response in zip(prompts, responses)]
-
-        # Tokenize full sequences
-        full_inputs = actor.tokenizer(
-            full_texts,
-            padding=True,
-            truncation=True,
-            max_length=actor.config.max_length,
-            return_tensors="pt",
-        )
-        input_ids = full_inputs["input_ids"].to(device)
-        attention_mask = full_inputs["attention_mask"].to(device)
-
-        # Tokenize prompts to find response boundaries
-        prompt_inputs = actor.tokenizer(
-            prompts,
-            padding=True,
-            truncation=True,
-            max_length=actor.config.max_length,
-            return_tensors="pt",
-        )
-        prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
-
-        # Forward pass through actor
-        actor_logits = actor.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        ).logits
-
-        # Forward pass through reference (if enabled)
-        ref_logits = None
-        if self.reference is not None and self.config.kl_coefficient > 0.0:
-            with torch.no_grad():
-                ref_logits = self.reference.model(
-                    input_ids=input_ids,
-                    attention_mask=attention_mask,
-                ).logits
-
-        # Compute loss
-        actor_log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
-        shift_ids = input_ids[:, 1:]
-        shift_mask = attention_mask[:, 1:].float()
-
-        actor_token_lp = torch.gather(
-            actor_log_probs,
-            dim=-1,
-            index=shift_ids.unsqueeze(-1),
-        ).squeeze(-1)
-
-        # Create response mask
-        response_mask = torch.zeros_like(shift_mask)
-        for index, prompt_length in enumerate(prompt_lengths):
-            prompt_start = int(prompt_length.item()) - 1
-            response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
-
-        # Compute policy signal and KL divergence
-        if ref_logits is not None:
-            ref_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-            ref_token_lp = torch.gather(
-                ref_log_probs,
-                dim=-1,
-                index=shift_ids.unsqueeze(-1),
-            ).squeeze(-1)
-            policy_signal = actor_token_lp - ref_token_lp
-            kl_divergence = (policy_signal * response_mask).sum() / response_mask.sum().clamp(min=1)
-        else:
-            policy_signal = actor_token_lp
-            kl_divergence = torch.zeros((), device=device, dtype=actor_logits.dtype)
-
-        # Compute policy loss with advantages
-        masked_policy_signal = policy_signal * response_mask
-        advantages_expanded = advantages.to(device).unsqueeze(-1) * response_mask
-
-        num_response_tokens = response_mask.sum().clamp(min=1)
-        policy_loss = -(advantages_expanded * masked_policy_signal).sum() / num_response_tokens
-        loss = policy_loss + self.config.kl_coefficient * kl_divergence
-
-        return {
-            "loss": loss,
-            "policy_loss": policy_loss,
-            "kl_divergence": kl_divergence,
-        }
-
-    def _batch_prompts(self, dataset: Any, batch_size: int | None = None) -> list[list[Prompt]]:
+    def _batch_prompts(self, dataset: Any, batch_size: int | None = None) -> Any:
         """Split dataset into batches."""
         size = batch_size or self.config.batch_size
         for index in range(0, len(dataset), size):
             yield dataset[index:index + size]
+
+    def _measure(self, operation: Callable[[], Any]) -> tuple[Any, float]:
+        """Measure one operation with perf_counter."""
+        started_at = time.perf_counter()
+        result = operation()
+        return result, time.perf_counter() - started_at
+
+    def _summary_stats(self, prefix: str, values: list[float]) -> dict[str, float]:
+        """Compute mean/std/min/max stats for a list of floats."""
+        if not values:
+            return {
+                f"{prefix}_mean": 0.0,
+                f"{prefix}_std": 0.0,
+                f"{prefix}_min": 0.0,
+                f"{prefix}_max": 0.0,
+            }
+        tensor = torch.tensor(values, dtype=torch.float32)
+        return {
+            f"{prefix}_mean": float(tensor.mean().item()),
+            f"{prefix}_std": float(tensor.std(unbiased=False).item()),
+            f"{prefix}_min": float(tensor.min().item()),
+            f"{prefix}_max": float(tensor.max().item()),
+        }
+
+    def _text_lengths(self, actor: Any, texts: list[str]) -> list[int]:
+        """Tokenize texts and return sequence lengths."""
+        if not texts:
+            return []
+        tokenized = actor.tokenizer(
+            texts,
+            padding=True,
+            truncation=True,
+            max_length=actor.config.max_length,
+            return_tensors="pt",
+        )
+        return [int(value) for value in tokenized["attention_mask"].sum(dim=1).tolist()]
+
+    def _accumulate_totals(
+        self,
+        target: dict[str, float],
+        update: dict[str, float],
+    ) -> None:
+        for key, value in update.items():
+            target[key] = target.get(key, 0.0) + float(value)
+
+    def _mean(self, values: list[float] | list[int]) -> float:
+        if not values:
+            return 0.0
+        return float(sum(values) / len(values))
+
+    def _truncate(self, text: str, *, limit: int = 240) -> str:
+        normalized = " ".join(text.strip().split())
+        if len(normalized) <= limit:
+            return normalized
+        return normalized[: limit - 3] + "..."
 
     def save_checkpoint(self, path: str) -> None:
         """Save model checkpoint."""

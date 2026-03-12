@@ -1,0 +1,31 @@
+model:
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  num_threads: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  num_threads: 1
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 4
+  max_epochs: 3
+  kl_coefficient: 0.0
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  pushgateway_url: http://localhost:9091
+  job_name: flashrl
+
+runtime:
+  reference_enabled: false
+
+hooks:
+  rollout_fn: examples.reasoning.train:reasoning_rollout_fn
+  reward_fn: examples.reasoning.train:reasoning_reward_fn
+  dataset_fn: examples.reasoning.train:build_dataset

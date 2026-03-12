@@ -1,7 +1,7 @@
-"""Configuration models for FlashRL components."""
+"""Configuration models for FlashRL components and YAML-driven runs."""
 
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, Field
 
@@ -28,6 +28,7 @@ class TrainerConfig(BaseConfig):
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10
+    clip_epsilon: float = 0.2
     kl_coefficient: float = 0.0
     gamma: float = 1.0  # Discount factor
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -44,6 +45,10 @@ class ModelConfig(BaseConfig):
     trust_remote_code: bool = False
     num_threads: int = 1  # Default to 1 CPU thread
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+
+class ServingConfig(ModelConfig):
+    """Configuration for the serving model copy."""
 
 
 class RolloutConfig(BaseConfig):
@@ -76,4 +81,41 @@ class LoggingConfig(BaseConfig):
     sample_every_steps: int = 10
     console: bool = True
     file: bool = True
+    console_mode: Literal["compact", "verbose"] = "compact"
     rich_progress: bool = False
+
+
+class MetricsConfig(BaseConfig):
+    """Configuration for Prometheus/Grafana observability."""
+
+    enabled: bool = True
+    backend: Literal["pushgateway"] = "pushgateway"
+    pushgateway_url: str = "http://localhost:9091"
+    job_name: str = "flashrl"
+
+
+class RuntimeConfig(BaseConfig):
+    """Runtime options that sit outside the model/trainer sections."""
+
+    reference_enabled: bool = False
+    reference_device: str | None = None
+
+
+class HookConfig(BaseConfig):
+    """Python import-string hooks used by YAML-driven runs."""
+
+    rollout_fn: str
+    reward_fn: str
+    dataset_fn: str
+
+
+class RunConfig(BaseConfig):
+    """Top-level YAML config for one FlashRL run."""
+
+    model: ModelConfig
+    serving: ServingConfig | None = None
+    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    hooks: HookConfig

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,8 +11,8 @@ import pytest
 import torch
 import torch.nn.functional as F
 
-import flashrl.flashrl as flashrl_module
-from flashrl import FlashRL, LoggingConfig
+import flashrl.framework.flashrl as flashrl_module
+from flashrl.framework import FlashRL, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
 from flashrl.framework.data_models import (
     Conversation,
@@ -209,6 +210,222 @@ def read_events(run_dir: Path) -> list[dict]:
     ]
 
 
+def read_rollouts(run_dir: Path) -> list[dict]:
+    """Read full rollout history records from a run directory."""
+    return [
+        json.loads(line)
+        for line in (run_dir / "rollouts.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+
+def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
+    """Starting a run should create the run directory and log files."""
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        model_name="org/model-name",
+    )
+
+    logger.start_run(
+        dataset_size=4,
+        batch_size=2,
+        max_epochs=1,
+        total_batches=2,
+        device="cpu",
+        dtype="float32",
+        cpu_threads=1,
+        runtime_shape="single-device-per-backend",
+        reference_enabled=False,
+        reference_device="auto",
+    )
+
+    assert logger.run_dir.exists()
+    assert (logger.run_dir / "events.jsonl").exists()
+    assert (logger.run_dir / "console.log").exists()
+    assert (logger.run_dir / "rollouts.jsonl").exists()
+
+    events = read_events(logger.run_dir)
+    assert any(event["event"] == "run_started" for event in events)
+
+    logger.close()
+
+
+def test_run_logger_sanitizes_model_name_in_run_dir(tmp_path: Path) -> None:
+    """Model names with path separators should not leak into the directory layout."""
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        model_name="Org/Model Name@v1",
+    )
+
+    assert "/" not in logger.run_dir.name
+    assert "org-model-name-v1" in logger.run_dir.name
+
+
+def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
+    """Compact mode should render grouped step blocks instead of repeated prefixes."""
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+            console_mode="compact",
+        ),
+        model_name="org/model-name",
+    )
+
+    logger.start_run(
+        dataset_size=4,
+        batch_size=2,
+        max_epochs=1,
+        total_batches=2,
+        device="cpu",
+        dtype="float32",
+        cpu_threads=1,
+        runtime_shape="single-device-per-backend",
+        reference_enabled=False,
+        reference_device="auto",
+    )
+    logger.log_model_load(
+        "training_backend",
+        "completed",
+        {
+            "device": "cpu",
+            "cpu_threads": 1,
+            "duration_seconds": 1.25,
+        },
+    )
+    logger.log_epoch_start(epoch=1, total_epochs=1, num_batches=2)
+    logger.log_step_stage(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 2,
+            "batch_size": 2,
+            "stage": "rollout",
+            "latency_seconds": 0.25,
+            "prompt_tokens_mean": 12.5,
+            "prompt_tokens_max": 16,
+            "response_tokens_mean": 24.0,
+            "response_tokens_max": 30,
+        }
+    )
+    logger.log_step_stage(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 2,
+            "batch_size": 2,
+            "stage": "reward",
+            "latency_seconds": 0.002,
+            "reward_mean": 1.5,
+            "reward_std": 0.5,
+            "reward_min": 1,
+            "reward_max": 2,
+            "reward_per_item_mean_seconds": 0.001,
+        }
+    )
+    logger.log_step_done(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 2,
+            "batch_size": 2,
+            "loss": 0.125,
+            "policy_loss": 0.1,
+            "kl_divergence": 0.025,
+            "reward_mean": 1.5,
+            "response_tokens_total": 48,
+            "tokens_per_second": 96.0,
+            "step_duration_seconds": 0.5,
+            "stage_timings": {
+                "rollout": 0.25,
+                "reward": 0.002,
+                "reference_forward": 0.0,
+            },
+            "stage_order": ["rollout", "reward"],
+            "reference_enabled": False,
+            "reference_active": False,
+            "dominant_stage": "rollout",
+        }
+    )
+    logger.log_sample_preview(
+        step=1,
+        prompt="prompt text",
+        response="response text",
+        reward=1.5,
+    )
+    logger.log_epoch_summary(
+        {
+            "epoch": 1,
+            "total_epochs": 1,
+            "loss": 0.125,
+            "reward": 1.5,
+            "kl_divergence": 0.025,
+            "tokens_per_second": 96.0,
+            "duration_seconds": 0.75,
+            "stage_totals": {"rollout": 0.25, "reward": 0.002},
+        }
+    )
+    logger.finish_run(
+        status="completed",
+        total_steps=1,
+        lifecycle_totals={"startup_total_seconds": 1.25, "training_loop_seconds": 0.75},
+    )
+
+    transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
+    assert "FlashRL training run\n  run      " in transcript
+    assert "load training_backend" in transcript
+    assert "step 1/2  epoch 1/1  batch 1/2  batch_size=2" in transcript
+    assert "  rollout" in transcript
+    assert "prompt_tok 12.5/16" in transcript
+    assert "response_tok 24.0/30" in transcript
+    assert "  reward" in transcript
+    assert "mean 1.5000" in transcript
+    assert "  done" in transcript
+    assert "dominant rollout" in transcript
+    assert "epoch 1/1 summary" in transcript
+    assert "  lifecycle startup 1.250s | train_loop 750.0ms" in transcript
+    assert "  stages    rollout 250.0ms" in transcript
+    assert "step=1 epoch=1/1" not in transcript
+    assert "sample" not in transcript
+
+    events = read_events(logger.run_dir)
+    assert any(event["event"] == "sample_preview" for event in events)
+
+    logger.close()
+
+
+def test_framework_is_the_only_supported_flashrl_import_surface() -> None:
+    """FlashRL should live under flashrl.framework only."""
+    namespace = {}
+
+    exec(
+        "from flashrl.framework import FlashRL as ImportedFlashRL, LoggingConfig as ImportedLoggingConfig",
+        {},
+        namespace,
+    )
+
+    assert namespace["ImportedFlashRL"] is FlashRL
+    assert namespace["ImportedLoggingConfig"] is LoggingConfig
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.flashrl")
+
+
 def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -251,6 +468,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
             console=False,
             file=True,
         ),
+        metrics_config=MetricsConfig(enabled=False),
     )
     assert FakeTrainingBackend.init_count == 1
     assert FakeServingBackend.init_count == 1
@@ -317,6 +535,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
             log_dir=tmp_path,
             console=False,
             file=True,
+            console_mode="verbose",
             log_every_steps=1,
             sample_every_steps=2,
         ),
@@ -349,12 +568,12 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     logger.finish_run(status="completed", total_steps=trainer.total_steps)
 
     events = read_events(logger.run_dir)
-    step_phases = [
-        event["payload"]["phase"]
+    step_stages = [
+        event["payload"]["stage"]
         for event in events
-        if event["event"] == "step_phase" and event["payload"]["step"] == 1
+        if event["event"] == "step_stage" and event["payload"]["step"] == 1
     ]
-    assert step_phases == [
+    assert step_stages == [
         "rollout",
         "reward",
         "advantage",
@@ -369,27 +588,28 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     rollout_event = next(
         event
         for event in events
-        if event["event"] == "step_phase"
+        if event["event"] == "step_stage"
         and event["payload"]["step"] == 1
-        and event["payload"]["phase"] == "rollout"
+        and event["payload"]["stage"] == "rollout"
     )
     assert "prompt_tokens_mean" in rollout_event["payload"]
     assert "response_tokens_max" in rollout_event["payload"]
+    assert "phase" not in rollout_event["payload"]
 
     reward_event = next(
         event
         for event in events
-        if event["event"] == "step_phase"
+        if event["event"] == "step_stage"
         and event["payload"]["step"] == 1
-        and event["payload"]["phase"] == "reward"
+        and event["payload"]["stage"] == "reward"
     )
     assert "reward_mean" in reward_event["payload"]
     assert "reward_std" in reward_event["payload"]
 
     step_done = next(event for event in events if event["event"] == "step_done")
     assert step_done["payload"]["reference_enabled"] is False
-    assert step_done["payload"]["timings"]["reference_forward_seconds"] == 0.0
-    assert [entry["name"] for entry in step_done["payload"]["phase_breakdown"]] == [
+    assert step_done["payload"]["stage_timings"]["reference_forward"] == 0.0
+    assert step_done["payload"]["stage_order"] == [
         "rollout",
         "reward",
         "advantage",
@@ -401,34 +621,174 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "optimizer",
         "sync",
     ]
-    assert set(step_done["payload"]["phase_groups"]) == {
-        "rollout",
-        "reward",
-        "calculate_loss",
-        "train",
-    }
+    assert step_done["payload"]["dominant_stage"] in step_done["payload"]["stage_timings"]
+    assert "phase_breakdown" not in step_done["payload"]
+    assert "phase_groups" not in step_done["payload"]
+    assert "timings" not in step_done["payload"]
 
     epoch_summary = next(event for event in events if event["event"] == "epoch_summary")
-    assert "hot_path_totals" in epoch_summary["payload"]
-    assert "hot_path_percentages" in epoch_summary["payload"]
-    assert "phase_group_totals" in epoch_summary["payload"]
-    assert "phase_group_percentages" in epoch_summary["payload"]
-    assert epoch_summary["payload"]["hot_path_totals"].get("reference_forward_seconds", 0.0) == 0.0
+    assert "stage_totals" in epoch_summary["payload"]
+    assert "stage_percentages" in epoch_summary["payload"]
+    assert epoch_summary["payload"]["stage_totals"].get("reference_forward", 0.0) == 0.0
+    assert "hot_path_totals" not in epoch_summary["payload"]
+    assert "phase_group_totals" not in epoch_summary["payload"]
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "runtime=single-device-per-backend reference=disabled" in transcript
     assert "cpu_threads=1" in transcript
-    assert "step=1 epoch=1/1 batch=1/3 batch_size=2 phase=rollout stage=rollout" in transcript
-    assert "phase=reward stage=reward" in transcript
-    assert "phase=loss_assembly stage=calculate_loss" in transcript
-    assert "phase=backward stage=train" in transcript
-    assert "phase=step_done stage=complete" in transcript
-    assert "reference_forward=" not in transcript
+    assert "step=1 epoch=1/1 batch=1/3 batch_size=2 stage=rollout" in transcript
+    assert "stage=reward" in transcript
+    assert "stage=loss_assembly" in transcript
+    assert "stage=backward" in transcript
+    assert "stage=complete" in transcript
+    assert "phase=" not in transcript
     assert "━" not in transcript
+    assert "sample step" not in transcript
+
+    rollouts = read_rollouts(logger.run_dir)
+    assert len(rollouts) == len(dataset)
+    first_rollout = rollouts[0]
+    assert first_rollout["run_id"] == logger.run_id
+    assert first_rollout["step"] == 1
+    assert first_rollout["sample_index"] == 1
+    assert first_rollout["prompt"]["text"] == "prompt 0"
+    assert first_rollout["rollout"]["response_text"].startswith("sample detail")
+    assert first_rollout["conversation"]["messages"][0]["role"] == "user"
+    assert first_rollout["conversation"]["messages"][1]["role"] == "assistant"
+    assert first_rollout["reward"]["value"] > 0.0
 
     logger.close()
 
 
+def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
+    """Loss assembly should use response-only GRPO terms and stored rollout log-probs."""
+    training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
+    serving_backend = FakeServingBackend(config=None)
+    reference = FakeReferenceModel(config=None)
+    trainer = GRPOTrainer(
+        config=TrainerConfig(
+            batch_size=2,
+            max_epochs=1,
+            clip_epsilon=0.2,
+            kl_coefficient=0.3,
+        ),
+        training_backend=training_backend,
+        serving_backend=serving_backend,
+        reference=reference,
+        reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
+        rollout_generator=UserDefinedRollout(
+            rollout_fn=make_rollout_fn(response_suffix="loss", repeat=2),
+            actor=serving_backend.actor,
+            config=SimpleNamespace(),
+        ),
+        run_logger=None,
+    )
+
+    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+    rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(prompts, serving_backend.actor)
+    prompt_texts = [prompt.text for prompt in prompts]
+    response_texts = [rollout.text for rollout in rollouts]
+    full_texts = [
+        prompt + response
+        for prompt, response in zip(prompt_texts, response_texts, strict=True)
+    ]
+
+    actor = training_backend.actor
+    full_inputs, _, _ = trainer._tokenize(actor, full_texts)
+    prompt_inputs, _, _ = trainer._tokenize(actor, prompt_texts)
+    input_ids = full_inputs["input_ids"].to(actor.device)
+    attention_mask = full_inputs["attention_mask"].to(actor.device)
+    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+
+    actor_logits = actor.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits
+    with torch.no_grad():
+        ref_logits = reference.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).logits
+
+    advantages = torch.tensor([1.25, -0.5], dtype=torch.float32)
+    rollout_response_log_probs = trainer._compute_rollout_response_log_probs(
+        prompt_texts,
+        response_texts,
+    )
+
+    loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = trainer._assemble_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=None,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        kl_coefficient=trainer.config.kl_coefficient,
+        clip_epsilon=trainer.config.clip_epsilon,
+    )
+
+    assert loss_no_ref.item() == pytest.approx(policy_no_ref.item())
+    assert kl_no_ref.item() == pytest.approx(0.0)
+    assert response_tokens_total == sum(len(sample) for sample in rollout_response_log_probs)
+
+    prompt_only_mutated_logits = actor_logits.clone()
+    for index, prompt_length in enumerate(prompt_lengths.tolist()):
+        prompt_positions = max(int(prompt_length) - 1, 0)
+        if prompt_positions == 0:
+            continue
+        prompt_only_mutated_logits[index, :prompt_positions, 0] += 25.0
+
+    mutated_loss, mutated_policy, mutated_kl, _ = trainer._assemble_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=prompt_only_mutated_logits,
+        ref_logits=None,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        kl_coefficient=trainer.config.kl_coefficient,
+        clip_epsilon=trainer.config.clip_epsilon,
+    )
+
+    assert mutated_loss.item() == pytest.approx(loss_no_ref.item())
+    assert mutated_policy.item() == pytest.approx(policy_no_ref.item())
+    assert mutated_kl.item() == pytest.approx(0.0)
+
+    loss_with_ref, policy_with_ref, kl_with_ref, _ = trainer._assemble_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=ref_logits,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        kl_coefficient=trainer.config.kl_coefficient,
+        clip_epsilon=trainer.config.clip_epsilon,
+    )
+
+    expected_total = policy_with_ref.item() + trainer.config.kl_coefficient * kl_with_ref.item()
+    assert loss_with_ref.item() == pytest.approx(expected_total)
+    assert kl_with_ref.item() >= 0.0
+
+    shifted_rollout_log_probs = [
+        [value - 0.5 for value in sample]
+        for sample in rollout_response_log_probs
+    ]
+    shifted_loss, shifted_policy, _, _ = trainer._assemble_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=None,
+        rollout_response_log_probs=shifted_rollout_log_probs,
+        advantages=advantages,
+        kl_coefficient=trainer.config.kl_coefficient,
+        clip_epsilon=trainer.config.clip_epsilon,
+    )
+
+    assert shifted_policy.item() != pytest.approx(policy_no_ref.item())
+    assert shifted_loss.item() != pytest.approx(loss_no_ref.item())
 def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -448,6 +808,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
             console=True,
             file=True,
         ),
+        metrics_config=MetricsConfig(enabled=False),
     )
     dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
 
@@ -458,16 +819,25 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
 
     output = capsys.readouterr().out
     assert "FlashRL training run" in output
-    assert "cpu_threads=1" in output
+    assert "  run      " in output
+    assert "cpu=1" in output
     assert "reference=disabled" in output
+    assert "load training_backend" in output
+    assert "load serving_backend" in output
     assert "loaded reference_model" not in output
-    assert "epoch 1 summary" in output
-    assert "lifecycle " in output
-    assert "phase=rollout stage=rollout" in output
-    assert "phase=reward stage=reward" in output
-    assert "phase=tokenize_full stage=calculate_loss" in output
-    assert "phase=backward stage=train" in output
-    assert "phase=step_done stage=complete" in output
+    assert "step 1/2  epoch 1/1  batch 1/2  batch_size=2" in output
+    assert "  rollout" in output
+    assert "  reward" in output
+    assert "  tokenize_full" in output
+    assert "  backward" in output
+    assert "  done" in output
+    assert "epoch 1/1 summary" in output
+    assert "  lifecycle " in output
+    assert "  stages    " in output
+    assert "step=1 epoch=1/1" not in output
+    assert "stage=rollout" not in output
+    assert "sample" not in output
+    assert "phase=" not in output
     assert "stage initializing" not in output
     assert "━" not in output
 
@@ -479,10 +849,18 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     )
     run_finished = next(event for event in events if event["event"] == "run_finished")
     assert "lifecycle_totals" in run_finished["payload"]
-    assert "hot_path_totals" in run_finished["payload"]
-    assert "phase_group_totals" in run_finished["payload"]
+    assert "stage_totals" in run_finished["payload"]
+    assert "stage_percentages" in run_finished["payload"]
     assert "startup_total_seconds" in run_finished["payload"]["lifecycle_totals"]
     assert run_finished["payload"]["no_training_steps_completed"] is False
+    assert "hot_path_totals" not in run_finished["payload"]
+    assert "phase_group_totals" not in run_finished["payload"]
+
+    rollouts = read_rollouts(trainer._run_logger.run_dir)
+    assert len(rollouts) == len(dataset)
+    assert rollouts[0]["prompt"]["text"] == "prompt 0"
+    assert rollouts[0]["reward"]["value"] > 0.0
+    assert rollouts[0]["conversation"]["messages"][0]["content"] == "prompt 0"
 
     trainer._run_logger.close()
 
@@ -507,6 +885,7 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
             console=False,
             file=True,
         ),
+        metrics_config=MetricsConfig(enabled=False),
     )
     dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
 
@@ -521,20 +900,18 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
     step_event = next(event for event in events if event["event"] == "step_done")
     assert step_event["payload"]["reference_enabled"] is True
     assert step_event["payload"]["reference_active"] is True
-    assert step_event["payload"]["timings"]["reference_forward_seconds"] > 0
+    assert step_event["payload"]["stage_timings"]["reference_forward"] > 0
+    assert "reference_forward" in step_event["payload"]["stage_order"]
     assert any(
-        entry["name"] == "reference_forward"
-        for entry in step_event["payload"]["phase_breakdown"]
-    )
-    assert any(
-        event["event"] == "step_phase"
-        and event["payload"].get("phase") == "reference_forward"
+        event["event"] == "step_stage"
+        and event["payload"].get("stage") == "reference_forward"
         for event in events
     )
 
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
-    assert "phase=reference_forward stage=calculate_loss" in transcript
-    assert "full_tokens_total=" in transcript
+    assert "reference=enabled" in transcript
+    assert "  reference_forward" in transcript
+    assert "full_tok_total" in transcript
 
     trainer._run_logger.close()
 
@@ -557,6 +934,7 @@ def test_flashrl_checkpoint_works_before_train_and_resume_skips_reset(
             console=False,
             file=True,
         ),
+        metrics_config=MetricsConfig(enabled=False),
     )
     checkpoint_path = tmp_path / "resume-checkpoint.pt"
 
@@ -598,6 +976,7 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
             console=False,
             file=True,
         ),
+        metrics_config=MetricsConfig(enabled=False),
     )
     dataset = [Prompt(text="why did reward fail?")]
 
@@ -616,10 +995,10 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
 
     run_finished = next(event for event in events if event["event"] == "run_finished")
     assert run_finished["payload"]["no_training_steps_completed"] is True
-    assert run_finished["payload"]["hot_path_totals"] == {}
-    step_phases = [event for event in events if event["event"] == "step_phase"]
-    assert len(step_phases) == 1
-    assert step_phases[0]["payload"]["phase"] == "rollout"
+    assert run_finished["payload"]["stage_totals"] == {}
+    step_stages = [event for event in events if event["event"] == "step_stage"]
+    assert len(step_stages) == 1
+    assert step_stages[0]["payload"]["stage"] == "rollout"
     assert all(event["event"] != "step_done" for event in events)
 
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")

@@ -14,7 +14,7 @@ source dev.sh
 python3 -m pytest tests/ -v
 
 # Test imports
-python3 -c "from flashrl.framework import BaseTrainer, BaseRollout"
+python3 -c "from flashrl.framework import FlashRL, RunConfig"
 ```
 
 ### Project Structure
@@ -41,16 +41,19 @@ rm -rf .cache/
 
 ## Quick Start
 
-### Try the Examples
+### Run the Reasoning Example
 
-**Quick test (no download):**
+The reasoning example now lives in its own folder with a thin training script
+and a YAML config:
+
 ```bash
-python3 examples/train_grpo_simple.py
+python3 -m examples.reasoning.train
 ```
 
-**Full training (downloads GPT-2):**
+Or run it directly from YAML:
+
 ```bash
-python3 examples/train_grpo.py
+python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```
 
 See [examples/README.md](examples/README.md) for details.
@@ -63,9 +66,9 @@ See [examples/README.md](examples/README.md) for details.
 
 **What works:**
 - Data models and configuration system
+- YAML-driven example runs
 - Model wrappers (Actor, Reference, Critic)
 - GRPO trainer structure
-- Simple rollout and reward functions
 - Training pipeline examples
 
 **Next steps:**

@@ -1,0 +1,11 @@
+apiVersion: 1
+
+providers:
+  - name: FlashRL
+    orgId: 1
+    folder: FlashRL
+    type: file
+    disableDeletion: true
+    updateIntervalSeconds: 5
+    options:
+      path: /var/lib/grafana/dashboards
