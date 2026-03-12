@@ -40,6 +40,10 @@ class ServingBackend:
         """
         return self.actor.generate(prompts, **kwargs)
 
+    def generate_batch(self, prompts: list[str], **kwargs: Any) -> list[Any]:
+        """Generate one structured sample per prompt."""
+        return self.actor.generate_batch(prompts, **kwargs)
+
     def generate_grouped(
         self,
         prompts: list[str],

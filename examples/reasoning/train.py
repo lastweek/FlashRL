@@ -35,31 +35,27 @@ REASONING_PROMPTS = [
 def reasoning_rollout_fn(
     prompts: list[Prompt],
     actor,
-    group_size: int,
-) -> list[list[RolloutOutput]]:
-    """Generate grouped reasoning rollouts with the actor model."""
-    grouped_samples = actor.generate_grouped([prompt.text for prompt in prompts], group_size)
-    grouped_rollouts: list[list[RolloutOutput]] = []
-    for prompt, samples in zip(prompts, grouped_samples, strict=True):
-        prompt_rollouts: list[RolloutOutput] = []
-        for sample in samples:
-            prompt_rollouts.append(
-                RolloutOutput(
-                    text=sample.text,
-                    log_prob=sample.log_prob,
-                    prompt_token_ids=sample.prompt_token_ids,
-                    response_token_ids=sample.response_token_ids,
-                    response_token_logprobs=sample.response_token_logprobs,
-                    conversation=Conversation(
-                        messages=[
-                            Message(role="user", content=prompt.text),
-                            Message(role="assistant", content=sample.text),
-                        ]
-                    ),
-                )
+    ) -> list[RolloutOutput]:
+    """Generate one reasoning rollout per prompt with the actor model."""
+    samples = actor.generate_batch([prompt.text for prompt in prompts])
+    rollouts: list[RolloutOutput] = []
+    for prompt, sample in zip(prompts, samples, strict=True):
+        rollouts.append(
+            RolloutOutput(
+                text=sample.text,
+                log_prob=sample.log_prob,
+                prompt_token_ids=sample.prompt_token_ids,
+                response_token_ids=sample.response_token_ids,
+                response_token_logprobs=sample.response_token_logprobs,
+                conversation=Conversation(
+                    messages=[
+                        Message(role="user", content=prompt.text),
+                        Message(role="assistant", content=sample.text),
+                    ]
+                ),
             )
-        grouped_rollouts.append(prompt_rollouts)
-    return grouped_rollouts
+        )
+    return rollouts
 
 
 def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:

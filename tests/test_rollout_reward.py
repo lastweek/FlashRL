@@ -23,14 +23,9 @@ def test_user_defined_rollout_generate_applies_generation_defaults() -> None:
     def rollout_fn(
         prompts: list[Prompt],
         wrapped_actor: TinyActor,
-        group_size: int,
-    ) -> list[list[RolloutOutput]]:
+    ) -> list[RolloutOutput]:
         captured_defaults.append(dict(wrapped_actor.generation_defaults))
-        return make_rollout_fn(response_suffix="rollout", repeat=1)(
-            prompts,
-            wrapped_actor,
-            group_size,
-        )
+        return make_rollout_fn(response_suffix="rollout", repeat=1)(prompts, wrapped_actor)
 
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn,
@@ -89,30 +84,29 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor, group_size: make_rollout_fn(
+        rollout_fn=lambda prompts, wrapped_actor: make_rollout_fn(
             response_suffix="invalid",
             repeat=1,
-        )(prompts[:-1], wrapped_actor, group_size),
+        )(prompts[:-1], wrapped_actor),
         actor=actor,
         config=RolloutConfig(),
     )
-    with pytest.raises(ValueError, match="one candidate list per input prompt"):
+    with pytest.raises(ValueError, match="one output per input prompt"):
         invalid.generate_grouped(prompts, group_size=2)
 
 
-def test_user_defined_rollout_generate_grouped_calls_hook_once_with_unique_prompts() -> None:
-    """Grouped rollout should pass unique prompts to the hook instead of duplicating them in Python."""
+def test_user_defined_rollout_generate_grouped_repeats_unique_prompt_batches_per_candidate() -> None:
+    """Grouped rollout should repeat the same unique-prompt batch once per candidate pass."""
     actor = TinyActor()
-    observed_calls: list[tuple[list[str], int]] = []
+    observed_calls: list[list[str]] = []
 
     def rollout_fn(
         prompts: list[Prompt],
         wrapped_actor: TinyActor,
-        group_size: int,
-    ) -> list[list[RolloutOutput]]:
+    ) -> list[RolloutOutput]:
         del wrapped_actor
-        observed_calls.append(([prompt.text for prompt in prompts], group_size))
-        return make_rollout_fn(response_suffix="grouped", repeat=1)(prompts, actor, group_size)
+        observed_calls.append([prompt.text for prompt in prompts])
+        return make_rollout_fn(response_suffix="grouped", repeat=1)(prompts, actor)
 
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn,
@@ -125,7 +119,11 @@ def test_user_defined_rollout_generate_grouped_calls_hook_once_with_unique_promp
         group_size=3,
     )
 
-    assert observed_calls == [(["prompt 0", "prompt 1"], 3)]
+    assert observed_calls == [
+        ["prompt 0", "prompt 1"],
+        ["prompt 0", "prompt 1"],
+        ["prompt 0", "prompt 1"],
+    ]
 
 
 def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handles_empty() -> None:
@@ -137,7 +135,7 @@ def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handl
         config=RolloutConfig(),
     )
     empty = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor, group_size: [[] for _ in prompts],
+        rollout_fn=lambda prompts, wrapped_actor: [],
         actor=actor,
         config=RolloutConfig(),
     )

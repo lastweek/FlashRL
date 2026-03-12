@@ -32,6 +32,7 @@ python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 - keeps logging in compact console mode
 - keeps metrics enabled by default
 - wires the rollout, reward, and dataset hooks through Python import strings
+- keeps the public rollout hook sample-oriented: one rollout per input prompt
 - treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
 
 **Shared defaults with training/serving overrides:**

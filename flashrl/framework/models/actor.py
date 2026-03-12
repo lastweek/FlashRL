@@ -55,6 +55,15 @@ class ActorModel:
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
 
+    def generate_batch(
+        self,
+        prompts: list[str],
+        **kwargs: Any,
+    ) -> list[GeneratedSample]:
+        """Generate one structured sample per prompt."""
+        grouped_outputs = self.generate_grouped(prompts, group_size=1, **kwargs)
+        return [candidates[0] for candidates in grouped_outputs]
+
     def generate_grouped(
         self,
         prompts: list[str],
@@ -132,8 +141,7 @@ class ActorModel:
 
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
         """Generate text from prompts."""
-        grouped_outputs = self.generate_grouped(prompts, group_size=1, **kwargs)
-        return [candidates[0].text for candidates in grouped_outputs]
+        return [sample.text for sample in self.generate_batch(prompts, **kwargs)]
 
     def set_generation_defaults(self, **kwargs: Any) -> None:
         """Set default generation kwargs used when rollout code does not pass them explicitly."""

@@ -101,10 +101,37 @@ class FakeActor:
         self.tokenizer = FakeTokenizer()
         self.model = FakeCausalLM(self.tokenizer.vocab_size, bias_shift=bias_shift)
         self.generation_defaults: dict[str, object] = {}
+        self._batch_call_index = 0
 
     def generate(self, prompts: list[str], **kwargs) -> list[str]:
+        return [sample.text for sample in self.generate_batch(prompts, **kwargs)]
+
+    def generate_batch(self, prompts: list[str], **kwargs):
         del kwargs
-        return [f"generated::{prompt}" for prompt in prompts]
+        call_index = self._batch_call_index
+        self._batch_call_index += 1
+        outputs = []
+        for prompt in prompts:
+            prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
+            response = f"generated::{prompt}::{call_index}"
+            response_token_ids = self.tokenizer._encode(
+                response,
+                max_length=self.config.max_length,
+            )[:4]
+            response_token_logprobs = [
+                -0.1 - 0.01 * call_index - 0.001 * token_index
+                for token_index in range(len(response_token_ids))
+            ]
+            outputs.append(
+                SimpleNamespace(
+                    text=response,
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    response_token_logprobs=response_token_logprobs,
+                    log_prob=float(sum(response_token_logprobs)),
+                )
+            )
+        return outputs
 
     def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
         del kwargs
@@ -193,37 +220,38 @@ class FakeReferenceModel:
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
     """Create a rollout function with deterministic responses."""
 
-    def rollout_fn(prompts: list[Prompt], actor, group_size: int) -> list[list[RolloutOutput]]:
+    call_index = 0
+
+    def rollout_fn(prompts: list[Prompt], actor) -> list[RolloutOutput]:
+        nonlocal call_index
         outputs = []
         for prompt in prompts:
             prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
-            prompt_outputs = []
-            for candidate_index in range(group_size):
-                response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{candidate_index}"
-                response_token_ids = actor.tokenizer._encode(
-                    response,
-                    max_length=actor.config.max_length,
-                )[:4]
-                response_token_logprobs = [
-                    -0.05 - 0.01 * candidate_index - 0.001 * token_index
-                    for token_index in range(len(response_token_ids))
-                ]
-                prompt_outputs.append(
-                    RolloutOutput(
-                        text=response,
-                        log_prob=float(sum(response_token_logprobs)),
-                        prompt_token_ids=prompt_token_ids,
-                        response_token_ids=response_token_ids,
-                        response_token_logprobs=response_token_logprobs,
-                        conversation=Conversation(
-                            messages=[
-                                Message(role="user", content=prompt.text),
-                                Message(role="assistant", content=response),
-                            ]
-                        ),
-                    )
+            response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{call_index}"
+            response_token_ids = actor.tokenizer._encode(
+                response,
+                max_length=actor.config.max_length,
+            )[:4]
+            response_token_logprobs = [
+                -0.05 - 0.01 * call_index - 0.001 * token_index
+                for token_index in range(len(response_token_ids))
+            ]
+            outputs.append(
+                RolloutOutput(
+                    text=response,
+                    log_prob=float(sum(response_token_logprobs)),
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    response_token_logprobs=response_token_logprobs,
+                    conversation=Conversation(
+                        messages=[
+                            Message(role="user", content=prompt.text),
+                            Message(role="assistant", content=response),
+                        ]
+                    ),
                 )
-            outputs.append(prompt_outputs)
+            )
+        call_index += 1
         return outputs
 
     return rollout_fn
@@ -756,9 +784,8 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
         prompts,
         serving_backend.actor,
-        1,
     )
-    rollouts = [candidates[0] for candidates in grouped_rollouts]
+    rollouts = grouped_rollouts
 
     actor = training_backend.actor
     input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
@@ -881,14 +908,14 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid_rollout = UserDefinedRollout(
-        rollout_fn=lambda prompts, actor, group_size: make_rollout_fn(
+        rollout_fn=lambda prompts, actor: make_rollout_fn(
             response_suffix="invalid",
             repeat=1,
-        )(prompts[:-1], actor, group_size),
+        )(prompts[:-1], actor),
         actor=serving_backend.actor,
         config=SimpleNamespace(),
     )
-    with pytest.raises(ValueError, match="one candidate list per input prompt"):
+    with pytest.raises(ValueError, match="one output per input prompt"):
         invalid_rollout.generate_grouped(prompts, group_size=2)
 
 

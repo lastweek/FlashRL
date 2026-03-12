@@ -62,10 +62,11 @@ def build_trainer(
 def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
     """A grouped GRPO step should consume batch_size/group_size unique prompts."""
     prompt_batches: list[list[str]] = []
+    rollout_impl = make_rollout_fn(response_suffix="batch", repeat=1)
 
-    def rollout_fn(prompts, actor, group_size):
+    def rollout_fn(prompts, actor):
         prompt_batches.append([prompt.text for prompt in prompts])
-        return make_rollout_fn(response_suffix="batch", repeat=1)(prompts, actor, group_size)
+        return rollout_impl(prompts, actor)
 
     trainer = build_trainer(batch_size=4, group_size=2, rollout_fn=rollout_fn)
     dataset = [Prompt(text=f"prompt {index}") for index in range(5)]
@@ -75,7 +76,10 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
     assert trainer._prompts_per_step() == 2
     assert prompt_batches == [
         ["prompt 0", "prompt 1"],
+        ["prompt 0", "prompt 1"],
         ["prompt 2", "prompt 3"],
+        ["prompt 2", "prompt 3"],
+        ["prompt 4"],
         ["prompt 4"],
     ]
 
@@ -119,9 +123,8 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
         prompts,
         trainer.serving_backend.actor,
-        1,
     )
-    rollouts = [candidates[0] for candidates in grouped_rollouts]
+    rollouts = grouped_rollouts
 
     actor = trainer.training_backend.actor
     input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
@@ -207,9 +210,8 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     grouped_rollouts = make_rollout_fn(response_suffix="align", repeat=2)(
         prompts,
         trainer.serving_backend.actor,
-        1,
     )
-    rollouts = [candidates[0] for candidates in grouped_rollouts]
+    rollouts = grouped_rollouts
     rollout_response_log_probs = [rollout.response_token_logprobs for rollout in rollouts]
 
     input_ids, attention_mask, prompt_lengths, _, _ = trainer._prepare_inputs(

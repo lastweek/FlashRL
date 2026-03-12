@@ -102,6 +102,23 @@ def test_actor_model_generate_grouped_returns_prompt_major_structured_candidates
     assert first.log_prob == pytest.approx(sum(first.response_token_logprobs))
 
 
+def test_actor_model_generate_batch_returns_structured_samples(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Batch generation should return one structured sample per prompt."""
+    tiny_model, _ = patch_hf_loaders(monkeypatch, actor_module)
+    actor = ActorModel(ModelConfig(model_name="fake/model", device="cpu"))
+
+    samples = actor.generate_batch(["ab", "xyz"], temperature=0.6)
+
+    assert len(samples) == 2
+    assert tiny_model.last_generate_kwargs is not None
+    assert tiny_model.last_generate_kwargs["num_return_sequences"] == 1
+    assert tiny_model.last_generate_kwargs["temperature"] == pytest.approx(0.6)
+    assert all(sample.prompt_token_ids for sample in samples)
+    assert all(len(sample.response_token_logprobs) == len(sample.response_token_ids) for sample in samples)
+
+
 def test_actor_model_compute_log_probs_returns_logits_on_target_device(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
