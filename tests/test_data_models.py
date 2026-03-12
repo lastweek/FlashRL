@@ -43,7 +43,14 @@ def test_training_batch_len_and_grouping_fields_are_preserved() -> None:
     """TrainingBatch should expose sample count through __len__ and keep grouping metadata intact."""
     prompts = [Prompt(text="p0"), Prompt(text="p0"), Prompt(text="p1"), Prompt(text="p1")]
     rollouts = [
-        RolloutOutput(text=f"r{index}", log_prob=0.0, conversation=Conversation(messages=[]))
+        RolloutOutput(
+            text=f"r{index}",
+            log_prob=0.0,
+            prompt_token_ids=[1],
+            response_token_ids=[2, 3],
+            response_token_logprobs=[-0.1, -0.2],
+            conversation=Conversation(messages=[]),
+        )
         for index in range(4)
     ]
     rewards = [RewardOutput(reward=float(index)) for index in range(4)]
@@ -56,7 +63,6 @@ def test_training_batch_len_and_grouping_fields_are_preserved() -> None:
         prompt_count=2,
         prompt_indices=[0, 0, 1, 1],
         candidate_indices=[0, 1, 0, 1],
-        rollout_response_log_probs=[[0.1], [0.2], [0.3], [0.4]],
     )
 
     assert len(batch) == 4
@@ -64,5 +70,3 @@ def test_training_batch_len_and_grouping_fields_are_preserved() -> None:
     assert batch.prompt_count == 2
     assert batch.prompt_indices == [0, 0, 1, 1]
     assert batch.candidate_indices == [0, 1, 0, 1]
-    assert batch.rollout_response_log_probs == [[0.1], [0.2], [0.3], [0.4]]
-

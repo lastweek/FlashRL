@@ -76,6 +76,30 @@ def test_actor_model_generation_defaults_merge_with_call_overrides(
     assert tiny_model.last_generate_kwargs["max_new_tokens"] == 7
     assert tiny_model.last_generate_kwargs["top_p"] == pytest.approx(0.7)
     assert tiny_model.last_generate_kwargs["do_sample"] is True
+    assert tiny_model.last_generate_kwargs["num_return_sequences"] == 1
+
+
+def test_actor_model_generate_grouped_returns_prompt_major_structured_candidates(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grouped generation should return prompt-major candidates with ids and token logprobs."""
+    tiny_model, _ = patch_hf_loaders(monkeypatch, actor_module)
+    actor = ActorModel(ModelConfig(model_name="fake/model", device="cpu"))
+
+    grouped = actor.generate_grouped(["ab", "xyz"], group_size=2, temperature=0.8)
+
+    assert len(grouped) == 2
+    assert [len(candidates) for candidates in grouped] == [2, 2]
+    assert tiny_model.last_generate_kwargs is not None
+    assert tiny_model.last_generate_kwargs["num_return_sequences"] == 2
+    assert tiny_model.last_generate_kwargs["temperature"] == pytest.approx(0.8)
+
+    first = grouped[0][0]
+    assert first.text == "decoded::30,31"
+    assert first.prompt_token_ids
+    assert first.response_token_ids == [30, 31]
+    assert len(first.response_token_logprobs) == len(first.response_token_ids)
+    assert first.log_prob == pytest.approx(sum(first.response_token_logprobs))
 
 
 def test_actor_model_compute_log_probs_returns_logits_on_target_device(
@@ -119,4 +143,3 @@ def test_reference_model_compute_log_probs_runs_without_grad(
     assert logits.shape == (1, 2, 32)
     assert tiny_model.grad_enabled_during_forward is False
     assert tiny_tokenizer.pad_token == tiny_tokenizer.eos_token
-

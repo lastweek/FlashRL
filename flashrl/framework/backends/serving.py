@@ -39,3 +39,12 @@ class ServingBackend:
             List of generated texts.
         """
         return self.actor.generate(prompts, **kwargs)
+
+    def generate_grouped(
+        self,
+        prompts: list[str],
+        group_size: int,
+        **kwargs: Any,
+    ) -> list[list[Any]]:
+        """Generate grouped candidates from prompts."""
+        return self.actor.generate_grouped(prompts, group_size, **kwargs)

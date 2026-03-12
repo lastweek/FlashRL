@@ -61,11 +61,11 @@ def build_trainer(
 
 def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
     """A grouped GRPO step should consume batch_size/group_size unique prompts."""
-    expanded_prompt_batches: list[list[str]] = []
+    prompt_batches: list[list[str]] = []
 
-    def rollout_fn(prompts, actor):
-        expanded_prompt_batches.append([prompt.text for prompt in prompts])
-        return make_rollout_fn(response_suffix="batch", repeat=1)(prompts, actor)
+    def rollout_fn(prompts, actor, group_size):
+        prompt_batches.append([prompt.text for prompt in prompts])
+        return make_rollout_fn(response_suffix="batch", repeat=1)(prompts, actor, group_size)
 
     trainer = build_trainer(batch_size=4, group_size=2, rollout_fn=rollout_fn)
     dataset = [Prompt(text=f"prompt {index}") for index in range(5)]
@@ -73,10 +73,10 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
     trainer.train(dataset)
 
     assert trainer._prompts_per_step() == 2
-    assert expanded_prompt_batches == [
-        ["prompt 0", "prompt 0", "prompt 1", "prompt 1"],
-        ["prompt 2", "prompt 2", "prompt 3", "prompt 3"],
-        ["prompt 4", "prompt 4"],
+    assert prompt_batches == [
+        ["prompt 0", "prompt 1"],
+        ["prompt 2", "prompt 3"],
+        ["prompt 4"],
     ]
 
 
@@ -116,23 +116,19 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     trainer = build_trainer(batch_size=2, group_size=2, kl_coefficient=0.3, reference=reference)
 
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
-    rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
+    grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
         prompts,
         trainer.serving_backend.actor,
+        1,
     )
-    prompt_texts = [prompt.text for prompt in prompts]
-    response_texts = [rollout.text for rollout in rollouts]
-    full_texts = [
-        prompt + response
-        for prompt, response in zip(prompt_texts, response_texts, strict=True)
-    ]
+    rollouts = [candidates[0] for candidates in grouped_rollouts]
 
     actor = trainer.training_backend.actor
-    full_inputs, _, _ = trainer._tokenize(actor, full_texts)
-    prompt_inputs, _, _ = trainer._tokenize(actor, prompt_texts)
-    input_ids = full_inputs["input_ids"].to(actor.device)
-    attention_mask = full_inputs["attention_mask"].to(actor.device)
-    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
+        SimpleNamespace(rollouts=rollouts),
+        actor,
+        actor.device,
+    )
 
     actor_logits = actor.model(
         input_ids=input_ids,
@@ -145,10 +141,6 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ).logits
 
     advantages = torch.tensor([1.25, -0.5], dtype=torch.float32)
-    rollout_response_log_probs = trainer._compute_rollout_response_log_probs(
-        prompt_texts,
-        response_texts,
-    )
 
     loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = trainer._assemble_loss(
         input_ids=input_ids,
@@ -212,26 +204,19 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     """Stored rollout log-probs should line up exactly with each sampled response length."""
     trainer = build_trainer(batch_size=2, group_size=2)
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
-    rollouts = make_rollout_fn(response_suffix="align", repeat=2)(
+    grouped_rollouts = make_rollout_fn(response_suffix="align", repeat=2)(
         prompts,
         trainer.serving_backend.actor,
+        1,
     )
-    prompt_texts = [prompt.text for prompt in prompts]
-    response_texts = [rollout.text for rollout in rollouts]
+    rollouts = [candidates[0] for candidates in grouped_rollouts]
+    rollout_response_log_probs = [rollout.response_token_logprobs for rollout in rollouts]
 
-    rollout_response_log_probs = trainer._compute_rollout_response_log_probs(
-        prompt_texts,
-        response_texts,
-    )
-
-    full_inputs, _, _ = trainer._tokenize(
+    input_ids, attention_mask, prompt_lengths, _, _ = trainer._prepare_inputs(
+        SimpleNamespace(rollouts=rollouts),
         trainer.training_backend.actor,
-        [prompt + response for prompt, response in zip(prompt_texts, response_texts, strict=True)],
+        trainer.training_backend.actor.device,
     )
-    prompt_inputs, _, _ = trainer._tokenize(trainer.training_backend.actor, prompt_texts)
-    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
-    input_ids = full_inputs["input_ids"]
-    attention_mask = full_inputs["attention_mask"]
     actor_logits = trainer.training_backend.actor.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
@@ -263,6 +248,27 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
             kl_coefficient=0.0,
             clip_ratio=trainer.grpo_config.clip_ratio,
         )
+
+
+def test_grpo_prepare_inputs_reuses_rollout_token_ids_without_tokenizer_calls() -> None:
+    """Input preparation should use rollout token ids directly and avoid tokenizer calls."""
+    trainer = build_trainer(batch_size=4, group_size=2)
+    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+    _, rollouts, _, _ = trainer.rollout_generator.generate_grouped(prompts, group_size=2)
+    actor = trainer.training_backend.actor
+    actor.tokenizer.calls.clear()
+
+    input_ids, attention_mask, prompt_lengths, full_lengths, rollout_response_log_probs = trainer._prepare_inputs(
+        SimpleNamespace(rollouts=rollouts),
+        actor,
+        actor.device,
+    )
+
+    assert actor.tokenizer.calls == []
+    assert input_ids.shape[0] == 4
+    assert attention_mask.sum(dim=1).tolist() == full_lengths
+    assert prompt_lengths.tolist() == [len(rollout.prompt_token_ids) for rollout in rollouts]
+    assert rollout_response_log_probs == [rollout.response_token_logprobs for rollout in rollouts]
 
 
 def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> None:

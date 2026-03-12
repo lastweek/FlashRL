@@ -20,9 +20,17 @@ def test_user_defined_rollout_generate_applies_generation_defaults() -> None:
     actor = TinyActor()
     captured_defaults: list[dict[str, object]] = []
 
-    def rollout_fn(prompts: list[Prompt], wrapped_actor: TinyActor) -> list[RolloutOutput]:
+    def rollout_fn(
+        prompts: list[Prompt],
+        wrapped_actor: TinyActor,
+        group_size: int,
+    ) -> list[list[RolloutOutput]]:
         captured_defaults.append(dict(wrapped_actor.generation_defaults))
-        return make_rollout_fn(response_suffix="rollout", repeat=1)(prompts, wrapped_actor)
+        return make_rollout_fn(response_suffix="rollout", repeat=1)(
+            prompts,
+            wrapped_actor,
+            group_size,
+        )
 
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn,
@@ -38,7 +46,7 @@ def test_user_defined_rollout_generate_applies_generation_defaults() -> None:
 
     outputs = rollout.generate([Prompt(text="hello")])
 
-    assert [output.text for output in outputs] == ["rollout detail hello"]
+    assert [output.text for output in outputs] == ["rollout detail hello::0"]
     assert captured_defaults == [
         {
             "max_new_tokens": 64,
@@ -72,21 +80,52 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
         "prompt 1",
     ]
     assert [rollout.text for rollout in rollouts] == [
-        "grouped detail prompt 0",
-        "grouped detail prompt 0",
-        "grouped detail prompt 1",
-        "grouped detail prompt 1",
+        "grouped detail prompt 0::0",
+        "grouped detail prompt 0::1",
+        "grouped detail prompt 1::0",
+        "grouped detail prompt 1::1",
     ]
     assert prompt_indices == [0, 0, 1, 1]
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor: rollout.generate(prompts[:-1]),
+        rollout_fn=lambda prompts, wrapped_actor, group_size: make_rollout_fn(
+            response_suffix="invalid",
+            repeat=1,
+        )(prompts[:-1], wrapped_actor, group_size),
         actor=actor,
         config=RolloutConfig(),
     )
-    with pytest.raises(ValueError, match="prompt_count \\* group_size"):
+    with pytest.raises(ValueError, match="one candidate list per input prompt"):
         invalid.generate_grouped(prompts, group_size=2)
+
+
+def test_user_defined_rollout_generate_grouped_calls_hook_once_with_unique_prompts() -> None:
+    """Grouped rollout should pass unique prompts to the hook instead of duplicating them in Python."""
+    actor = TinyActor()
+    observed_calls: list[tuple[list[str], int]] = []
+
+    def rollout_fn(
+        prompts: list[Prompt],
+        wrapped_actor: TinyActor,
+        group_size: int,
+    ) -> list[list[RolloutOutput]]:
+        del wrapped_actor
+        observed_calls.append(([prompt.text for prompt in prompts], group_size))
+        return make_rollout_fn(response_suffix="grouped", repeat=1)(prompts, actor, group_size)
+
+    rollout = UserDefinedRollout(
+        rollout_fn=rollout_fn,
+        actor=actor,
+        config=RolloutConfig(),
+    )
+
+    rollout.generate_grouped(
+        [Prompt(text="prompt 0"), Prompt(text="prompt 1")],
+        group_size=3,
+    )
+
+    assert observed_calls == [(["prompt 0", "prompt 1"], 3)]
 
 
 def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handles_empty() -> None:
@@ -98,7 +137,7 @@ def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handl
         config=RolloutConfig(),
     )
     empty = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor: [],
+        rollout_fn=lambda prompts, wrapped_actor, group_size: [[] for _ in prompts],
         actor=actor,
         config=RolloutConfig(),
     )
@@ -106,7 +145,7 @@ def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handl
     conversation = single.generate_conversation(Prompt(text="hello"))
     empty_conversation = empty.generate_conversation(Prompt(text="hello"))
 
-    assert conversation.messages[-1].content == "conv detail hello"
+    assert conversation.messages[-1].content == "conv detail hello::0"
     assert empty_conversation.messages == []
 
 
@@ -117,8 +156,22 @@ def test_user_defined_reward_compute_batch_preserves_order() -> None:
         config=RewardConfig(),
     )
     rollouts = [
-        RolloutOutput(text="a", log_prob=0.0, conversation=Conversation(messages=[])),
-        RolloutOutput(text="abcd", log_prob=0.0, conversation=Conversation(messages=[])),
+        RolloutOutput(
+            text="a",
+            log_prob=0.0,
+            prompt_token_ids=[1],
+            response_token_ids=[2],
+            response_token_logprobs=[-0.1],
+            conversation=Conversation(messages=[]),
+        ),
+        RolloutOutput(
+            text="abcd",
+            log_prob=0.0,
+            prompt_token_ids=[1],
+            response_token_ids=[2, 3],
+            response_token_logprobs=[-0.1, -0.2],
+            conversation=Conversation(messages=[]),
+        ),
     ]
 
     outputs = reward.compute_batch(rollouts)
@@ -146,4 +199,3 @@ def test_user_defined_reward_compute_conversation_reward_builds_fallback_text() 
 
     assert result.reward == pytest.approx(1.0)
     assert captured_texts == ["user: hello\nassistant: world"]
-

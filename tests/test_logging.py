@@ -34,6 +34,8 @@ class FakeTokenizer:
         self.vocab_size = vocab_size
         self.pad_token = "<pad>"
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = vocab_size - 1
         self.padding_side = "right"
 
     def __call__(
@@ -98,10 +100,42 @@ class FakeActor:
         self.config = SimpleNamespace(max_length=128)
         self.tokenizer = FakeTokenizer()
         self.model = FakeCausalLM(self.tokenizer.vocab_size, bias_shift=bias_shift)
+        self.generation_defaults: dict[str, object] = {}
 
     def generate(self, prompts: list[str], **kwargs) -> list[str]:
         del kwargs
         return [f"generated::{prompt}" for prompt in prompts]
+
+    def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
+        del kwargs
+        grouped_outputs = []
+        for prompt in prompts:
+            prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
+            prompt_outputs = []
+            for candidate_index in range(group_size):
+                response = f"generated::{prompt}::{candidate_index}"
+                response_token_ids = self.tokenizer._encode(
+                    response,
+                    max_length=self.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.1 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    SimpleNamespace(
+                        text=response,
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        log_prob=float(sum(response_token_logprobs)),
+                    )
+                )
+            grouped_outputs.append(prompt_outputs)
+        return grouped_outputs
+
+    def set_generation_defaults(self, **kwargs) -> None:
+        self.generation_defaults = dict(kwargs)
 
     def train(self) -> None:
         self.model.train()
@@ -159,23 +193,37 @@ class FakeReferenceModel:
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
     """Create a rollout function with deterministic responses."""
 
-    def rollout_fn(prompts: list[Prompt], actor) -> list[RolloutOutput]:
-        del actor
+    def rollout_fn(prompts: list[Prompt], actor, group_size: int) -> list[list[RolloutOutput]]:
         outputs = []
         for prompt in prompts:
-            response = f"{response_suffix} " + ("detail " * repeat) + prompt.text
-            outputs.append(
-                RolloutOutput(
-                    text=response,
-                    log_prob=0.0,
-                    conversation=Conversation(
-                        messages=[
-                            Message(role="user", content=prompt.text),
-                            Message(role="assistant", content=response),
-                        ]
-                    ),
+            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            prompt_outputs = []
+            for candidate_index in range(group_size):
+                response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{candidate_index}"
+                response_token_ids = actor.tokenizer._encode(
+                    response,
+                    max_length=actor.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.05 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    RolloutOutput(
+                        text=response,
+                        log_prob=float(sum(response_token_logprobs)),
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        conversation=Conversation(
+                            messages=[
+                                Message(role="user", content=prompt.text),
+                                Message(role="assistant", content=response),
+                            ]
+                        ),
+                    )
                 )
-            )
+            outputs.append(prompt_outputs)
         return outputs
 
     return rollout_fn
@@ -592,8 +640,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "rollout",
         "reward",
         "advantage",
-        "tokenize_full",
-        "tokenize_prompt",
+        "prepare_inputs",
         "actor_forward",
         "loss_assembly",
         "backward",
@@ -628,8 +675,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "rollout",
         "reward",
         "advantage",
-        "tokenize_full",
-        "tokenize_prompt",
+        "prepare_inputs",
         "actor_forward",
         "loss_assembly",
         "backward",
@@ -673,6 +719,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert first_rollout["sample_count"] == 4
     assert first_rollout["prompt"]["text"] == "prompt 0"
     assert first_rollout["rollout"]["response_text"].startswith("sample detail")
+    assert first_rollout["rollout"]["prompt_token_count"] > 0
+    assert first_rollout["rollout"]["response_token_count"] > 0
     assert first_rollout["conversation"]["messages"][0]["role"] == "user"
     assert first_rollout["conversation"]["messages"][1]["role"] == "assistant"
     assert first_rollout["reward"]["value"] > 0.0
@@ -705,20 +753,19 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     )
 
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
-    rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(prompts, serving_backend.actor)
-    prompt_texts = [prompt.text for prompt in prompts]
-    response_texts = [rollout.text for rollout in rollouts]
-    full_texts = [
-        prompt + response
-        for prompt, response in zip(prompt_texts, response_texts, strict=True)
-    ]
+    grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
+        prompts,
+        serving_backend.actor,
+        1,
+    )
+    rollouts = [candidates[0] for candidates in grouped_rollouts]
 
     actor = training_backend.actor
-    full_inputs, _, _ = trainer._tokenize(actor, full_texts)
-    prompt_inputs, _, _ = trainer._tokenize(actor, prompt_texts)
-    input_ids = full_inputs["input_ids"].to(actor.device)
-    attention_mask = full_inputs["attention_mask"].to(actor.device)
-    prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
+        SimpleNamespace(rollouts=rollouts),
+        actor,
+        actor.device,
+    )
 
     actor_logits = actor.model(
         input_ids=input_ids,
@@ -731,10 +778,6 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ).logits
 
     advantages = torch.tensor([1.25, -0.5], dtype=torch.float32)
-    rollout_response_log_probs = trainer._compute_rollout_response_log_probs(
-        prompt_texts,
-        response_texts,
-    )
 
     loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = trainer._assemble_loss(
         input_ids=input_ids,
@@ -812,7 +855,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
 
 
 def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_count() -> None:
-    """Grouped rollout should duplicate prompts prompt-major and require one sample per expanded prompt."""
+    """Grouped rollout should flatten prompt-major candidates and validate grouped shape."""
     serving_backend = FakeServingBackend(config=None)
     rollout = UserDefinedRollout(
         rollout_fn=make_rollout_fn(response_suffix="group", repeat=1),
@@ -838,11 +881,14 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid_rollout = UserDefinedRollout(
-        rollout_fn=lambda prompts, actor: rollout.generate(prompts[:-1]),
+        rollout_fn=lambda prompts, actor, group_size: make_rollout_fn(
+            response_suffix="invalid",
+            repeat=1,
+        )(prompts[:-1], actor, group_size),
         actor=serving_backend.actor,
         config=SimpleNamespace(),
     )
-    with pytest.raises(ValueError, match="prompt_count \\* group_size"):
+    with pytest.raises(ValueError, match="one candidate list per input prompt"):
         invalid_rollout.generate_grouped(prompts, group_size=2)
 
 
@@ -916,7 +962,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "step 1/2  epoch 1/1  batch 1/2  prompts=2  group=2  samples=4" in output
     assert "  rollout" in output
     assert "  reward" in output
-    assert "  tokenize_full" in output
+    assert "  prepare_inputs" in output
     assert "  backward" in output
     assert "  done" in output
     assert "epoch 1/1 summary" in output

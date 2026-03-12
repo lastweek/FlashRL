@@ -16,8 +16,7 @@ STAGE_DISPLAY_ORDER = [
     "rollout",
     "reward",
     "advantage",
-    "tokenize_full",
-    "tokenize_prompt",
+    "prepare_inputs",
     "actor_forward",
     "reference_forward",
     "loss_assembly",
@@ -300,6 +299,8 @@ class RunLogger:
                 "rollout": {
                     "response_text": rollout.text,
                     "log_prob": rollout.log_prob,
+                    "prompt_token_count": len(getattr(rollout, "prompt_token_ids", [])),
+                    "response_token_count": len(getattr(rollout, "response_token_ids", [])),
                     "metadata": self._serialize_for_json(rollout.metadata),
                 },
                 "conversation": self._serialize_for_json(rollout.conversation),
@@ -539,10 +540,11 @@ class RunLogger:
                 f"mean {self._format_fixed(float(payload['advantage_mean']), 4)}  "
                 f"std {self._format_fixed(float(payload['advantage_std']), 4)}"
             )
-        if stage == "tokenize_full":
-            return f"full_tok {self._format_compact_ratio(payload['full_tokens_mean'], payload['full_tokens_max'])}"
-        if stage == "tokenize_prompt":
-            return f"prompt_tok {self._format_compact_ratio(payload['prompt_tokens_mean'], payload['prompt_tokens_max'])}"
+        if stage == "prepare_inputs":
+            return (
+                f"full_tok {self._format_compact_ratio(payload['full_tokens_mean'], payload['full_tokens_max'])}  "
+                f"resp_tok {self._format_compact_scalar(payload['response_tokens_total'])}"
+            )
         if stage in {"actor_forward", "reference_forward"}:
             return f"full_tok_total {self._format_compact_scalar(payload['full_tokens_total'])}"
         if stage == "loss_assembly":
@@ -687,13 +689,10 @@ class RunLogger:
                 "advantage_min",
                 "advantage_max",
             ],
-            "tokenize_full": [
+            "prepare_inputs": [
                 "full_tokens_mean",
                 "full_tokens_max",
-            ],
-            "tokenize_prompt": [
-                "prompt_tokens_mean",
-                "prompt_tokens_max",
+                "response_tokens_total",
             ],
             "actor_forward": ["full_tokens_total"],
             "reference_forward": ["full_tokens_total"],

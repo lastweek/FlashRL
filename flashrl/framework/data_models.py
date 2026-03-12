@@ -59,6 +59,9 @@ class RolloutOutput(BaseModel):
 
     text: str
     log_prob: float
+    prompt_token_ids: list[int]
+    response_token_ids: list[int]
+    response_token_logprobs: list[float]
     conversation: Conversation
     metadata: dict[str, Any] = Field(default_factory=dict)
 
@@ -81,7 +84,6 @@ class TrainingBatch(BaseModel):
     prompt_count: int = 0
     prompt_indices: list[int] = Field(default_factory=list)
     candidate_indices: list[int] = Field(default_factory=list)
-    rollout_response_log_probs: list[list[float]] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 
     def __len__(self) -> int:

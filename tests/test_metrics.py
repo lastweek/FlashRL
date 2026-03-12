@@ -30,6 +30,8 @@ class FakeTokenizer:
         self.vocab_size = vocab_size
         self.pad_token = "<pad>"
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = vocab_size - 1
         self.padding_side = "right"
 
     def __call__(
@@ -94,10 +96,42 @@ class FakeActor:
         self.config = SimpleNamespace(max_length=128)
         self.tokenizer = FakeTokenizer()
         self.model = FakeCausalLM(self.tokenizer.vocab_size, bias_shift=bias_shift)
+        self.generation_defaults: dict[str, object] = {}
 
     def generate(self, prompts: list[str], **kwargs) -> list[str]:
         del kwargs
         return [f"generated::{prompt}" for prompt in prompts]
+
+    def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
+        del kwargs
+        grouped_outputs = []
+        for prompt in prompts:
+            prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
+            prompt_outputs = []
+            for candidate_index in range(group_size):
+                response = f"generated::{prompt}::{candidate_index}"
+                response_token_ids = self.tokenizer._encode(
+                    response,
+                    max_length=self.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.1 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    SimpleNamespace(
+                        text=response,
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        log_prob=float(sum(response_token_logprobs)),
+                    )
+                )
+            grouped_outputs.append(prompt_outputs)
+        return grouped_outputs
+
+    def set_generation_defaults(self, **kwargs) -> None:
+        self.generation_defaults = dict(kwargs)
 
     def train(self) -> None:
         self.model.train()
@@ -152,23 +186,37 @@ class FakeReferenceModel:
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
     """Create a rollout function with deterministic responses."""
 
-    def rollout_fn(prompts: list[Prompt], actor) -> list[RolloutOutput]:
-        del actor
+    def rollout_fn(prompts: list[Prompt], actor, group_size: int) -> list[list[RolloutOutput]]:
         outputs = []
         for prompt in prompts:
-            response = f"{response_suffix} " + ("detail " * repeat) + prompt.text
-            outputs.append(
-                RolloutOutput(
-                    text=response,
-                    log_prob=0.0,
-                    conversation=Conversation(
-                        messages=[
-                            Message(role="user", content=prompt.text),
-                            Message(role="assistant", content=response),
-                        ]
-                    ),
+            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            prompt_outputs = []
+            for candidate_index in range(group_size):
+                response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{candidate_index}"
+                response_token_ids = actor.tokenizer._encode(
+                    response,
+                    max_length=actor.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.05 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    RolloutOutput(
+                        text=response,
+                        log_prob=float(sum(response_token_logprobs)),
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        conversation=Conversation(
+                            messages=[
+                                Message(role="user", content=prompt.text),
+                                Message(role="assistant", content=response),
+                            ]
+                        ),
+                    )
                 )
-            )
+            outputs.append(prompt_outputs)
         return outputs
 
     return rollout_fn
@@ -275,22 +323,28 @@ def create_yaml_hook_module(tmp_path: Path) -> str:
                 return [Prompt(text=text) for text in DATASET_TEXTS]
 
 
-            def rollout_fn(prompts, actor):
-                texts = actor.generate([prompt.text for prompt in prompts])
+            def rollout_fn(prompts, actor, group_size):
+                grouped_samples = actor.generate_grouped([prompt.text for prompt in prompts], group_size)
                 outputs = []
-                for prompt, text in zip(prompts, texts, strict=True):
-                    outputs.append(
-                        RolloutOutput(
-                            text=text,
-                            log_prob=0.0,
-                            conversation=Conversation(
-                                messages=[
-                                    Message(role="user", content=prompt.text),
-                                    Message(role="assistant", content=text),
-                                ]
-                            ),
+                for prompt, samples in zip(prompts, grouped_samples, strict=True):
+                    prompt_outputs = []
+                    for sample in samples:
+                        prompt_outputs.append(
+                            RolloutOutput(
+                                text=sample.text,
+                                log_prob=sample.log_prob,
+                                prompt_token_ids=sample.prompt_token_ids,
+                                response_token_ids=sample.response_token_ids,
+                                response_token_logprobs=sample.response_token_logprobs,
+                                conversation=Conversation(
+                                    messages=[
+                                        Message(role="user", content=prompt.text),
+                                        Message(role="assistant", content=sample.text),
+                                    ]
+                                ),
+                            )
                         )
-                    )
+                    outputs.append(prompt_outputs)
                 return outputs
 
 

@@ -27,8 +27,7 @@ STAGE_ORDER = (
     "rollout",
     "reward",
     "advantage",
-    "tokenize_full",
-    "tokenize_prompt",
+    "prepare_inputs",
     "actor_forward",
     "reference_forward",
     "loss_assembly",
@@ -168,22 +167,15 @@ class GRPOTrainer:
         context: StepContext,
     ) -> dict[str, Any]:
         """Run one full training step and emit detailed stage logs."""
-        actor = self.training_backend.actor
         step_started_at = time.perf_counter()
 
         rollout_started_at = time.perf_counter()
         grouped_prompts, rollouts, prompt_indices, candidate_indices = (
             self.rollout_generator.generate_grouped(prompts, context.group_size)
         )
-        prompt_texts = [prompt.text for prompt in grouped_prompts]
-        response_texts = [rollout.text for rollout in rollouts]
-        rollout_response_log_probs = self._compute_rollout_response_log_probs(
-            prompt_texts,
-            response_texts,
-        )
         rollout_seconds = time.perf_counter() - rollout_started_at
-        prompt_lengths = self._text_lengths(actor, prompt_texts)
-        response_lengths = self._text_lengths(actor, response_texts)
+        prompt_lengths = [len(rollout.prompt_token_ids) for rollout in rollouts]
+        response_lengths = [len(rollout.response_token_ids) for rollout in rollouts]
         self._log_stage(
             context,
             "rollout",
@@ -234,7 +226,6 @@ class GRPOTrainer:
             prompt_count=context.prompt_count,
             prompt_indices=prompt_indices,
             candidate_indices=candidate_indices,
-            rollout_response_log_probs=rollout_response_log_probs,
         )
 
         advantages, advantage_seconds = self._measure(
@@ -257,7 +248,7 @@ class GRPOTrainer:
             **result.stage_timings,
         }
         step_duration_seconds = time.perf_counter() - step_started_at
-        response_tokens_total = int(sum(response_lengths))
+        response_tokens_total = result.response_tokens_total
         if step_duration_seconds > 0.0:
             tokens_per_second = response_tokens_total / step_duration_seconds
         else:
@@ -345,42 +336,25 @@ class GRPOTrainer:
         advantages: torch.Tensor,
         context: StepContext | None,
     ) -> OptimizationResult:
-        """Run tokenize, forward, loss, backward, step, and sync."""
+        """Run input preparation, forward, loss, backward, step, and sync."""
         actor = self.training_backend.actor
         device = actor.device
-        rollout_response_log_probs = batch.rollout_response_log_probs
-        if rollout_response_log_probs is None:
-            raise ValueError(
-                "TrainingBatch.rollout_response_log_probs is required for exact GRPO optimization."
-            )
-
-        prompts = [prompt.text for prompt in batch.prompts]
-        responses = [rollout.text for rollout in batch.rollouts]
-        full_texts = [prompt + response for prompt, response in zip(prompts, responses)]
-
-        full_inputs, full_lengths, full_seconds = self._tokenize(actor, full_texts)
-        input_ids = full_inputs["input_ids"].to(device)
-        attention_mask = full_inputs["attention_mask"].to(device)
+        (
+            input_ids,
+            attention_mask,
+            prompt_lengths,
+            full_lengths,
+            rollout_response_log_probs,
+        ), full_seconds = self._measure(lambda: self._prepare_inputs(batch, actor, device))
         full_tokens_total = int(sum(full_lengths))
         self._log_stage(
             context,
-            "tokenize_full",
+            "prepare_inputs",
             full_seconds,
             {
                 "full_tokens_mean": self._mean(full_lengths),
                 "full_tokens_max": max(full_lengths, default=0),
-            },
-        )
-
-        prompt_inputs, prompt_lengths_list, prompt_seconds = self._tokenize(actor, prompts)
-        prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
-        self._log_stage(
-            context,
-            "tokenize_prompt",
-            prompt_seconds,
-            {
-                "prompt_tokens_mean": self._mean(prompt_lengths_list),
-                "prompt_tokens_max": max(prompt_lengths_list, default=0),
+                "response_tokens_total": int(sum(len(rollout.response_token_ids) for rollout in batch.rollouts)),
             },
         )
 
@@ -458,8 +432,7 @@ class GRPOTrainer:
             lambda: self.training_backend.sync_weights_to(self.serving_backend)
         )
         stage_timings = {
-            "tokenize_full": full_seconds,
-            "tokenize_prompt": prompt_seconds,
+            "prepare_inputs": full_seconds,
             "actor_forward": actor_forward_seconds,
             "reference_forward": reference_forward_seconds,
             "loss_assembly": loss_seconds,
@@ -564,7 +537,7 @@ class GRPOTrainer:
         # 3. Fixed rollout-policy log-probs captured when the samples were generated.
         if len(rollout_response_log_probs) != response_mask.shape[0]:
             raise ValueError(
-                "TrainingBatch.rollout_response_log_probs must match the batch size."
+                "rollout_response_log_probs must match the batch size."
             )
 
         log_pi_old = torch.zeros(
@@ -627,58 +600,6 @@ class GRPOTrainer:
         loss = policy_loss + kl_coefficient * kl_divergence
         return loss, policy_loss, kl_divergence, response_tokens_total
 
-    def _compute_rollout_response_log_probs(
-        self,
-        prompt_texts: list[str],
-        response_texts: list[str],
-    ) -> list[list[float]]:
-        """Score sampled response tokens under the rollout policy."""
-        if not prompt_texts:
-            return []
-
-        actor = self.serving_backend.actor
-        full_texts = [
-            prompt + response
-            for prompt, response in zip(prompt_texts, response_texts, strict=True)
-        ]
-
-        full_inputs, _, _ = self._tokenize(actor, full_texts)
-        prompt_inputs, _, _ = self._tokenize(actor, prompt_texts)
-
-        input_ids = full_inputs["input_ids"].to(actor.device)
-        attention_mask = full_inputs["attention_mask"].to(actor.device)
-        prompt_lengths = prompt_inputs["attention_mask"].sum(dim=1)
-        shift_ids = input_ids[:, 1:]
-        shift_mask = attention_mask[:, 1:].float()
-        response_mask = torch.zeros_like(shift_mask)
-        for index, prompt_length in enumerate(prompt_lengths.tolist()):
-            prompt_start = max(int(prompt_length) - 1, 0)
-            response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
-
-        with torch.no_grad():
-            rollout_logits = actor.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            ).logits
-
-        rollout_token_log_probs = F.log_softmax(rollout_logits[:, :-1, :], dim=-1)
-        selected_rollout_log_probs = torch.gather(
-            rollout_token_log_probs,
-            dim=-1,
-            index=shift_ids.unsqueeze(-1),
-        ).squeeze(-1)
-        response_log_probs: list[list[float]] = []
-        token_log_probs_cpu = selected_rollout_log_probs.detach().cpu()
-        response_mask_cpu = response_mask.detach().to(dtype=torch.bool).cpu()
-        for sample_log_probs, sample_mask in zip(
-            token_log_probs_cpu,
-            response_mask_cpu,
-            strict=True,
-        ):
-            values = sample_log_probs[sample_mask].tolist()
-            response_log_probs.append([float(value) for value in values])
-        return response_log_probs
-
     def _backward_step(self, loss: torch.Tensor) -> Callable[[], None]:
         """Return the backward closure used in timing."""
 
@@ -688,23 +609,57 @@ class GRPOTrainer:
 
         return run
 
-    def _tokenize(
+    def _prepare_inputs(
         self,
+        batch: TrainingBatch,
         actor: Any,
-        texts: list[str],
-    ) -> tuple[dict[str, torch.Tensor], list[int], float]:
-        """Tokenize texts and return inputs, token lengths, and latency."""
-        inputs, duration_seconds = self._measure(
-            lambda: actor.tokenizer(
-                texts,
-                padding=True,
-                truncation=True,
-                max_length=actor.config.max_length,
-                return_tensors="pt",
-            )
+        device: torch.device,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[float]]]:
+        """Build padded training tensors directly from rollout-provided token ids."""
+        pad_token_id = getattr(actor.tokenizer, "pad_token_id", 0)
+        if pad_token_id is None:
+            pad_token_id = 0
+
+        full_sequences: list[list[int]] = []
+        prompt_lengths: list[int] = []
+        full_lengths: list[int] = []
+        rollout_response_log_probs: list[list[float]] = []
+        for rollout in batch.rollouts:
+            prompt_ids = [int(token_id) for token_id in rollout.prompt_token_ids]
+            response_ids = [int(token_id) for token_id in rollout.response_token_ids]
+            response_logprobs = [float(value) for value in rollout.response_token_logprobs]
+            if len(response_ids) != len(response_logprobs):
+                raise ValueError(
+                    "RolloutOutput.response_token_logprobs must match RolloutOutput.response_token_ids."
+                )
+            full_sequence = prompt_ids + response_ids
+            if not full_sequence:
+                raise ValueError("GRPO training requires at least one prompt token per rollout.")
+            full_sequences.append(full_sequence)
+            prompt_lengths.append(len(prompt_ids))
+            full_lengths.append(len(full_sequence))
+            rollout_response_log_probs.append(response_logprobs)
+
+        batch_size = len(full_sequences)
+        max_length = max(full_lengths, default=0)
+        input_ids = torch.full(
+            (batch_size, max_length),
+            fill_value=int(pad_token_id),
+            dtype=torch.long,
+            device=device,
         )
-        lengths = [int(value) for value in inputs["attention_mask"].sum(dim=1).tolist()]
-        return inputs, lengths, duration_seconds
+        attention_mask = torch.zeros(
+            (batch_size, max_length),
+            dtype=torch.long,
+            device=device,
+        )
+        for index, token_ids in enumerate(full_sequences):
+            length = len(token_ids)
+            input_ids[index, :length] = torch.tensor(token_ids, dtype=torch.long, device=device)
+            attention_mask[index, :length] = 1
+
+        prompt_length_tensor = torch.tensor(prompt_lengths, dtype=torch.long, device=device)
+        return input_ids, attention_mask, prompt_length_tensor, full_lengths, rollout_response_log_probs
 
     def _build_epoch_summary(
         self,
@@ -818,19 +773,6 @@ class GRPOTrainer:
             f"{prefix}_min": float(tensor.min().item()),
             f"{prefix}_max": float(tensor.max().item()),
         }
-
-    def _text_lengths(self, actor: Any, texts: list[str]) -> list[int]:
-        """Tokenize texts and return sequence lengths."""
-        if not texts:
-            return []
-        tokenized = actor.tokenizer(
-            texts,
-            padding=True,
-            truncation=True,
-            max_length=actor.config.max_length,
-            return_tensors="pt",
-        )
-        return [int(value) for value in tokenized["attention_mask"].sum(dim=1).tolist()]
 
     def _accumulate_totals(
         self,

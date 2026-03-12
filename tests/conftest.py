@@ -18,6 +18,8 @@ class TinyTokenizer:
         self.vocab_size = vocab_size
         self.pad_token = pad_token
         self.eos_token = "<eos>"
+        self.pad_token_id = 0
+        self.eos_token_id = vocab_size - 1
         self.padding_side = "right"
         self.calls: list[dict[str, Any]] = []
         self.batch_decode_calls: list[dict[str, Any]] = []
@@ -60,7 +62,9 @@ class TinyTokenizer:
             "attention_mask": torch.tensor(attention_mask, dtype=torch.long),
         }
 
-    def batch_decode(self, token_batches: torch.Tensor, *, skip_special_tokens: bool) -> list[str]:
+    def batch_decode(self, token_batches: torch.Tensor | list[list[int]], *, skip_special_tokens: bool) -> list[str]:
+        if not isinstance(token_batches, torch.Tensor):
+            token_batches = torch.tensor(token_batches, dtype=torch.long)
         self.batch_decode_calls.append(
             {
                 "skip_special_tokens": skip_special_tokens,
@@ -114,12 +118,36 @@ class TinyCausalLM(torch.nn.Module):
     def generate(self, **kwargs: Any) -> torch.Tensor:
         self.last_generate_kwargs = dict(kwargs)
         input_ids = kwargs["input_ids"]
+        num_return_sequences = int(kwargs.get("num_return_sequences", 1))
+        expanded_input_ids = input_ids.repeat_interleave(num_return_sequences, dim=0)
         completion = torch.tensor(
             [[self.logit_bias.shape[0] - 2, self.logit_bias.shape[0] - 1]],
             dtype=input_ids.dtype,
             device=input_ids.device,
-        ).repeat(input_ids.shape[0], 1)
-        return torch.cat([input_ids, completion], dim=1)
+        ).repeat(expanded_input_ids.shape[0], 1)
+        sequences = torch.cat([expanded_input_ids, completion], dim=1)
+        scores = [
+            self.logit_bias.view(1, -1).repeat(expanded_input_ids.shape[0], 1),
+            (self.logit_bias + 0.1).view(1, -1).repeat(expanded_input_ids.shape[0], 1),
+        ]
+        if kwargs.get("return_dict_in_generate"):
+            return SimpleNamespace(sequences=sequences, scores=scores)
+        return sequences
+
+    def compute_transition_scores(
+        self,
+        sequences: torch.Tensor,
+        scores: list[torch.Tensor],
+        normalize_logits: bool,
+    ) -> torch.Tensor:
+        del normalize_logits
+        generated_tokens = sequences[:, -len(scores):]
+        per_step = []
+        for step_index, step_scores in enumerate(scores):
+            token_logprobs = F.log_softmax(step_scores, dim=-1)
+            step_ids = generated_tokens[:, step_index].unsqueeze(-1)
+            per_step.append(torch.gather(token_logprobs, dim=-1, index=step_ids).squeeze(-1))
+        return torch.stack(per_step, dim=1)
 
     def to(self, device: torch.device | str) -> "TinyCausalLM":
         self.device = torch.device(device)
@@ -140,6 +168,39 @@ class TinyActor:
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
         self.last_generate_kwargs = dict(kwargs)
         return [f"generated::{prompt}" for prompt in prompts]
+
+    def generate_grouped(
+        self,
+        prompts: list[str],
+        group_size: int,
+        **kwargs: Any,
+    ) -> list[list[SimpleNamespace]]:
+        self.last_generate_kwargs = dict(kwargs)
+        grouped_outputs: list[list[SimpleNamespace]] = []
+        for prompt in prompts:
+            prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
+            prompt_outputs: list[SimpleNamespace] = []
+            for candidate_index in range(group_size):
+                response_text = f"generated::{prompt}::{candidate_index}"
+                response_token_ids = self.tokenizer._encode(
+                    response_text,
+                    max_length=self.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.1 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    SimpleNamespace(
+                        text=response_text,
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        log_prob=float(sum(response_token_logprobs)),
+                    )
+                )
+            grouped_outputs.append(prompt_outputs)
+        return grouped_outputs
 
     def set_generation_defaults(self, **kwargs: Any) -> None:
         self.generation_defaults = dict(kwargs)
@@ -182,23 +243,42 @@ class TinyReferenceModel:
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
     """Create deterministic rollout outputs for a batch of prompts."""
 
-    def rollout_fn(prompts: list[Prompt], actor: Any) -> list[RolloutOutput]:
-        del actor
-        outputs = []
+    def rollout_fn(prompts: list[Prompt], actor: Any, group_size: int) -> list[list[RolloutOutput]]:
+        outputs: list[list[RolloutOutput]] = []
         for prompt in prompts:
-            response = f"{response_suffix} " + ("detail " * repeat) + prompt.text
-            outputs.append(
-                RolloutOutput(
-                    text=response,
-                    log_prob=0.0,
-                    conversation=Conversation(
-                        messages=[
-                            Message(role="user", content=prompt.text),
-                            Message(role="assistant", content=response),
-                        ]
-                    ),
+            prompt_outputs: list[RolloutOutput] = []
+            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            for candidate_index in range(group_size):
+                response = (
+                    f"{response_suffix} "
+                    + ("detail " * repeat)
+                    + prompt.text
+                    + f"::{candidate_index}"
                 )
-            )
+                response_token_ids = actor.tokenizer._encode(
+                    response,
+                    max_length=actor.config.max_length,
+                )[:4]
+                response_token_logprobs = [
+                    -0.05 - 0.01 * candidate_index - 0.001 * token_index
+                    for token_index in range(len(response_token_ids))
+                ]
+                prompt_outputs.append(
+                    RolloutOutput(
+                        text=response,
+                        log_prob=float(sum(response_token_logprobs)),
+                        prompt_token_ids=prompt_token_ids,
+                        response_token_ids=response_token_ids,
+                        response_token_logprobs=response_token_logprobs,
+                        conversation=Conversation(
+                            messages=[
+                                Message(role="user", content=prompt.text),
+                                Message(role="assistant", content=response),
+                            ]
+                        ),
+                    )
+                )
+            outputs.append(prompt_outputs)
         return outputs
 
     return rollout_fn

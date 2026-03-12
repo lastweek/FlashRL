@@ -85,6 +85,9 @@ class UserDefinedReward:
         basic_rollout = RolloutOutput(
             text=text,
             log_prob=0.0,
+            prompt_token_ids=[],
+            response_token_ids=[],
+            response_token_logprobs=[],
             conversation=conversation,
         )
         return self.reward_fn(basic_rollout)

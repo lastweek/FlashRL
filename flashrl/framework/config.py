@@ -56,7 +56,6 @@ class RolloutConfig(BaseConfig):
     top_p: float = 0.9
     top_k: int = 0
     do_sample: bool = True
-    num_return_sequences: int = 1
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

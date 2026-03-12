@@ -3,7 +3,6 @@
 from typing import Callable
 
 from flashrl.framework.config import RolloutConfig
-# Removed BaseRollout inheritance - using direct class
 from flashrl.framework.data_models import (
     Prompt,
     RolloutOutput,
@@ -19,8 +18,8 @@ class UserDefinedRollout:
     without needing to inherit from base classes.
 
     Example:
-        def my_rollout_fn(prompts, actor):
-            return actor.generate([p.text for p in prompts])
+        def my_rollout_fn(prompts, actor, group_size):
+            return actor.generate_grouped([p.text for p in prompts], group_size)
 
         rollout = UserDefinedRollout(my_rollout_fn, actor, config)
         rollouts = rollout.generate(prompts)
@@ -28,7 +27,7 @@ class UserDefinedRollout:
 
     def __init__(
         self,
-        rollout_fn: Callable[[list[Prompt], ActorModel], list[RolloutOutput]],
+        rollout_fn: Callable[[list[Prompt], ActorModel, int], list[list[RolloutOutput]]],
         actor: ActorModel,
         config: RolloutConfig,
     ) -> None:
@@ -36,7 +35,8 @@ class UserDefinedRollout:
 
         Args:
             rollout_fn: User-provided function that generates rollouts.
-                Takes (list[Prompt], ActorModel) and returns list[RolloutOutput].
+                Takes (list[Prompt], ActorModel, group_size) and returns
+                prompt-major grouped RolloutOutput values.
             actor: Actor model to use for generation.
             config: Rollout configuration.
         """
@@ -64,42 +64,70 @@ class UserDefinedRollout:
             setattr(self.actor, "generation_defaults", generation_kwargs)
 
     def generate(self, prompts: list[Prompt]) -> list[RolloutOutput]:
-        """Generate rollouts using user function.
-
-        Args:
-            prompts: List of input prompts.
-
-        Returns:
-            List of rollout outputs.
-        """
-        self._apply_generation_defaults()
-        return self.rollout_fn(prompts, self.actor)
+        """Generate exactly one rollout per prompt."""
+        grouped_rollouts = self._generate_nested(prompts, group_size=1)
+        return [candidates[0] for candidates in grouped_rollouts]
 
     def generate_grouped(
         self,
         prompts: list[Prompt],
         group_size: int,
     ) -> tuple[list[Prompt], list[RolloutOutput], list[int], list[int]]:
-        """Expand prompts into prompt-major groups and generate one rollout per sample."""
+        """Generate prompt-major grouped rollouts and flatten them for the trainer."""
         if group_size < 1:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
 
-        expanded_prompts: list[Prompt] = []
+        grouped_rollouts = self._generate_nested(prompts, group_size=group_size)
+
+        flat_prompts: list[Prompt] = []
+        flat_rollouts: list[RolloutOutput] = []
         prompt_indices: list[int] = []
         candidate_indices: list[int] = []
-        for prompt_index, prompt in enumerate(prompts):
-            for candidate_index in range(group_size):
-                expanded_prompts.append(prompt.model_copy(deep=True))
+        for prompt_index, (prompt, candidates) in enumerate(zip(prompts, grouped_rollouts, strict=True)):
+            for candidate_index, rollout in enumerate(candidates):
+                flat_prompts.append(prompt)
+                flat_rollouts.append(rollout)
                 prompt_indices.append(prompt_index)
                 candidate_indices.append(candidate_index)
 
-        rollouts = self.generate(expanded_prompts)
-        if len(rollouts) != len(expanded_prompts):
+        return flat_prompts, flat_rollouts, prompt_indices, candidate_indices
+
+    def _generate_nested(
+        self,
+        prompts: list[Prompt],
+        group_size: int,
+    ) -> list[list[RolloutOutput]]:
+        """Generate grouped rollouts and validate prompt-major grouped shape."""
+        self._apply_generation_defaults()
+        grouped_rollouts = self.rollout_fn(prompts, self.actor, group_size)
+        if len(grouped_rollouts) != len(prompts):
             raise ValueError(
-                "Grouped rollout must return exactly prompt_count * group_size samples "
-                f"(expected {len(expanded_prompts)}, got {len(rollouts)})."
+                "Grouped rollout must return exactly one candidate list per input prompt "
+                f"(expected {len(prompts)}, got {len(grouped_rollouts)})."
             )
-        return expanded_prompts, rollouts, prompt_indices, candidate_indices
+
+        validated: list[list[RolloutOutput]] = []
+        for prompt_index, candidates in enumerate(grouped_rollouts):
+            if len(candidates) != group_size:
+                raise ValueError(
+                    "Grouped rollout must return exactly group_size candidates per prompt "
+                    f"(prompt_index={prompt_index}, expected {group_size}, got {len(candidates)})."
+                )
+            validated_candidates: list[RolloutOutput] = []
+            for rollout in candidates:
+                self._validate_rollout_output(rollout)
+                validated_candidates.append(rollout)
+            validated.append(validated_candidates)
+        return validated
+
+    def _validate_rollout_output(self, rollout: RolloutOutput) -> None:
+        """Validate that rollout outputs contain the token data required by GRPO."""
+        if not rollout.prompt_token_ids:
+            raise ValueError("RolloutOutput.prompt_token_ids must be populated for GRPO training.")
+        if len(rollout.response_token_logprobs) != len(rollout.response_token_ids):
+            raise ValueError(
+                "RolloutOutput.response_token_logprobs must match RolloutOutput.response_token_ids."
+            )
 
     def generate_conversation(
         self,
@@ -115,11 +143,14 @@ class UserDefinedRollout:
             max_turns: Maximum number of turns (ignored for single-turn).
 
         Returns:
-            Generated conversation.
+            Generated conversation. This path still uses the grouped rollout
+            hook, but always requests a single candidate.
         """
-        # Generate single turn
-        rollouts = self.generate([prompt])
-        if rollouts:
-            return rollouts[0].conversation
-        else:
-            return Conversation(messages=[])
+        del max_turns
+        self._apply_generation_defaults()
+        grouped_rollouts = self.rollout_fn([prompt], self.actor, 1)
+        if grouped_rollouts and grouped_rollouts[0]:
+            rollout = grouped_rollouts[0][0]
+            self._validate_rollout_output(rollout)
+            return rollout.conversation
+        return Conversation(messages=[])

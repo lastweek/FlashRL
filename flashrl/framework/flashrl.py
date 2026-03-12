@@ -111,7 +111,7 @@ class FlashRL:
     def __init__(
         self,
         model: str,
-        rollout_fn: Callable[[list[Prompt], "ActorModel"], list[RolloutOutput]],
+        rollout_fn: Callable[[list[Prompt], "ActorModel", int], list[list[RolloutOutput]]],
         reward_fn: Callable[[RolloutOutput], RewardOutput],
         learning_rate: float = 1e-5,
         batch_size: int = 32,
