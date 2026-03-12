@@ -29,6 +29,7 @@ class ActorModel:
         )
         self.model.to(self.device)
         self.model.eval()
+        self.generation_defaults: dict[str, Any] = {}
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -48,6 +49,8 @@ class ActorModel:
         Returns:
             List of generated texts.
         """
+        generation_kwargs = {**self.generation_defaults, **kwargs}
+
         # Use left padding for generation (required for decoder-only models)
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
@@ -62,12 +65,18 @@ class ActorModel:
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
 
         with torch.no_grad():
-            outputs = self.model.generate(**inputs, **kwargs)
+            outputs = self.model.generate(**inputs, **generation_kwargs)
 
         self.tokenizer.padding_side = original_padding_side
 
-        generated_texts = self.tokenizer.batch_decode(outputs, skip_special_tokens=True)
+        prompt_width = inputs["input_ids"].shape[1]
+        generated_tokens = outputs[:, prompt_width:]
+        generated_texts = self.tokenizer.batch_decode(generated_tokens, skip_special_tokens=True)
         return generated_texts
+
+    def set_generation_defaults(self, **kwargs: Any) -> None:
+        """Set default generation kwargs used when rollout code does not pass them explicitly."""
+        self.generation_defaults = dict(kwargs)
 
     def compute_log_probs(
         self,

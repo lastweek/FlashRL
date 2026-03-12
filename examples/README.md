@@ -27,18 +27,29 @@ python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```
 
 **What the YAML does:**
-- chooses the training model, serving model, and trainer settings
+- chooses shared defaults plus separate training and serving settings
+- configures grouped GRPO rollout and optimization
 - keeps logging in compact console mode
 - keeps metrics enabled by default
 - wires the rollout, reward, and dataset hooks through Python import strings
+- treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
 
-**Serving is configured separately:**
+**Shared defaults with training/serving overrides:**
 ```yaml
-model:
+common:
   model_name: Qwen/Qwen2.5-0.5B-Instruct
+
+training:
+  num_threads: 1
+  batch_size: 4
+  max_epochs: 3
 
 serving:
-  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  num_threads: 1
+
+grpo:
+  group_size: 2
+  clip_ratio: 0.2
 ```
 
 **Example prompt:**

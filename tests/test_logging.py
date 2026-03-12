@@ -12,7 +12,7 @@ import torch
 import torch.nn.functional as F
 
 import flashrl.framework.flashrl as flashrl_module
-from flashrl.framework import FlashRL, LoggingConfig, MetricsConfig
+from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
 from flashrl.framework.data_models import (
     Conversation,
@@ -232,7 +232,7 @@ def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
 
     logger.start_run(
         dataset_size=4,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         total_batches=2,
         device="cpu",
@@ -241,6 +241,8 @@ def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
         runtime_shape="single-device-per-backend",
         reference_enabled=False,
         reference_device="auto",
+        group_size=2,
+        clip_ratio=0.2,
     )
 
     assert logger.run_dir.exists()
@@ -283,7 +285,7 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
 
     logger.start_run(
         dataset_size=4,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         total_batches=2,
         device="cpu",
@@ -292,6 +294,8 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
         runtime_shape="single-device-per-backend",
         reference_enabled=False,
         reference_device="auto",
+        group_size=2,
+        clip_ratio=0.2,
     )
     logger.log_model_load(
         "training_backend",
@@ -310,9 +314,12 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "total_epochs": 1,
             "batch_index": 1,
             "batches_in_epoch": 2,
-            "batch_size": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
             "stage": "rollout",
             "latency_seconds": 0.25,
+            "sample_count": 4,
             "prompt_tokens_mean": 12.5,
             "prompt_tokens_max": 16,
             "response_tokens_mean": 24.0,
@@ -326,7 +333,9 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "total_epochs": 1,
             "batch_index": 1,
             "batches_in_epoch": 2,
-            "batch_size": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
             "stage": "reward",
             "latency_seconds": 0.002,
             "reward_mean": 1.5,
@@ -343,7 +352,9 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "total_epochs": 1,
             "batch_index": 1,
             "batches_in_epoch": 2,
-            "batch_size": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
             "loss": 0.125,
             "policy_loss": 0.1,
             "kl_divergence": 0.025,
@@ -388,8 +399,9 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "FlashRL training run\n  run      " in transcript
+    assert "  grpo     group=2  clip=0.2000" in transcript
     assert "load training_backend" in transcript
-    assert "step 1/2  epoch 1/1  batch 1/2  batch_size=2" in transcript
+    assert "step 1/2  epoch 1/1  batch 1/2  prompts=2  group=2  samples=4" in transcript
     assert "  rollout" in transcript
     assert "prompt_tok 12.5/16" in transcript
     assert "response_tok 24.0/30" in transcript
@@ -401,7 +413,7 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
     assert "  lifecycle startup 1.250s | train_loop 750.0ms" in transcript
     assert "  stages    rollout 250.0ms" in transcript
     assert "step=1 epoch=1/1" not in transcript
-    assert "sample" not in transcript
+    assert "sample step" not in transcript
 
     events = read_events(logger.run_dir)
     assert any(event["event"] == "sample_preview" for event in events)
@@ -461,7 +473,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
         model="fake/model",
         rollout_fn=make_rollout_fn(response_suffix="reuse", repeat=2),
         reward_fn=reward_fn,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
@@ -542,7 +554,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         model_name="fake/model",
     )
     trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=2, max_epochs=1, kl_coefficient=0.0),
+        config=TrainerConfig(batch_size=4, max_epochs=1),
+        grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.0),
         training_backend=training_backend,
         serving_backend=serving_backend,
         reference=None,
@@ -554,7 +567,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
 
     logger.start_run(
         dataset_size=len(dataset),
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         total_batches=3,
         device="cpu",
@@ -563,6 +576,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         runtime_shape="single-device-per-backend",
         reference_enabled=False,
         reference_device="auto",
+        group_size=2,
+        clip_ratio=0.2,
     )
     trainer.train(dataset)
     logger.finish_run(status="completed", total_steps=trainer.total_steps)
@@ -636,7 +651,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "runtime=single-device-per-backend reference=disabled" in transcript
     assert "cpu_threads=1" in transcript
-    assert "step=1 epoch=1/1 batch=1/3 batch_size=2 stage=rollout" in transcript
+    assert "step=1 epoch=1/1 batch=1/3 batch_size=4 prompt_count=2 group_size=2 stage=rollout" in transcript
     assert "stage=reward" in transcript
     assert "stage=loss_assembly" in transcript
     assert "stage=backward" in transcript
@@ -646,11 +661,16 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert "sample step" not in transcript
 
     rollouts = read_rollouts(logger.run_dir)
-    assert len(rollouts) == len(dataset)
+    assert len(rollouts) == len(dataset) * 2
     first_rollout = rollouts[0]
     assert first_rollout["run_id"] == logger.run_id
     assert first_rollout["step"] == 1
     assert first_rollout["sample_index"] == 1
+    assert first_rollout["prompt_index"] == 0
+    assert first_rollout["candidate_index"] == 0
+    assert first_rollout["group_size"] == 2
+    assert first_rollout["prompt_count"] == 2
+    assert first_rollout["sample_count"] == 4
     assert first_rollout["prompt"]["text"] == "prompt 0"
     assert first_rollout["rollout"]["response_text"].startswith("sample detail")
     assert first_rollout["conversation"]["messages"][0]["role"] == "user"
@@ -666,10 +686,10 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     serving_backend = FakeServingBackend(config=None)
     reference = FakeReferenceModel(config=None)
     trainer = GRPOTrainer(
-        config=TrainerConfig(
-            batch_size=2,
-            max_epochs=1,
-            clip_epsilon=0.2,
+        config=TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=GrpoConfig(
+            group_size=2,
+            clip_ratio=0.2,
             kl_coefficient=0.3,
         ),
         training_backend=training_backend,
@@ -724,8 +744,8 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.config.kl_coefficient,
-        clip_epsilon=trainer.config.clip_epsilon,
+        kl_coefficient=trainer.grpo_config.kl_coefficient,
+        clip_ratio=trainer.grpo_config.clip_ratio,
     )
 
     assert loss_no_ref.item() == pytest.approx(policy_no_ref.item())
@@ -747,8 +767,8 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.config.kl_coefficient,
-        clip_epsilon=trainer.config.clip_epsilon,
+        kl_coefficient=trainer.grpo_config.kl_coefficient,
+        clip_ratio=trainer.grpo_config.clip_ratio,
     )
 
     assert mutated_loss.item() == pytest.approx(loss_no_ref.item())
@@ -763,11 +783,11 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=ref_logits,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.config.kl_coefficient,
-        clip_epsilon=trainer.config.clip_epsilon,
+        kl_coefficient=trainer.grpo_config.kl_coefficient,
+        clip_ratio=trainer.grpo_config.clip_ratio,
     )
 
-    expected_total = policy_with_ref.item() + trainer.config.kl_coefficient * kl_with_ref.item()
+    expected_total = policy_with_ref.item() + trainer.grpo_config.kl_coefficient * kl_with_ref.item()
     assert loss_with_ref.item() == pytest.approx(expected_total)
     assert kl_with_ref.item() >= 0.0
 
@@ -783,12 +803,79 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=shifted_rollout_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.config.kl_coefficient,
-        clip_epsilon=trainer.config.clip_epsilon,
+        kl_coefficient=trainer.grpo_config.kl_coefficient,
+        clip_ratio=trainer.grpo_config.clip_ratio,
     )
 
     assert shifted_policy.item() != pytest.approx(policy_no_ref.item())
     assert shifted_loss.item() != pytest.approx(loss_no_ref.item())
+
+
+def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_count() -> None:
+    """Grouped rollout should duplicate prompts prompt-major and require one sample per expanded prompt."""
+    serving_backend = FakeServingBackend(config=None)
+    rollout = UserDefinedRollout(
+        rollout_fn=make_rollout_fn(response_suffix="group", repeat=1),
+        actor=serving_backend.actor,
+        config=SimpleNamespace(),
+    )
+    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+
+    expanded_prompts, rollouts, prompt_indices, candidate_indices = rollout.generate_grouped(
+        prompts,
+        group_size=2,
+    )
+
+    assert len(expanded_prompts) == 4
+    assert len(rollouts) == 4
+    assert [prompt.text for prompt in expanded_prompts] == [
+        "prompt 0",
+        "prompt 0",
+        "prompt 1",
+        "prompt 1",
+    ]
+    assert prompt_indices == [0, 0, 1, 1]
+    assert candidate_indices == [0, 1, 0, 1]
+
+    invalid_rollout = UserDefinedRollout(
+        rollout_fn=lambda prompts, actor: rollout.generate(prompts[:-1]),
+        actor=serving_backend.actor,
+        config=SimpleNamespace(),
+    )
+    with pytest.raises(ValueError, match="prompt_count \\* group_size"):
+        invalid_rollout.generate_grouped(prompts, group_size=2)
+
+
+def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
+    """GRPO advantages should be computed per prompt group, not across the whole flat batch."""
+    trainer = GRPOTrainer(
+        config=TrainerConfig(batch_size=4, max_epochs=1),
+        grpo_config=GrpoConfig(group_size=2),
+        training_backend=FakeTrainingBackend(config=None, learning_rate=1e-2),
+        serving_backend=FakeServingBackend(config=None),
+        reference=None,
+        reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
+        rollout_generator=UserDefinedRollout(
+            rollout_fn=make_rollout_fn(response_suffix="adv", repeat=1),
+            actor=FakeServingBackend(config=None).actor,
+            config=SimpleNamespace(),
+        ),
+        run_logger=None,
+    )
+
+    advantages = trainer._compute_advantages(
+        [
+            RewardOutput(reward=1.0),
+            RewardOutput(reward=3.0),
+            RewardOutput(reward=10.0),
+            RewardOutput(reward=12.0),
+        ],
+        prompt_count=2,
+        group_size=2,
+    )
+
+    assert advantages.tolist() == pytest.approx([-1.0, 1.0, -1.0, 1.0])
+
 def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -801,7 +888,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
         model="fake/model",
         rollout_fn=make_rollout_fn(response_suffix="console", repeat=8),
         reward_fn=reward_fn,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
@@ -822,10 +909,11 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "  run      " in output
     assert "cpu=1" in output
     assert "reference=disabled" in output
+    assert "group=2  clip=0.2000" in output
     assert "load training_backend" in output
     assert "load serving_backend" in output
     assert "loaded reference_model" not in output
-    assert "step 1/2  epoch 1/1  batch 1/2  batch_size=2" in output
+    assert "step 1/2  epoch 1/1  batch 1/2  prompts=2  group=2  samples=4" in output
     assert "  rollout" in output
     assert "  reward" in output
     assert "  tokenize_full" in output
@@ -836,7 +924,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "  stages    " in output
     assert "step=1 epoch=1/1" not in output
     assert "stage=rollout" not in output
-    assert "sample" not in output
+    assert "sample step" not in output
     assert "phase=" not in output
     assert "stage initializing" not in output
     assert "━" not in output
@@ -857,10 +945,12 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "phase_group_totals" not in run_finished["payload"]
 
     rollouts = read_rollouts(trainer._run_logger.run_dir)
-    assert len(rollouts) == len(dataset)
+    assert len(rollouts) == len(dataset) * 2
     assert rollouts[0]["prompt"]["text"] == "prompt 0"
     assert rollouts[0]["reward"]["value"] > 0.0
     assert rollouts[0]["conversation"]["messages"][0]["content"] == "prompt 0"
+    assert rollouts[0]["prompt_index"] == 0
+    assert rollouts[0]["candidate_index"] == 0
 
     trainer._run_logger.close()
 
@@ -876,9 +966,9 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
         model="fake/model",
         rollout_fn=make_rollout_fn(response_suffix="kl", repeat=8),
         reward_fn=reward_fn,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
-        kl_coefficient=0.1,
+        grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.1),
         reference_enabled=True,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
@@ -950,7 +1040,7 @@ def test_flashrl_checkpoint_works_before_train_and_resume_skips_reset(
     dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
     trainer.train(dataset)
 
-    assert trainer._trainer.total_steps == 11
+    assert trainer._trainer.total_steps == 15
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "epoch 2/3" in transcript
     assert "epoch 1/3" not in transcript

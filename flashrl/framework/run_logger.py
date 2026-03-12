@@ -74,6 +74,8 @@ class RunLogger:
         runtime_shape: str,
         reference_enabled: bool,
         reference_device: str,
+        group_size: int | None = None,
+        clip_ratio: float | None = None,
     ) -> None:
         """Log the start of a training run."""
         self._total_batches = total_batches
@@ -92,6 +94,8 @@ class RunLogger:
             "runtime_shape": runtime_shape,
             "reference_enabled": reference_enabled,
             "reference_device": reference_device,
+            "group_size": group_size,
+            "clip_ratio": clip_ratio,
             "run_dir": str(self.run_dir),
         }
         self._emit_event("run_started", payload)
@@ -109,6 +113,8 @@ class RunLogger:
                     runtime_shape=runtime_shape,
                     reference_enabled=reference_enabled,
                     reference_device=reference_device,
+                    group_size=group_size,
+                    clip_ratio=clip_ratio,
                 )
             )
             return
@@ -124,6 +130,11 @@ class RunLogger:
         self._emit_console(
             f"  runtime={runtime_shape} reference={reference_state} reference_device={reference_device}"
         )
+        if group_size is not None:
+            line = f"  grpo=group_size:{group_size}"
+            if clip_ratio is not None:
+                line += f" clip_ratio={clip_ratio:.4f}"
+            self._emit_console(line)
         self._emit_console(f"  logs={self.run_dir}")
 
     def log_model_load(
@@ -259,10 +270,15 @@ class RunLogger:
         prompts: list[Any],
         rollouts: list[Any],
         rewards: list[Any],
+        prompt_indices: list[int],
+        candidate_indices: list[int],
+        group_size: int,
+        prompt_count: int,
     ) -> None:
         """Persist one full-fidelity rollout record per sample."""
-        for sample_index, (prompt, rollout, reward) in enumerate(
-            zip(prompts, rollouts, rewards, strict=True),
+        sample_count = len(prompts)
+        for sample_index, (prompt, rollout, reward, prompt_index, candidate_index) in enumerate(
+            zip(prompts, rollouts, rewards, prompt_indices, candidate_indices, strict=True),
             start=1,
         ):
             record = {
@@ -272,6 +288,11 @@ class RunLogger:
                 "batch_index": batch_index,
                 "batches_in_epoch": batches_in_epoch,
                 "sample_index": sample_index,
+                "prompt_index": prompt_index,
+                "candidate_index": candidate_index,
+                "group_size": group_size,
+                "prompt_count": prompt_count,
+                "sample_count": sample_count,
                 "prompt": {
                     "text": prompt.text,
                     "metadata": self._serialize_for_json(prompt.metadata),
@@ -455,16 +476,24 @@ class RunLogger:
         runtime_shape: str,
         reference_enabled: bool,
         reference_device: str,
+        group_size: int | None,
+        clip_ratio: float | None,
     ) -> list[str]:
         reference_state = "enabled" if reference_enabled else "disabled"
-        return [
+        lines = [
             "FlashRL training run",
             f"  run      {self.run_id}",
             f"  model    {self.model_name}  device={device} dtype={dtype} cpu={cpu_threads}",
             f"  data     dataset={dataset_size} batch={batch_size} epochs={max_epochs} total_batches={total_batches}",
             f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
-            f"  logs     {self.run_dir}",
         ]
+        if group_size is not None:
+            grpo_line = f"  grpo     group={group_size}"
+            if clip_ratio is not None:
+                grpo_line += f"  clip={self._format_fixed(float(clip_ratio), 4)}"
+            lines.append(grpo_line)
+        lines.append(f"  logs     {self.run_dir}")
+        return lines
 
     def _format_compact_load_line(self, component: str, metadata: dict[str, Any]) -> str:
         device = metadata.get("device", "unknown")
@@ -478,7 +507,9 @@ class RunLogger:
             f"step {payload['step']}/{total_batches}  "
             f"epoch {payload['epoch']}/{payload['total_epochs']}  "
             f"batch {payload['batch_index']}/{payload['batches_in_epoch']}  "
-            f"batch_size={payload['batch_size']}"
+            f"prompts={payload.get('prompt_count', '?')}  "
+            f"group={payload.get('group_size', '?')}  "
+            f"samples={payload['batch_size']}"
         )
 
     def _format_compact_stage_row(self, payload: dict[str, Any]) -> str:
@@ -629,12 +660,15 @@ class RunLogger:
             f" epoch={payload['epoch']}/{payload['total_epochs']}"
             f" batch={payload['batch_index']}/{payload['batches_in_epoch']}"
             f" batch_size={payload['batch_size']}"
+            f" prompt_count={payload.get('prompt_count', '?')}"
+            f" group_size={payload.get('group_size', '?')}"
             f" stage={payload['stage']}"
         )
 
     def _verbose_stage_keys(self, stage: str) -> list[str]:
         ordered_keys = {
             "rollout": [
+                "sample_count",
                 "prompt_tokens_mean",
                 "prompt_tokens_max",
                 "response_tokens_mean",

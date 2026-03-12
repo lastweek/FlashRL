@@ -11,12 +11,14 @@ from types import SimpleNamespace
 import warnings
 
 import pytest
+from pydantic import ValidationError
 import torch
 import torch.nn.functional as F
+import yaml
 
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.metrics as metrics_module
-from flashrl.framework import FlashRL, LoggingConfig, MetricsConfig
+from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.metrics import PrometheusMetricsSink
 
@@ -107,8 +109,10 @@ class FakeActor:
 class FakeTrainingBackend:
     """Training backend used for metrics tests."""
 
+    last_config = None
+
     def __init__(self, config, learning_rate: float = 1e-5) -> None:
-        del config
+        type(self).last_config = config
         self.actor = FakeActor(bias_shift=0.25)
         self.actor.train()
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
@@ -126,8 +130,10 @@ class FakeTrainingBackend:
 class FakeServingBackend:
     """Serving backend used for metrics tests."""
 
+    last_config = None
+
     def __init__(self, config) -> None:
-        del config
+        type(self).last_config = config
         self.actor = FakeActor(bias_shift=0.1)
         self.actor.eval()
 
@@ -135,8 +141,10 @@ class FakeServingBackend:
 class FakeReferenceModel:
     """Reference model used for KL computation in tests."""
 
+    last_config = None
+
     def __init__(self, config) -> None:
-        del config
+        type(self).last_config = config
         self.device = torch.device("cpu")
         self.model = FakeCausalLM(bias_shift=0.0)
 
@@ -173,6 +181,9 @@ def reward_fn(rollout: RolloutOutput) -> RewardOutput:
 
 def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch FlashRL to use fake local backends."""
+    FakeTrainingBackend.last_config = None
+    FakeServingBackend.last_config = None
+    FakeReferenceModel.last_config = None
     monkeypatch.setattr(flashrl_module, "TrainingBackend", FakeTrainingBackend)
     monkeypatch.setattr(flashrl_module, "ServingBackend", FakeServingBackend)
     monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
@@ -298,41 +309,68 @@ def write_yaml_run_config(
     hook_module: str,
     log_dir: Path,
     metrics_enabled: bool = False,
+    common_dtype: str | None = None,
     serving_num_threads: int = 3,
+    training_num_threads: int | None = 1,
+    group_size: int = 2,
+    clip_ratio: float = 0.2,
+    kl_coefficient: float = 0.0,
 ) -> Path:
     """Write a temporary YAML config for FlashRL.from_yaml tests."""
     config_path = tmp_path / "run.yaml"
+    training_section = {
+        "learning_rate": 1.0e-5,
+        "batch_size": 2,
+        "max_epochs": 1,
+    }
+    if training_num_threads is not None:
+        training_section["num_threads"] = training_num_threads
+
+    serving_section: dict[str, int] = {}
+    if serving_num_threads is not None:
+        serving_section["num_threads"] = serving_num_threads
+
+    common_section: dict[str, object] = {"model_name": "fake/model"}
+    if common_dtype is not None:
+        common_section["dtype"] = common_dtype
+
     config_path.write_text(
-        textwrap.dedent(
-            f"""
-            model:
-              model_name: fake/model
-              num_threads: 1
-            serving:
-              model_name: fake/model
-              num_threads: {serving_num_threads}
-            trainer:
-              learning_rate: 1.0e-5
-              batch_size: 2
-              max_epochs: 1
-              kl_coefficient: 0.0
-            logging:
-              log_dir: {log_dir}
-              console: false
-              file: true
-            metrics:
-              enabled: {"true" if metrics_enabled else "false"}
-              pushgateway_url: http://localhost:9091
-              job_name: flashrl-test
-            runtime:
-              reference_enabled: false
-            hooks:
-              rollout_fn: {hook_module}:rollout_fn
-              reward_fn: {hook_module}:reward_fn
-              dataset_fn: {hook_module}:dataset_fn
-            """
-        ).strip()
-        + "\n",
+        yaml.safe_dump(
+            {
+                "common": common_section,
+                "training": training_section,
+                "serving": serving_section,
+                "grpo": {
+                    "group_size": group_size,
+                    "clip_ratio": clip_ratio,
+                    "kl_coefficient": kl_coefficient,
+                    "max_new_tokens": 32,
+                    "temperature": 1.0,
+                    "top_p": 0.9,
+                    "top_k": 0,
+                    "do_sample": True,
+                },
+                "logging": {
+                    "log_dir": str(log_dir),
+                    "console": False,
+                    "file": True,
+                },
+                "metrics": {
+                    "enabled": metrics_enabled,
+                    "pushgateway_url": "http://localhost:9091",
+                    "job_name": "flashrl-test",
+                },
+                "runtime": {
+                    "reference_enabled": False,
+                },
+                "hooks": {
+                    "rollout_fn": f"{hook_module}:rollout_fn",
+                    "reward_fn": f"{hook_module}:reward_fn",
+                    "dataset_fn": f"{hook_module}:dataset_fn",
+                },
+            },
+            sort_keys=False,
+        ),
         encoding="utf-8",
     )
     return config_path
@@ -390,6 +428,12 @@ def test_metrics_config_defaults_enabled() -> None:
     assert MetricsConfig().enabled is True
 
 
+def test_grpo_config_rejects_group_size_below_two() -> None:
+    """Real GRPO requires at least two samples per prompt group."""
+    with pytest.raises(ValidationError, match="group_size"):
+        GrpoConfig(group_size=1)
+
+
 def test_prometheus_metrics_sink_warns_once_and_continues_on_push_failure() -> None:
     """Push failures should not raise and should warn only once per sink."""
     attempts: list[tuple[str, str]] = []
@@ -436,7 +480,7 @@ def test_flashrl_metrics_push_process_lifetime_across_runs(
         model="fake/model",
         rollout_fn=make_rollout_fn(response_suffix="metrics", repeat=4),
         reward_fn=reward_fn,
-        batch_size=2,
+        batch_size=4,
         max_epochs=1,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
@@ -513,6 +557,30 @@ def test_flashrl_default_metrics_push_failure_does_not_fail_training(
     assert (trainer._run_logger.run_dir / "events.jsonl").exists()
 
 
+def test_flashrl_rejects_batch_size_not_divisible_by_group_size(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Grouped GRPO should fail fast if the sampled batch cannot be split into full groups."""
+    patch_backends(monkeypatch)
+
+    with pytest.raises(ValueError, match="divisible by grpo.group_size"):
+        FlashRL(
+            model="fake/model",
+            rollout_fn=make_rollout_fn(response_suffix="invalid", repeat=2),
+            reward_fn=reward_fn,
+            batch_size=3,
+            max_epochs=1,
+            grpo_config=GrpoConfig(group_size=2),
+            logging_config=LoggingConfig(
+                log_dir=tmp_path,
+                console=False,
+                file=True,
+            ),
+            metrics_config=MetricsConfig(enabled=False),
+        )
+
+
 def test_flashrl_from_yaml_loads_hooks_and_supports_dataset_loader(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -533,8 +601,294 @@ def test_flashrl_from_yaml_loads_hooks_and_supports_dataset_loader(
     assert trainer._dataset_loader is not None
     assert trainer.metrics_config.enabled is False
     assert trainer.serving_config.num_threads == 3
-    assert trainer.model_config.num_threads == 1
+    assert trainer.training_model_config.num_threads == 1
+    assert trainer.training_model_config.model_name == "fake/model"
+    assert trainer.grpo_config.group_size == 2
+    assert trainer.grpo_config.clip_ratio == pytest.approx(0.2)
     assert trainer._run_logger.run_dir.exists()
+
+
+def test_flashrl_from_yaml_common_defaults_flow_into_training_and_serving(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """common model defaults should flow into both resolved model copies."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = write_yaml_run_config(
+        tmp_path,
+        hook_module=hook_module,
+        log_dir=tmp_path / "common-logs",
+        common_dtype="float16",
+        training_num_threads=5,
+        serving_num_threads=3,
+    )
+
+    trainer = FlashRL.from_yaml(config_path)
+
+    assert trainer.training_model_config.model_name == "fake/model"
+    assert trainer.training_model_config.dtype == "float16"
+    assert trainer.training_model_config.num_threads == 5
+    assert trainer.serving_config.model_name == "fake/model"
+    assert trainer.serving_config.dtype == "float16"
+    assert trainer.serving_config.num_threads == 3
+
+
+def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """training and serving should be able to override common defaults independently."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = tmp_path / "override.yaml"
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "common": {
+                    "model_name": "fake/model",
+                    "dtype": "float16",
+                },
+                "training": {
+                    "dtype": "bfloat16",
+                    "num_threads": 5,
+                    "batch_size": 2,
+                    "max_epochs": 1,
+                },
+                "serving": {
+                    "dtype": "float32",
+                    "num_threads": 3,
+                },
+                "grpo": {
+                    "group_size": 2,
+                    "clip_ratio": 0.2,
+                    "kl_coefficient": 0.0,
+                    "max_new_tokens": 32,
+                    "temperature": 1.0,
+                    "top_p": 0.9,
+                    "top_k": 0,
+                    "do_sample": True,
+                },
+                "logging": {
+                    "log_dir": str(tmp_path / "override-logs"),
+                    "console": False,
+                    "file": True,
+                },
+                "metrics": {
+                    "enabled": False,
+                },
+                "runtime": {
+                    "reference_enabled": False,
+                },
+                "hooks": {
+                    "rollout_fn": f"{hook_module}:rollout_fn",
+                    "reward_fn": f"{hook_module}:reward_fn",
+                    "dataset_fn": f"{hook_module}:dataset_fn",
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+
+    trainer = FlashRL.from_yaml(config_path)
+
+    assert trainer.training_model_config.dtype == "bfloat16"
+    assert trainer.training_model_config.num_threads == 5
+    assert trainer.serving_config.dtype == "float32"
+    assert trainer.serving_config.num_threads == 3
+    assert FakeTrainingBackend.last_config.dtype == "bfloat16"
+    assert FakeTrainingBackend.last_config.num_threads == 5
+    assert FakeServingBackend.last_config.dtype == "float32"
+    assert FakeServingBackend.last_config.num_threads == 3
+
+
+def test_flashrl_from_yaml_reference_model_uses_resolved_training_config(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The reference model should derive from training-side config plus runtime override."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = tmp_path / "reference.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            common:
+              model_name: fake/model
+            training:
+              device: cpu
+              num_threads: 5
+              batch_size: 2
+              max_epochs: 1
+            serving: {{}}
+            grpo:
+              group_size: 2
+              clip_ratio: 0.2
+              kl_coefficient: 0.0
+            logging:
+              log_dir: {tmp_path / "reference-logs"}
+              console: false
+              file: true
+            metrics:
+              enabled: false
+            runtime:
+              reference_enabled: true
+              reference_device: reference-device
+            hooks:
+              rollout_fn: {hook_module}:rollout_fn
+              reward_fn: {hook_module}:reward_fn
+              dataset_fn: {hook_module}:dataset_fn
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    trainer = FlashRL.from_yaml(config_path)
+
+    assert trainer.reference_enabled is True
+    assert FakeReferenceModel.last_config is not None
+    assert FakeReferenceModel.last_config.model_name == "fake/model"
+    assert FakeReferenceModel.last_config.num_threads == 5
+    assert FakeReferenceModel.last_config.device == "reference-device"
+
+
+def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Both training and serving must resolve a model name after merge."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = tmp_path / "missing-model.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            training:
+              batch_size: 2
+              max_epochs: 1
+            serving: {{}}
+            grpo:
+              group_size: 2
+              clip_ratio: 0.2
+              kl_coefficient: 0.0
+            logging:
+              log_dir: {tmp_path / "missing-model-logs"}
+              console: false
+              file: true
+            metrics:
+              enabled: false
+            runtime:
+              reference_enabled: false
+            hooks:
+              rollout_fn: {hook_module}:rollout_fn
+              reward_fn: {hook_module}:reward_fn
+              dataset_fn: {hook_module}:dataset_fn
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="common.model_name"):
+        FlashRL.from_yaml(config_path)
+
+
+def test_flashrl_from_yaml_rejects_loop_fields_under_common(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """common should only allow shared model defaults, not training loop fields."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = tmp_path / "invalid-common.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            common:
+              model_name: fake/model
+              batch_size: 4
+            training:
+              batch_size: 2
+              max_epochs: 1
+            serving: {{}}
+            grpo:
+              group_size: 2
+              clip_ratio: 0.2
+              kl_coefficient: 0.0
+            logging:
+              log_dir: {tmp_path / "invalid-common-logs"}
+              console: false
+              file: true
+            metrics:
+              enabled: false
+            runtime:
+              reference_enabled: false
+            hooks:
+              rollout_fn: {hook_module}:rollout_fn
+              reward_fn: {hook_module}:reward_fn
+              dataset_fn: {hook_module}:dataset_fn
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="batch_size"):
+        FlashRL.from_yaml(config_path)
+
+
+def test_flashrl_from_yaml_rejects_num_threads_under_common(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """num_threads is runtime-local and must live under training or serving, not common."""
+    patch_backends(monkeypatch)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = tmp_path / "invalid-common-num-threads.yaml"
+    config_path.write_text(
+        textwrap.dedent(
+            f"""
+            common:
+              model_name: fake/model
+              num_threads: 4
+            training:
+              batch_size: 2
+              max_epochs: 1
+              num_threads: 2
+            serving:
+              num_threads: 1
+            grpo:
+              group_size: 2
+              clip_ratio: 0.2
+              kl_coefficient: 0.0
+            logging:
+              log_dir: {tmp_path / "invalid-common-num-threads-logs"}
+              console: false
+              file: true
+            metrics:
+              enabled: false
+            runtime:
+              reference_enabled: false
+            hooks:
+              rollout_fn: {hook_module}:rollout_fn
+              reward_fn: {hook_module}:reward_fn
+              dataset_fn: {hook_module}:dataset_fn
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValidationError, match="num_threads"):
+        FlashRL.from_yaml(config_path)
 
 
 def test_flashrl_train_requires_dataset_without_yaml_loader(
@@ -606,7 +960,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     )
     trainer._metrics_sink = PrometheusMetricsSink(
         trainer.metrics_config,
-        model_name=trainer.model_config.model_name,
+        model_name=trainer.training_model_config.model_name,
     )
     assert trainer._trainer is not None
     trainer._trainer.metrics_sink = trainer._metrics_sink
@@ -636,11 +990,28 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "endpoint-ready before reporting success" in docs
     assert "python3 -m examples.reasoning.train" in docs
     assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in docs
+    assert "model:" not in docs
+    assert "trainer:" not in docs
+    assert "common:" in docs
+    assert "training:" in docs
+    assert "serving:" in docs
+    assert "grpo:" in docs
     assert "http://localhost:3000" in docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
+
+    example_yaml = Path("examples/reasoning/config.yaml").read_text(encoding="utf-8")
+    assert "model:" not in example_yaml
+    assert "trainer:" not in example_yaml
+    assert "common:" in example_yaml
+    assert "training:" in example_yaml
+    assert "serving:" in example_yaml
+    assert "grpo:" in example_yaml
+    assert "common:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct\n  num_threads:" not in example_yaml
+    assert "training:\n  num_threads: 1" in example_yaml
+    assert "serving:\n  num_threads: 1" in example_yaml
 
 
 def test_dev_sh_metrics_commands_and_compose_validation() -> None:

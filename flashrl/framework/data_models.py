@@ -77,6 +77,10 @@ class TrainingBatch(BaseModel):
     conversations: list[Conversation]
     rollouts: list[RolloutOutput]
     rewards: list[RewardOutput]
+    group_size: int = 1
+    prompt_count: int = 0
+    prompt_indices: list[int] = Field(default_factory=list)
+    candidate_indices: list[int] = Field(default_factory=list)
     rollout_response_log_probs: list[list[float]] | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
 

@@ -3,7 +3,7 @@
 from pathlib import Path
 from typing import Any, Literal
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class BaseConfig(BaseModel):
@@ -28,9 +28,6 @@ class TrainerConfig(BaseConfig):
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10
-    clip_epsilon: float = 0.2
-    kl_coefficient: float = 0.0
-    gamma: float = 1.0  # Discount factor
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -72,6 +69,22 @@ class RewardConfig(BaseConfig):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class GrpoConfig(BaseConfig):
+    """Configuration for grouped GRPO rollout and optimization."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    group_size: int = Field(default=2, ge=2)
+    clip_ratio: float = 0.2
+    kl_coefficient: float = 0.0
+    max_new_tokens: int = 512
+    temperature: float = 1.0
+    top_p: float = 0.9
+    top_k: int = 0
+    do_sample: bool = True
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class LoggingConfig(BaseConfig):
     """Configuration for run logging and terminal UX."""
 
@@ -109,12 +122,44 @@ class HookConfig(BaseConfig):
     dataset_fn: str
 
 
+class CommonConfig(BaseConfig):
+    """Optional shared model defaults for both training and serving."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_name: str | None = None
+    device: str | None = None
+    dtype: str | None = None
+    max_length: int | None = None
+    load_in_8bit: bool | None = None
+    trust_remote_code: bool | None = None
+    metadata: dict[str, Any] | None = None
+
+
+class TrainingSectionConfig(CommonConfig):
+    """YAML training section: model-copy settings plus loop settings."""
+
+    num_threads: int | None = None
+    learning_rate: float = 1e-5
+    batch_size: int = 32
+    max_epochs: int = 10
+
+
+class ServingSectionConfig(CommonConfig):
+    """YAML serving section: serving model-copy settings only."""
+
+    num_threads: int | None = None
+
+
 class RunConfig(BaseConfig):
     """Top-level YAML config for one FlashRL run."""
 
-    model: ModelConfig
-    serving: ServingConfig | None = None
-    trainer: TrainerConfig = Field(default_factory=TrainerConfig)
+    model_config = ConfigDict(extra="forbid")
+
+    common: CommonConfig | None = None
+    training: TrainingSectionConfig
+    serving: ServingSectionConfig
+    grpo: GrpoConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)

@@ -3,6 +3,8 @@
 from flashrl.framework.backends.training import TrainingBackend
 from flashrl.framework.backends.serving import ServingBackend
 from flashrl.framework.config import (
+    CommonConfig,
+    GrpoConfig,
     HookConfig,
     LoggingConfig,
     MetricsConfig,
@@ -12,6 +14,8 @@ from flashrl.framework.config import (
     RuntimeConfig,
     RolloutConfig,
     ServingConfig,
+    ServingSectionConfig,
+    TrainingSectionConfig,
     TrainerConfig,
 )
 from flashrl.framework.data_models import (
@@ -29,9 +33,13 @@ from flashrl.framework.flashrl import FlashRL
 __all__ = [
     "FlashRL",
     # Config
+    "CommonConfig",
+    "GrpoConfig",
     "TrainerConfig",
     "ModelConfig",
     "ServingConfig",
+    "TrainingSectionConfig",
+    "ServingSectionConfig",
     "RolloutConfig",
     "RewardConfig",
     "LoggingConfig",

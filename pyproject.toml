@@ -36,3 +36,7 @@ ignore = ["E501"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+    "unit: fast offline deterministic tests",
+    "integration: optional local-service or heavier smoke tests",
+]

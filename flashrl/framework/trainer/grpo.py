@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 import torch.nn.functional as F
 
-from flashrl.framework.config import TrainerConfig
+from flashrl.framework.config import GrpoConfig, TrainerConfig
 from flashrl.framework.data_models import Prompt, RewardOutput, TrainingBatch
 from flashrl.framework.models.reference import ReferenceModel
 from flashrl.framework.reward.user_defined import UserDefinedReward
@@ -48,6 +48,8 @@ class StepContext:
     batch_index: int
     batches_in_epoch: int
     batch_size: int
+    prompt_count: int
+    group_size: int
 
     def payload(self) -> dict[str, int]:
         """Return the event payload fields shared by all step-stage logs."""
@@ -58,6 +60,8 @@ class StepContext:
             "batch_index": self.batch_index,
             "batches_in_epoch": self.batches_in_epoch,
             "batch_size": self.batch_size,
+            "prompt_count": self.prompt_count,
+            "group_size": self.group_size,
         }
 
 
@@ -79,6 +83,7 @@ class GRPOTrainer:
     def __init__(
         self,
         config: TrainerConfig,
+        grpo_config: GrpoConfig,
         training_backend: "TrainingBackend",
         serving_backend: "ServingBackend",
         reference: ReferenceModel | None,
@@ -95,6 +100,7 @@ class GRPOTrainer:
         self.total_steps = 0
         self.training_backend = training_backend
         self.serving_backend = serving_backend
+        self.grpo_config = grpo_config
         self.reference = reference
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
@@ -110,8 +116,8 @@ class GRPOTrainer:
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
-        batch_size = self.config.batch_size
-        batches_in_epoch = math.ceil(len(dataset) / batch_size) if len(dataset) else 0
+        prompts_per_step = self._prompts_per_step()
+        batches_in_epoch = math.ceil(len(dataset) / prompts_per_step) if len(dataset) else 0
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
@@ -126,15 +132,21 @@ class GRPOTrainer:
                     batches_in_epoch,
                 )
 
-            for batch_index, prompts in enumerate(self._batch_prompts(dataset, batch_size), start=1):
+            for batch_index, prompts in enumerate(
+                self._batch_prompts(dataset, prompts_per_step),
+                start=1,
+            ):
                 next_step = self.total_steps + 1
+                sample_count = len(prompts) * self.grpo_config.group_size
                 context = StepContext(
                     step=next_step,
                     epoch=epoch_number,
                     total_epochs=self.config.max_epochs,
                     batch_index=batch_index,
                     batches_in_epoch=batches_in_epoch,
-                    batch_size=len(prompts),
+                    batch_size=sample_count,
+                    prompt_count=len(prompts),
+                    group_size=self.grpo_config.group_size,
                 )
                 step_payload = self._run_logged_step(prompts, context)
                 epoch_step_payloads.append(step_payload)
@@ -160,8 +172,10 @@ class GRPOTrainer:
         step_started_at = time.perf_counter()
 
         rollout_started_at = time.perf_counter()
-        rollouts = self.rollout_generator.generate(prompts)
-        prompt_texts = [prompt.text for prompt in prompts]
+        grouped_prompts, rollouts, prompt_indices, candidate_indices = (
+            self.rollout_generator.generate_grouped(prompts, context.group_size)
+        )
+        prompt_texts = [prompt.text for prompt in grouped_prompts]
         response_texts = [rollout.text for rollout in rollouts]
         rollout_response_log_probs = self._compute_rollout_response_log_probs(
             prompt_texts,
@@ -175,6 +189,7 @@ class GRPOTrainer:
             "rollout",
             rollout_seconds,
             {
+                "sample_count": len(grouped_prompts),
                 "prompt_tokens_mean": self._mean(prompt_lengths),
                 "prompt_tokens_max": max(prompt_lengths, default=0),
                 "response_tokens_mean": self._mean(response_lengths),
@@ -182,7 +197,7 @@ class GRPOTrainer:
             },
         )
 
-        rewards, reward_seconds = self._compute_rewards(context, prompts, rollouts)
+        rewards, reward_seconds = self._compute_rewards(context, grouped_prompts, rollouts)
         reward_values = [reward.reward for reward in rewards]
         reward_stats = self._summary_stats("reward", reward_values)
         reward_per_item_mean_seconds = reward_seconds / len(rewards) if rewards else 0.0
@@ -201,21 +216,29 @@ class GRPOTrainer:
                 epoch=context.epoch,
                 batch_index=context.batch_index,
                 batches_in_epoch=context.batches_in_epoch,
-                prompts=prompts,
+                prompts=grouped_prompts,
                 rollouts=rollouts,
                 rewards=rewards,
+                prompt_indices=prompt_indices,
+                candidate_indices=candidate_indices,
+                group_size=context.group_size,
+                prompt_count=context.prompt_count,
             )
 
         batch = TrainingBatch(
-            prompts=prompts,
+            prompts=grouped_prompts,
             conversations=[rollout.conversation for rollout in rollouts],
             rollouts=rollouts,
             rewards=rewards,
+            group_size=context.group_size,
+            prompt_count=context.prompt_count,
+            prompt_indices=prompt_indices,
+            candidate_indices=candidate_indices,
             rollout_response_log_probs=rollout_response_log_probs,
         )
 
         advantages, advantage_seconds = self._measure(
-            lambda: self._compute_advantages(batch.rewards)
+            lambda: self._compute_advantages(batch.rewards, batch.prompt_count, batch.group_size)
         )
         advantage_values = [float(value) for value in advantages.tolist()]
         advantage_stats = self._summary_stats("advantage", advantage_values)
@@ -268,13 +291,14 @@ class GRPOTrainer:
             "reference_enabled": reference_enabled,
             "reference_active": result.reference_active,
             "dominant_stage": dominant_stage,
+            "sample_count": len(grouped_prompts),
         }
 
         if self.run_logger is not None:
             self.run_logger.log_step_done(payload)
             self.run_logger.log_sample_preview(
                 step=context.step,
-                prompt=prompts[0].text if prompts else "",
+                prompt=grouped_prompts[0].text if grouped_prompts else "",
                 response=rollouts[0].text if rollouts else "",
                 reward=reward_values[0] if reward_values else 0.0,
             )
@@ -373,7 +397,7 @@ class GRPOTrainer:
             {"full_tokens_total": full_tokens_total},
         )
 
-        reference_active = self.reference is not None and self.config.kl_coefficient > 0.0
+        reference_active = self.reference is not None and self.grpo_config.kl_coefficient > 0.0
         if reference_active:
             ref_logits, reference_forward_seconds = self._measure(
                 lambda: self._reference_logits(input_ids, attention_mask)
@@ -397,8 +421,8 @@ class GRPOTrainer:
                 ref_logits=ref_logits,
                 rollout_response_log_probs=rollout_response_log_probs,
                 advantages=advantages,
-                kl_coefficient=self.config.kl_coefficient,
-                clip_epsilon=self.config.clip_epsilon,
+                kl_coefficient=self.grpo_config.kl_coefficient,
+                clip_ratio=self.grpo_config.clip_ratio,
             )
         )
         loss, policy_loss, kl_divergence, response_tokens_total = loss_result
@@ -492,7 +516,7 @@ class GRPOTrainer:
         rollout_response_log_probs: list[list[float]],
         advantages: torch.Tensor,
         kl_coefficient: float,
-        clip_epsilon: float,
+        clip_ratio: float,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
         """Assemble the response-only GRPO objective and count response tokens.
 
@@ -501,7 +525,7 @@ class GRPOTrainer:
             L(theta) = L_policy(theta) + beta * L_KL(theta)
 
             L_policy(theta)
-              = -mean_t min(r_t * A_i, clip(r_t, 1 - clip_epsilon, 1 + clip_epsilon) * A_i)
+              = -mean_t min(r_t * A_i, clip(r_t, 1 - clip_ratio, 1 + clip_ratio) * A_i)
             r_t = exp(log_pi_theta - log_pi_old)
 
             L_KL(theta)
@@ -573,7 +597,7 @@ class GRPOTrainer:
         ).unsqueeze(-1)
         expanded_advantages = sample_advantages.expand_as(response_mask)
         ratio = torch.exp(log_pi_theta - log_pi_old)
-        clipped_ratio = torch.clamp(ratio, 1.0 - clip_epsilon, 1.0 + clip_epsilon)
+        clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
         surrogate_unclipped = ratio * expanded_advantages
         surrogate_clipped = clipped_ratio * expanded_advantages
         surrogate_objective = torch.minimum(surrogate_unclipped, surrogate_clipped)
@@ -738,21 +762,39 @@ class GRPOTrainer:
         if self.metrics_sink is not None:
             self.metrics_sink.observe_stage(stage, latency_seconds)
 
-    def _compute_advantages(self, rewards: list[RewardOutput]) -> torch.Tensor:
-        """Compute group-based relative advantages."""
+    def _compute_advantages(
+        self,
+        rewards: list[RewardOutput],
+        prompt_count: int,
+        group_size: int,
+    ) -> torch.Tensor:
+        """Compute GRPO advantages within each prompt group."""
         reward_values = torch.tensor(
             [reward.reward for reward in rewards],
             dtype=torch.float32,
         )
-        mean = reward_values.mean()
-        std = reward_values.std(unbiased=False)
-        return (reward_values - mean) / (std + 1e-8)
+        expected_samples = prompt_count * group_size
+        if reward_values.numel() != expected_samples:
+            raise ValueError(
+                "Reward count must match prompt_count * group_size for GRPO "
+                f"(expected {expected_samples}, got {reward_values.numel()})."
+            )
+        if reward_values.numel() == 0:
+            return reward_values
+        grouped_rewards = reward_values.view(prompt_count, group_size)
+        group_means = grouped_rewards.mean(dim=1, keepdim=True)
+        group_stds = grouped_rewards.std(dim=1, unbiased=False, keepdim=True)
+        return ((grouped_rewards - group_means) / (group_stds + 1e-8)).reshape(-1)
 
     def _batch_prompts(self, dataset: Any, batch_size: int | None = None) -> Any:
         """Split dataset into batches."""
         size = batch_size or self.config.batch_size
         for index in range(0, len(dataset), size):
             yield dataset[index:index + size]
+
+    def _prompts_per_step(self) -> int:
+        """Return the number of unique prompts consumed by each grouped GRPO step."""
+        return self.config.batch_size // self.grpo_config.group_size
 
     def _measure(self, operation: Callable[[], Any]) -> tuple[Any, float]:
         """Measure one operation with perf_counter."""

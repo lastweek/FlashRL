@@ -13,6 +13,8 @@ from typing import TYPE_CHECKING, Any, Callable, Sequence
 from .backends.serving import ServingBackend
 from .backends.training import TrainingBackend
 from .config import (
+    CommonConfig,
+    GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     ModelConfig,
@@ -60,6 +62,49 @@ def _coerce_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
     return normalized
 
 
+MODEL_SECTION_FIELDS = {
+    "model_name",
+    "device",
+    "dtype",
+    "max_length",
+    "load_in_8bit",
+    "trust_remote_code",
+    "num_threads",
+    "metadata",
+}
+
+
+def _resolve_model_config(
+    *,
+    common: CommonConfig | None,
+    section: CommonConfig,
+    config_cls: type[ModelConfig] | type[ServingConfig],
+    section_name: str,
+) -> ModelConfig | ServingConfig:
+    """Merge optional common defaults with one model-copy section."""
+    merged = {}
+    if common is not None:
+        merged.update(common.model_dump(exclude_none=True))
+    merged.update(section.model_dump(include=MODEL_SECTION_FIELDS, exclude_none=True))
+
+    if not merged.get("model_name"):
+        raise ValueError(
+            f"Run config requires '{section_name}.model_name' or 'common.model_name' after merge."
+        )
+    return config_cls(**merged)
+
+
+def _rollout_config_from_grpo(grpo_config: GrpoConfig) -> RolloutConfig:
+    """Build the internal rollout config from GRPO sampling knobs."""
+    return RolloutConfig(
+        max_new_tokens=grpo_config.max_new_tokens,
+        temperature=grpo_config.temperature,
+        top_p=grpo_config.top_p,
+        top_k=grpo_config.top_k,
+        do_sample=grpo_config.do_sample,
+    )
+
+
 class FlashRL:
     """Unified FlashRL trainer with a simple RL training API."""
 
@@ -71,7 +116,7 @@ class FlashRL:
         learning_rate: float = 1e-5,
         batch_size: int = 32,
         max_epochs: int = 10,
-        clip_epsilon: float = 0.2,
+        clip_ratio: float = 0.2,
         kl_coefficient: float = 0.0,
         gamma: float = 1.0,
         device: str | None = None,
@@ -80,6 +125,7 @@ class FlashRL:
         load_in_8bit: bool = False,
         trust_remote_code: bool = False,
         num_threads: int = 1,
+        grpo_config: GrpoConfig | None = None,
         serving_config: ServingConfig | None = None,
         logging_config: LoggingConfig | None = None,
         metrics_config: MetricsConfig | None = None,
@@ -97,7 +143,7 @@ class FlashRL:
         self.reference_enabled = reference_enabled
         self.reference_device = reference_device
 
-        self.model_config = ModelConfig(
+        self.training_model_config = ModelConfig(
             model_name=model,
             device=device,
             dtype=dtype,
@@ -109,17 +155,25 @@ class FlashRL:
         self.serving_config = (
             serving_config
             if serving_config is not None
-            else ServingConfig(**self.model_config.model_dump())
+            else ServingConfig(**self.training_model_config.model_dump())
         )
         self.trainer_config = TrainerConfig(
             learning_rate=learning_rate,
             batch_size=batch_size,
             max_epochs=max_epochs,
-            clip_epsilon=clip_epsilon,
-            kl_coefficient=kl_coefficient,
-            gamma=gamma,
         )
-        self.rollout_config = RolloutConfig()
+        self.grpo_config = grpo_config or GrpoConfig(
+            clip_ratio=clip_ratio,
+            kl_coefficient=kl_coefficient,
+            metadata={"gamma": gamma},
+        )
+        if self.trainer_config.batch_size % self.grpo_config.group_size != 0:
+            raise ValueError(
+                "training.batch_size must be divisible by grpo.group_size "
+                f"(got batch_size={self.trainer_config.batch_size}, "
+                f"group_size={self.grpo_config.group_size})."
+            )
+        self.rollout_config = _rollout_config_from_grpo(self.grpo_config)
         self.reward_config = RewardConfig()
         self.logging_config = logging_config or LoggingConfig()
         self.metrics_config = metrics_config or MetricsConfig()
@@ -141,7 +195,7 @@ class FlashRL:
         if self.metrics_config.enabled:
             self._metrics_sink = PrometheusMetricsSink(
                 self.metrics_config,
-                model_name=self.model_config.model_name,
+                model_name=self.training_model_config.model_name,
             )
 
         self._initialize_runtime()
@@ -151,31 +205,42 @@ class FlashRL:
         """Construct FlashRL from a YAML run config."""
         config_path = Path(path)
         run_config = RunConfig.from_yaml(config_path)
+        training_model_config = _resolve_model_config(
+            common=run_config.common,
+            section=run_config.training,
+            config_cls=ModelConfig,
+            section_name="training",
+        )
+        serving_config = _resolve_model_config(
+            common=run_config.common,
+            section=run_config.serving,
+            config_cls=ServingConfig,
+            section_name="serving",
+        )
+        trainer_config = TrainerConfig(
+            learning_rate=run_config.training.learning_rate,
+            batch_size=run_config.training.batch_size,
+            max_epochs=run_config.training.max_epochs,
+        )
         rollout_fn = _resolve_import_string(run_config.hooks.rollout_fn)
         reward_fn = _resolve_import_string(run_config.hooks.reward_fn)
         dataset_fn = _resolve_import_string(run_config.hooks.dataset_fn)
 
         instance = cls(
-            model=run_config.model.model_name,
+            model=training_model_config.model_name,
             rollout_fn=rollout_fn,
             reward_fn=reward_fn,
-            learning_rate=run_config.trainer.learning_rate,
-            batch_size=run_config.trainer.batch_size,
-            max_epochs=run_config.trainer.max_epochs,
-            clip_epsilon=run_config.trainer.clip_epsilon,
-            kl_coefficient=run_config.trainer.kl_coefficient,
-            gamma=run_config.trainer.gamma,
-            device=run_config.model.device,
-            dtype=run_config.model.dtype,
-            max_length=run_config.model.max_length,
-            load_in_8bit=run_config.model.load_in_8bit,
-            trust_remote_code=run_config.model.trust_remote_code,
-            num_threads=run_config.model.num_threads,
-            serving_config=(
-                run_config.serving
-                if run_config.serving is not None
-                else ServingConfig(**run_config.model.model_dump())
-            ),
+            learning_rate=trainer_config.learning_rate,
+            batch_size=trainer_config.batch_size,
+            max_epochs=trainer_config.max_epochs,
+            device=training_model_config.device,
+            dtype=training_model_config.dtype,
+            max_length=training_model_config.max_length,
+            load_in_8bit=training_model_config.load_in_8bit,
+            trust_remote_code=training_model_config.trust_remote_code,
+            num_threads=training_model_config.num_threads,
+            grpo_config=run_config.grpo,
+            serving_config=serving_config,
             logging_config=run_config.logging,
             metrics_config=run_config.metrics,
             reference_enabled=run_config.runtime.reference_enabled,
@@ -192,7 +257,7 @@ class FlashRL:
 
         started_at = time.perf_counter()
         self._training_backend = TrainingBackend(
-            self.model_config,
+            self.training_model_config,
             learning_rate=self.trainer_config.learning_rate,
         )
         duration_seconds = time.perf_counter() - started_at
@@ -203,6 +268,7 @@ class FlashRL:
                 component="training_backend",
                 duration_seconds=duration_seconds,
                 device=self._training_backend.actor.device,
+                cpu_threads=self.training_model_config.num_threads,
             )
         )
 
@@ -216,13 +282,16 @@ class FlashRL:
                 component="serving_backend",
                 duration_seconds=duration_seconds,
                 device=self._serving_backend.actor.device,
+                cpu_threads=self.serving_config.num_threads,
             )
         )
 
         if self.reference_enabled:
             started_at = time.perf_counter()
-            reference_config = self.model_config.model_copy(
-                update={"device": self.reference_device or self.model_config.device}
+            reference_config = self.training_model_config.model_copy(
+                update={
+                    "device": self.reference_device or self.training_model_config.device
+                }
             )
             self._reference = ReferenceModel(reference_config)
             duration_seconds = time.perf_counter() - started_at
@@ -233,6 +302,7 @@ class FlashRL:
                     component="reference_model",
                     duration_seconds=duration_seconds,
                     device=self._reference.device,
+                    cpu_threads=reference_config.num_threads,
                 )
             )
         else:
@@ -250,6 +320,7 @@ class FlashRL:
 
         self._trainer = GRPOTrainer(
             config=self.trainer_config,
+            grpo_config=self.grpo_config,
             training_backend=self._training_backend,
             serving_backend=self._serving_backend,
             reference=self._reference,
@@ -265,6 +336,7 @@ class FlashRL:
         component: str,
         duration_seconds: float,
         device: Any,
+        cpu_threads: int,
     ) -> dict[str, Any]:
         """Build one cached model-load event for replay into each run logger."""
         return {
@@ -272,7 +344,7 @@ class FlashRL:
             "status": "completed",
             "metadata": {
                 "device": str(device),
-                "cpu_threads": self.model_config.num_threads,
+                "cpu_threads": cpu_threads,
                 "duration_seconds": duration_seconds,
             },
         }
@@ -300,26 +372,31 @@ class FlashRL:
             **self._runtime_bootstrap_totals,
             **checkpoint_totals,
         }
+        prompts_per_step = self.trainer_config.batch_size // self.grpo_config.group_size
         total_batches = (
-            math.ceil(len(dataset) / self.trainer_config.batch_size) * self.trainer_config.max_epochs
+            math.ceil(len(dataset) / prompts_per_step) * self.trainer_config.max_epochs
             if dataset
             else 0
         )
         self._run_logger = RunLogger(
             self.logging_config,
-            model_name=self.model_config.model_name,
+            model_name=self.training_model_config.model_name,
         )
         self._run_logger.start_run(
             dataset_size=len(dataset),
             batch_size=self.trainer_config.batch_size,
             max_epochs=self.trainer_config.max_epochs,
             total_batches=total_batches,
-            device=self.model_config.device or "auto",
-            dtype=self.model_config.dtype,
-            cpu_threads=self.model_config.num_threads,
+            device=self.training_model_config.device or "auto",
+            dtype=self.training_model_config.dtype,
+            cpu_threads=self.training_model_config.num_threads,
             runtime_shape="single-device-per-backend",
             reference_enabled=self.reference_enabled,
-            reference_device=self.reference_device or self.model_config.device or "auto",
+            reference_device=self.reference_device
+            or self.training_model_config.device
+            or "auto",
+            group_size=self.grpo_config.group_size,
+            clip_ratio=self.grpo_config.clip_ratio,
         )
         for event in self._runtime_bootstrap_events:
             self._run_logger.log_model_load(
