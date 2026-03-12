@@ -264,15 +264,60 @@ class TinyTrainingBackend:
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
 
     def sync_weights_to(self, serving_backend: "TinyServingBackend") -> None:
-        serving_backend.actor.model.load_state_dict(self.actor.model.state_dict())
+        serving_backend.sync_from_training_actor(self.actor)
+
+
+def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
+    tokens = [((ord(char) % (vocab_size - 2)) + 1) for char in text[:max_length]]
+    return tokens or [1]
 
 
 class TinyServingBackend:
     """Local serving backend fake for GRPO tests."""
 
-    def __init__(self) -> None:
-        self.actor = TinyActor(bias_shift=0.1)
-        self.actor.eval()
+    def __init__(self, *, debug_live_rollout: bool = False) -> None:
+        self.config = SimpleNamespace(debug_live_rollout=debug_live_rollout)
+        self._actor = TinyActor(bias_shift=0.1)
+        self._actor.eval()
+        self.device = self._actor.device
+        self.generation_defaults: dict[str, Any] = {}
+
+    def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
+        return self._actor.generate(prompts, **kwargs)
+
+    def generate_batch(self, prompts: list[str], **kwargs: Any) -> list[SimpleNamespace]:
+        return self._actor.generate_batch(prompts, **kwargs)
+
+    def generate_grouped(
+        self,
+        prompts: list[str],
+        group_size: int,
+        **kwargs: Any,
+    ) -> list[list[SimpleNamespace]]:
+        return self._actor.generate_grouped(prompts, group_size, **kwargs)
+
+    def set_generation_defaults(self, **kwargs: Any) -> None:
+        self.generation_defaults = dict(kwargs)
+        self._actor.set_generation_defaults(**kwargs)
+
+    def sync_from_training_actor(self, training_actor: TinyActor) -> None:
+        self._actor.model.load_state_dict(training_actor.model.state_dict())
+
+    def set_live_rollout_debug(self, callback: Any, context: dict[str, Any]) -> None:
+        if not self.config.debug_live_rollout:
+            return
+        self._actor.set_live_rollout_debug(callback, context)
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        if not self.config.debug_live_rollout:
+            return
+        self._actor.set_live_rollout_candidate_index(candidate_index)
+
+    def clear_live_rollout_debug(self) -> None:
+        self._actor.clear_live_rollout_debug()
+
+    def close(self) -> None:
+        return None
 
 
 class TinyReferenceModel:
@@ -288,21 +333,19 @@ def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
 
     call_index = 0
 
-    def rollout_fn(prompts: list[Prompt], actor: Any) -> list[RolloutOutput]:
+    def rollout_fn(prompts: list[Prompt], serving_backend: Any) -> list[RolloutOutput]:
         nonlocal call_index
+        del serving_backend
         outputs: list[RolloutOutput] = []
         for prompt in prompts:
-            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            prompt_token_ids = _encode_text(prompt.text)
             response = (
                 f"{response_suffix} "
                 + ("detail " * repeat)
                 + prompt.text
                 + f"::{call_index}"
             )
-            response_token_ids = actor.tokenizer._encode(
-                response,
-                max_length=actor.config.max_length,
-            )[:4]
+            response_token_ids = _encode_text(response)[:4]
             response_token_logprobs = [
                 -0.05 - 0.01 * call_index - 0.001 * token_index
                 for token_index in range(len(response_token_ids))

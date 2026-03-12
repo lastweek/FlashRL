@@ -8,9 +8,8 @@ import math
 from pathlib import Path
 import sys
 import time
-from typing import TYPE_CHECKING, Any, Callable, Sequence
+from typing import Any, Callable, Sequence
 
-from .backends.serving import ServingBackend
 from .backends.training import TrainingBackend
 from .config import (
     CommonConfig,
@@ -30,10 +29,8 @@ from .metrics import PrometheusMetricsSink
 from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
+from .serving import ServingBackend, create_serving_backend
 from .trainer.grpo import GRPOTrainer
-
-if TYPE_CHECKING:
-    from .models.actor import ActorModel
 
 
 def _resolve_import_string(import_string: str) -> Any:
@@ -62,7 +59,7 @@ def _coerce_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
     return normalized
 
 
-MODEL_SECTION_FIELDS = {
+COMMON_MODEL_SECTION_FIELDS = {
     "model_name",
     "device",
     "dtype",
@@ -70,8 +67,13 @@ MODEL_SECTION_FIELDS = {
     "load_in_8bit",
     "trust_remote_code",
     "num_threads",
-    "debug_live_rollout",
     "metadata",
+}
+
+SERVING_ONLY_SECTION_FIELDS = {
+    "backend",
+    "runtime_python",
+    "debug_live_rollout",
 }
 
 
@@ -86,7 +88,10 @@ def _resolve_model_config(
     merged = {}
     if common is not None:
         merged.update(common.model_dump(exclude_none=True))
-    merged.update(section.model_dump(include=MODEL_SECTION_FIELDS, exclude_none=True))
+    include_fields = set(COMMON_MODEL_SECTION_FIELDS)
+    if config_cls is ServingConfig:
+        include_fields.update(SERVING_ONLY_SECTION_FIELDS)
+    merged.update(section.model_dump(include=include_fields, exclude_none=True))
 
     if not merged.get("model_name"):
         raise ValueError(
@@ -112,7 +117,7 @@ class FlashRL:
     def __init__(
         self,
         model: str,
-        rollout_fn: Callable[[list[Prompt], "ActorModel"], list[RolloutOutput]],
+        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]],
         reward_fn: Callable[[RolloutOutput], RewardOutput],
         learning_rate: float = 1e-5,
         batch_size: int = 32,
@@ -274,7 +279,10 @@ class FlashRL:
         )
 
         started_at = time.perf_counter()
-        self._serving_backend = ServingBackend(self.serving_config)
+        self._serving_backend = create_serving_backend(
+            self.serving_config,
+            training_actor=self._training_backend.actor,
+        )
         duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
         self._runtime_bootstrap_totals["startup_serving_backend_seconds"] = duration_seconds
@@ -282,7 +290,7 @@ class FlashRL:
             self._make_model_load_event(
                 component="serving_backend",
                 duration_seconds=duration_seconds,
-                device=self._serving_backend.actor.device,
+                device=self._serving_backend.device,
                 cpu_threads=self.serving_config.num_threads,
             )
         )
@@ -311,7 +319,7 @@ class FlashRL:
 
         self._rollout_generator = UserDefinedRollout(
             rollout_fn=self.rollout_fn,
-            actor=self._serving_backend.actor,
+            serving_backend=self._serving_backend,
             config=self.rollout_config,
         )
         self._reward = UserDefinedReward(
@@ -349,6 +357,15 @@ class FlashRL:
                 "duration_seconds": duration_seconds,
             },
         }
+
+    def close(self) -> None:
+        """Release runtime-owned resources."""
+        if self._run_logger is not None:
+            self._run_logger.close()
+            self._run_logger = None
+        if self._serving_backend is not None:
+            self._serving_backend.close()
+            self._serving_backend = None
 
     def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
         """Train on dataset or use the configured dataset loader."""
@@ -398,6 +415,9 @@ class FlashRL:
             or "auto",
             group_size=self.grpo_config.group_size,
             clip_ratio=self.grpo_config.clip_ratio,
+            prompts_per_step=prompts_per_step,
+            steps_per_epoch=(math.ceil(len(dataset) / prompts_per_step) if dataset else 0),
+            total_planned_steps=total_batches,
         )
         for event in self._runtime_bootstrap_events:
             self._run_logger.log_model_load(
@@ -426,6 +446,8 @@ class FlashRL:
                 }
                 context["epoch"] = epoch
                 self._run_logger.log_exception(exc, context=context)
+            if self._serving_backend is not None:
+                self._serving_backend.close()
             raise
         finally:
             self._run_lifecycle_totals["training_loop_seconds"] = (
@@ -498,6 +520,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entrypoint for ``python -m flashrl.framework.flashrl``."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    flashrl: FlashRL | None = None
 
     try:
         flashrl = FlashRL.from_yaml(args.config)
@@ -505,6 +528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     except Exception as exc:
         print(f"FlashRL YAML run failed: {exc}", file=sys.stderr)
         return 1
+    finally:
+        if flashrl is not None:
+            flashrl.close()
     return 0
 
 

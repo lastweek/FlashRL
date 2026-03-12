@@ -8,8 +8,10 @@ training:
   max_epochs: 1
 
 serving:
+  backend: vllm_metal
+  runtime_python: ~/.venv-vllm-metal/bin/python
   num_threads: 1
-  debug_live_rollout: true
+  debug_live_rollout: false
 
 grpo:
   group_size: 2

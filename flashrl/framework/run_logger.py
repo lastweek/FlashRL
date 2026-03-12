@@ -9,6 +9,7 @@ import os
 from pathlib import Path
 import re
 import sys
+import textwrap
 from typing import Any
 from uuid import uuid4
 
@@ -29,6 +30,23 @@ STAGE_DISPLAY_ORDER = [
 ]
 
 RUN_INDEX_WIDTH = 6
+PROMPT_WRAP_WIDTH = 88
+PROMPT_MAX_LINES = 6
+PROMPT_MAX_CHARS = 320
+PROMPT_SEPARATOR = "  " + ("=" * 72)
+
+ANSI_RESET = "\033[0m"
+ANSI_STYLES = {
+    "run_header": "\033[1;36m",
+    "meta_label": "\033[1;34m",
+    "step_header": "\033[1;36m",
+    "stage_label": "\033[1;34m",
+    "serving_header": "\033[1;35m",
+    "serving_candidate": "\033[1;33m",
+    "serving_timing": "\033[1;32m",
+    "divider": "\033[2;37m",
+    "error": "\033[1;31m",
+}
 
 
 def _sanitize_model_name(model_name: str) -> str:
@@ -95,6 +113,8 @@ class RunLogger:
         self._total_batches = 0
         self._current_step_header: int | None = None
         self._serving_stream_open = False
+        self._current_serving_prompt_key: tuple[int, int] | None = None
+        self._step_block_complete = False
 
     def start_run(
         self,
@@ -110,10 +130,15 @@ class RunLogger:
         reference_device: str,
         group_size: int | None = None,
         clip_ratio: float | None = None,
+        prompts_per_step: int | None = None,
+        steps_per_epoch: int | None = None,
+        total_planned_steps: int | None = None,
     ) -> None:
         """Log the start of a training run."""
         self._total_batches = total_batches
         self._current_step_header = None
+        self._current_serving_prompt_key = None
+        self._step_block_complete = False
 
         payload = {
             "run_id": self.run_id,
@@ -131,6 +156,13 @@ class RunLogger:
             "reference_device": reference_device,
             "group_size": group_size,
             "clip_ratio": clip_ratio,
+            "dataset_prompt_count": dataset_size,
+            "planned_prompts_per_step": prompts_per_step,
+            "planned_samples_per_step": batch_size,
+            "completions_per_prompt": group_size,
+            "planned_completions_per_step": batch_size,
+            "steps_per_epoch": steps_per_epoch,
+            "total_planned_steps": total_planned_steps,
             "run_dir": str(self.run_dir),
         }
         self._emit_event("run_started", payload)
@@ -150,6 +182,9 @@ class RunLogger:
                     reference_device=reference_device,
                     group_size=group_size,
                     clip_ratio=clip_ratio,
+                    prompts_per_step=prompts_per_step,
+                    steps_per_epoch=steps_per_epoch,
+                    total_planned_steps=total_planned_steps,
                 )
             )
             return
@@ -160,16 +195,26 @@ class RunLogger:
             f"  model={self.model_name} device={device} dtype={dtype} cpu_threads={cpu_threads}"
         )
         self._emit_console(
-            f"  dataset={dataset_size} batch_size={batch_size} epochs={max_epochs} total_batches={total_batches}"
+            f"  dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}"
         )
         self._emit_console(
             f"  runtime={runtime_shape} reference={reference_state} reference_device={reference_device}"
         )
         if group_size is not None:
-            line = f"  grpo=group_size:{group_size}"
+            line = f"  grpo=completions_per_prompt:{group_size}"
             if clip_ratio is not None:
                 line += f" clip_ratio={clip_ratio:.4f}"
             self._emit_console(line)
+        if prompts_per_step is not None and steps_per_epoch is not None and total_planned_steps is not None:
+            self._emit_console(
+                "  mapping="
+                f"dataset_prompts:{dataset_size} "
+                f"prompts_per_step:{prompts_per_step} "
+                f"completions_per_prompt:{group_size} "
+                f"completions_per_step:{batch_size} "
+                f"steps_per_epoch:{steps_per_epoch} "
+                f"total_steps:{total_planned_steps}"
+            )
         self._emit_console(f"  logs={self.run_dir}")
 
     def log_model_load(
@@ -210,6 +255,8 @@ class RunLogger:
         }
         self._emit_event("epoch_start", payload)
         self._current_step_header = None
+        self._current_serving_prompt_key = None
+        self._step_block_complete = False
         if self.config.console_mode == "compact":
             self._emit_console(f"epoch {epoch}/{total_epochs}  batches={num_batches}")
             return
@@ -221,6 +268,10 @@ class RunLogger:
             return
 
         self._emit_event("step_stage", payload)
+
+        if self._current_step_header != int(payload["step"]) and self._step_block_complete:
+            self._emit_console("")
+            self._step_block_complete = False
 
         if self.config.console_mode == "compact":
             if self._current_step_header != int(payload["step"]):
@@ -260,6 +311,7 @@ class RunLogger:
                 self._emit_console(self._format_compact_step_header(payload))
                 self._current_step_header = int(payload["step"])
             self._emit_console(self._format_compact_done_row(payload))
+            self._step_block_complete = True
             return
 
         line = self._format_verbose_step_prefix({**payload, "stage": "complete"})
@@ -273,6 +325,7 @@ class RunLogger:
             f" step_duration_seconds={self._format_duration(step_duration_seconds)}"
         )
         self._emit_console(line)
+        self._step_block_complete = True
 
     def log_sample_preview(
         self,
@@ -366,15 +419,32 @@ class RunLogger:
 
     def log_serving_debug_start(self, payload: dict[str, Any]) -> None:
         """Log the start of one live serving candidate stream."""
-        header = (
-            f"serve step={payload['step']} epoch={payload['epoch']}/{payload['total_epochs']} "
-            f"batch={payload['batch_index']}/{payload['batches_in_epoch']} "
-            f"prompt={int(payload['prompt_index']) + 1}/{payload['prompt_count']} "
-            f"candidate={int(payload['candidate_index']) + 1}/{payload['group_size']}"
-        )
-        self._emit_console(header)
+        prompt_key = (int(payload["step"]), int(payload["prompt_index"]))
+        candidate_index = int(payload["candidate_index"])
+        prompt_text = str(payload.get("prompt_text") or payload.get("prompt_preview", ""))
+
+        if self._current_serving_prompt_key is None:
+            pass
+        elif self._current_serving_prompt_key != prompt_key:
+            self._emit_console(PROMPT_SEPARATOR)
+        else:
+            self._emit_console("")
+
+        if self._current_serving_prompt_key != prompt_key:
+            header = (
+                f"serve step={payload['step']} epoch={payload['epoch']}/{payload['total_epochs']} "
+                f"batch={payload['batch_index']}/{payload['batches_in_epoch']} "
+                f"prompt={int(payload['prompt_index']) + 1}/{payload['prompt_count']} "
+                f"completions_per_prompt={payload['group_size']}"
+            )
+            self._emit_console(header)
+            for line in self._format_serving_prompt_lines(prompt_text):
+                self._emit_console(line)
+            self._current_serving_prompt_key = prompt_key
+
+        self._emit_console(f"  candidate {candidate_index + 1}/{payload['group_size']}")
         if self.config.console:
-            sys.stdout.write("  ")
+            sys.stdout.write("    ")
             sys.stdout.flush()
         self._serving_stream_open = True
 
@@ -434,6 +504,7 @@ class RunLogger:
         }
         self._emit_event("epoch_summary", payload)
         self._current_step_header = None
+        self._step_block_complete = False
 
         if self.config.console_mode == "compact":
             self._emit_console_lines(self._format_compact_epoch_summary(payload))
@@ -537,6 +608,8 @@ class RunLogger:
         }
         self._emit_event("run_finished", payload)
         self._current_step_header = None
+        self._current_serving_prompt_key = None
+        self._step_block_complete = False
 
         if self.config.console_mode == "compact":
             self._emit_console_lines(
@@ -590,20 +663,35 @@ class RunLogger:
         reference_device: str,
         group_size: int | None,
         clip_ratio: float | None,
+        prompts_per_step: int | None,
+        steps_per_epoch: int | None,
+        total_planned_steps: int | None,
     ) -> list[str]:
         reference_state = "enabled" if reference_enabled else "disabled"
         lines = [
             "FlashRL training run",
             f"  run      #{_format_run_index(self.run_index)}  {self.run_id}",
             f"  model    {self.model_name}  device={device} dtype={dtype} cpu={cpu_threads}",
-            f"  data     dataset={dataset_size} batch={batch_size} epochs={max_epochs} total_batches={total_batches}",
+            f"  data     dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}",
             f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
         ]
         if group_size is not None:
-            grpo_line = f"  grpo     group={group_size}"
+            grpo_line = f"  grpo     completions_per_prompt={group_size}"
             if clip_ratio is not None:
                 grpo_line += f"  clip={self._format_fixed(float(clip_ratio), 4)}"
             lines.append(grpo_line)
+        if prompts_per_step is not None and steps_per_epoch is not None and total_planned_steps is not None:
+            lines.append(
+                "  mapping  "
+                f"dataset_prompts={dataset_size}  "
+                f"prompts_per_step={prompts_per_step}  "
+                f"completions_per_step={batch_size}"
+            )
+            lines.append(
+                "  progress "
+                f"steps_per_epoch={steps_per_epoch}  "
+                f"total_steps={total_planned_steps}"
+            )
         lines.append(f"  logs     {self.run_dir}")
         return lines
 
@@ -619,9 +707,12 @@ class RunLogger:
             f"step {payload['step']}/{total_batches}  "
             f"epoch {payload['epoch']}/{payload['total_epochs']}  "
             f"batch {payload['batch_index']}/{payload['batches_in_epoch']}  "
-            f"prompts={payload.get('prompt_count', '?')}  "
-            f"group={payload.get('group_size', '?')}  "
-            f"samples={payload['batch_size']}"
+            f"prompt_window={payload.get('dataset_prompt_start', '?')}-{payload.get('dataset_prompt_end', '?')}/"
+            f"{payload.get('dataset_prompt_count', '?')}  "
+            f"prompts_this_step={payload.get('prompt_count', '?')}/{payload.get('planned_prompts_per_step', '?')}  "
+            f"completions_per_prompt={payload.get('completions_per_prompt', payload.get('group_size', '?'))}  "
+            f"completions_this_step={payload.get('completions_this_step', payload.get('samples_this_step', payload['batch_size']))}/"
+            f"{payload.get('planned_completions_per_step', payload.get('planned_samples_per_step', '?'))}"
         )
 
     def _format_compact_stage_row(self, payload: dict[str, Any]) -> str:
@@ -772,9 +863,12 @@ class RunLogger:
             f"step={payload['step']}"
             f" epoch={payload['epoch']}/{payload['total_epochs']}"
             f" batch={payload['batch_index']}/{payload['batches_in_epoch']}"
-            f" batch_size={payload['batch_size']}"
-            f" prompt_count={payload.get('prompt_count', '?')}"
-            f" group_size={payload.get('group_size', '?')}"
+            f" prompt_window={payload.get('dataset_prompt_start', '?')}-{payload.get('dataset_prompt_end', '?')}/{payload.get('dataset_prompt_count', '?')}"
+            f" completions_this_step={payload.get('completions_this_step', payload.get('samples_this_step', payload['batch_size']))}"
+            f" prompts_this_step={payload.get('prompt_count', '?')}"
+            f" planned_prompts_per_step={payload.get('planned_prompts_per_step', '?')}"
+            f" completions_per_prompt={payload.get('completions_per_prompt', payload.get('group_size', '?'))}"
+            f" planned_completions_per_step={payload.get('planned_completions_per_step', payload.get('planned_samples_per_step', '?'))}"
             f" stage={payload['stage']}"
         )
 
@@ -845,7 +939,7 @@ class RunLogger:
             sys.stdout.flush()
             self._serving_stream_open = False
         if self.config.console:
-            print(line)
+            print(self._style_terminal_line(line))
         if self.config.file:
             with self.console_path.open("a", encoding="utf-8") as handle:
                 handle.write(f"{line}\n")
@@ -932,6 +1026,125 @@ class RunLogger:
         if len(normalized) <= limit:
             return normalized
         return normalized[: limit - 3] + "..."
+
+    def _format_serving_prompt_lines(self, prompt_text: str) -> list[str]:
+        """Render the original prompt once with adaptive wrapping/truncation."""
+        text = prompt_text.replace("\r\n", "\n").strip()
+        if not text:
+            return []
+
+        truncated = False
+        if len(text) > PROMPT_MAX_CHARS:
+            text = text[:PROMPT_MAX_CHARS].rstrip()
+            truncated = True
+
+        wrapped_lines: list[str] = []
+        for raw_line in text.split("\n"):
+            line = raw_line.rstrip()
+            segments = textwrap.wrap(
+                line,
+                width=PROMPT_WRAP_WIDTH,
+                replace_whitespace=False,
+                drop_whitespace=False,
+            )
+            if not segments:
+                segments = [""]
+            wrapped_lines.extend(segments)
+
+        if len(wrapped_lines) > PROMPT_MAX_LINES:
+            wrapped_lines = wrapped_lines[:PROMPT_MAX_LINES]
+            truncated = True
+
+        if truncated and wrapped_lines:
+            suffix = " ... [truncated]"
+            last_line = wrapped_lines[-1].rstrip()
+            available = max(PROMPT_WRAP_WIDTH - len(suffix), 0)
+            if len(last_line) > available:
+                last_line = last_line[:available].rstrip()
+            wrapped_lines[-1] = f"{last_line}{suffix}".strip()
+
+        lines: list[str] = []
+        for index, segment in enumerate(wrapped_lines):
+            prefix = "  prompt: " if index == 0 else "          "
+            lines.append(f"{prefix}{segment}")
+        return lines
+
+    def _style_terminal_line(self, line: str) -> str:
+        """Colorize terminal metadata while keeping file logs plain."""
+        if not self._should_color_terminal():
+            return line
+
+        if line == "FlashRL training run":
+            return self._color(line, "run_header")
+
+        if line.startswith("serve step="):
+            return self._color(line, "serving_header")
+        if line.startswith("  candidate "):
+            return self._color(line, "serving_candidate")
+        if line.startswith("  serve_done "):
+            return self._style_key_value_line(line, "serving_timing")
+        if line == PROMPT_SEPARATOR:
+            return self._color(line, "divider")
+        if line.startswith("  prompt: "):
+            label, value = line.split(": ", 1)
+            return f"{self._color(label + ':', 'meta_label')} {value}"
+
+        compact_label_match = re.match(r"^(  )(run|model|data|runtime|grpo|logs)(\s+)(.*)$", line)
+        if compact_label_match:
+            indent, label, spacing, value = compact_label_match.groups()
+            return f"{indent}{self._color(label, 'meta_label')}{spacing}{value}"
+
+        if line.startswith("load "):
+            component, _, remainder = line.partition("  ")
+            return f"{self._color(component, 'meta_label')}  {remainder}"
+
+        if line.startswith("step "):
+            return self._color(line, "step_header")
+        if re.match(r"^epoch \d+/\d+", line):
+            return self._color(line, "step_header")
+        if line.startswith("run "):
+            return self._color(line, "run_header")
+        if line.startswith("checkpoint "):
+            return self._color(line, "meta_label")
+        if line.startswith("error "):
+            return self._color(line, "error")
+        if line.startswith("  lifecycle ") or line.startswith("  stages"):
+            return self._style_key_value_line(line, "meta_label")
+
+        stage_match = re.match(r"^(  )([a-z_]+|done)(\s+)(\S+)(.*)$", line)
+        if stage_match:
+            indent, label, spacing, duration, suffix = stage_match.groups()
+            return (
+                f"{indent}{self._color(label, 'stage_label')}"
+                f"{spacing}{self._color(duration, 'serving_timing')}"
+                f"{suffix}"
+            )
+
+        return line
+
+    def _style_key_value_line(self, line: str, style: str) -> str:
+        """Colorize the metadata labels in a key=value line."""
+        return re.sub(
+            r"([A-Za-z_][A-Za-z0-9_/.-]*=)",
+            lambda match: self._color(match.group(1), style),
+            line,
+        )
+
+    def _should_color_terminal(self) -> bool:
+        """Enable ANSI colors only for interactive terminals."""
+        if not self.config.console:
+            return False
+        if os.environ.get("TERM", "").lower() == "dumb":
+            return False
+        stream = sys.stdout
+        return bool(hasattr(stream, "isatty") and stream.isatty())
+
+    def _color(self, text: str, style: str) -> str:
+        """Apply one ANSI style when terminal coloring is enabled."""
+        prefix = ANSI_STYLES.get(style)
+        if prefix is None:
+            return text
+        return f"{prefix}{text}{ANSI_RESET}"
 
     def _serialize_for_json(self, value: Any) -> Any:
         if hasattr(value, "model_dump"):

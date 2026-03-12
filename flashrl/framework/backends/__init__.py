@@ -1,6 +1,5 @@
-"""Training and serving backends."""
+"""Training backends."""
 
 from flashrl.framework.backends.training import TrainingBackend
-from flashrl.framework.backends.serving import ServingBackend
 
-__all__ = ["TrainingBackend", "ServingBackend"]
+__all__ = ["TrainingBackend"]

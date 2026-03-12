@@ -914,10 +914,10 @@
     }
 
     function summarizeEvent(event) {
-      const payload = event.payload || {};
-      switch (event.event) {
+        const payload = event.payload || {};
+        switch (event.event) {
         case "run_started":
-          return `dataset=${payload.dataset_size} batch=${payload.batch_size} epochs=${payload.max_epochs}`;
+          return `dataset_prompts=${payload.dataset_prompt_count ?? payload.dataset_size} completions_per_step=${payload.planned_completions_per_step ?? payload.batch_size} epochs=${payload.max_epochs}`;
         case "model_load":
           return `${payload.component} ${payload.status}`;
         case "epoch_start":

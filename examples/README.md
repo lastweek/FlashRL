@@ -26,6 +26,11 @@ python3 -m examples.reasoning.train
 python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```
 
+**Run with the experimental `vllm_metal` serving backend on Apple silicon:**
+```bash
+python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm_metal.yaml
+```
+
 **Inspect runs after training:**
 ```bash
 open docs/run_viewer.html
@@ -46,6 +51,7 @@ have them.
 - keeps the public rollout hook sample-oriented: one rollout per input prompt
 - treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
 - supports `serving.debug_live_rollout: true` for slower token-level live serving debug with TTFT/TPOT capture
+- supports `serving.backend: vllm_metal` for an experimental separate-runtime Metal path on macOS arm64
 
 **Shared defaults with training/serving overrides:**
 ```yaml
@@ -83,6 +89,23 @@ hooks:
   reward_fn: examples.reasoning.train:reasoning_reward_fn
   dataset_fn: examples.reasoning.train:build_dataset
 ```
+
+## Experimental vLLM Metal Backend
+
+Use `serving.backend: vllm_metal` when you want FlashRL to launch a separate
+local worker backed by a `vllm-metal` install in its own Python runtime.
+
+```yaml
+serving:
+  backend: vllm_metal
+  runtime_python: ~/.venv-vllm-metal/bin/python
+  debug_live_rollout: false
+```
+
+Notes:
+- macOS arm64 only
+- experimental and slower to sync than the default in-process `huggingface` backend
+- `serving.debug_live_rollout: true` is not supported with `vllm_metal`
 
 ## Local Observability
 

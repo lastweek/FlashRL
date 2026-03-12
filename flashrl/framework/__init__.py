@@ -1,7 +1,6 @@
 """Framework layer: Core RL training APIs."""
 
 from flashrl.framework.backends.training import TrainingBackend
-from flashrl.framework.backends.serving import ServingBackend
 from flashrl.framework.config import (
     CommonConfig,
     GrpoConfig,
@@ -29,6 +28,12 @@ from flashrl.framework.data_models import (
     TrainingBatch,
 )
 from flashrl.framework.flashrl import FlashRL
+from flashrl.framework.serving import (
+    HuggingFaceServingBackend,
+    ServingBackend,
+    VLLMMetalServingBackend,
+    create_serving_backend,
+)
 
 __all__ = [
     "FlashRL",
@@ -57,6 +62,9 @@ __all__ = [
     "RewardOutput",
     "TrainingBatch",
     # Backends
-    "TrainingBackend",
     "ServingBackend",
+    "HuggingFaceServingBackend",
+    "VLLMMetalServingBackend",
+    "create_serving_backend",
+    "TrainingBackend",
 ]

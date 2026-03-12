@@ -8,7 +8,7 @@ from flashrl.framework.data_models import (
     RolloutOutput,
     Conversation,
 )
-from flashrl.framework.models.actor import ActorModel
+from flashrl.framework.serving import ServingBackend
 
 
 class UserDefinedRollout:
@@ -18,32 +18,32 @@ class UserDefinedRollout:
     without needing to inherit from base classes.
 
     Example:
-        def my_rollout_fn(prompts, actor):
-            samples = actor.generate_batch([p.text for p in prompts])
+        def my_rollout_fn(prompts, serving_backend):
+            samples = serving_backend.generate_batch([p.text for p in prompts])
             return [...]
 
-        rollout = UserDefinedRollout(my_rollout_fn, actor, config)
+        rollout = UserDefinedRollout(my_rollout_fn, serving_backend, config)
         rollouts = rollout.generate(prompts)
     """
 
     def __init__(
         self,
-        rollout_fn: Callable[[list[Prompt], ActorModel], list[RolloutOutput]],
-        actor: ActorModel,
+        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]],
+        serving_backend: ServingBackend,
         config: RolloutConfig,
     ) -> None:
         """Initialize UserDefinedRollout.
 
         Args:
             rollout_fn: User-provided function that generates rollouts.
-                Takes (list[Prompt], ActorModel) and returns exactly one
+                Takes (list[Prompt], ServingBackend) and returns exactly one
                 RolloutOutput per input prompt.
-            actor: Actor model to use for generation.
+            serving_backend: Serving backend to use for generation.
             config: Rollout configuration.
         """
         self.config = config
         self.rollout_fn = rollout_fn
-        self.actor = actor
+        self.serving_backend = serving_backend
         self._apply_generation_defaults()
 
     def _generation_kwargs(self) -> dict[str, int | float | bool]:
@@ -57,12 +57,9 @@ class UserDefinedRollout:
         }
 
     def _apply_generation_defaults(self) -> None:
-        """Apply generation defaults to the actor when supported."""
+        """Apply generation defaults to the serving backend."""
         generation_kwargs = self._generation_kwargs()
-        if hasattr(self.actor, "set_generation_defaults"):
-            self.actor.set_generation_defaults(**generation_kwargs)
-        else:
-            setattr(self.actor, "generation_defaults", generation_kwargs)
+        self.serving_backend.set_generation_defaults(**generation_kwargs)
 
     def generate(self, prompts: list[Prompt]) -> list[RolloutOutput]:
         """Generate exactly one rollout per prompt."""
@@ -80,14 +77,12 @@ class UserDefinedRollout:
         grouped_rollouts: list[list[RolloutOutput]] = [[] for _ in prompts]
         try:
             for candidate_index in range(group_size):
-                if hasattr(self.actor, "set_live_rollout_candidate_index"):
-                    self.actor.set_live_rollout_candidate_index(candidate_index)
+                self.serving_backend.set_live_rollout_candidate_index(candidate_index)
                 rollouts = self._generate_once(prompts)
                 for prompt_index, rollout in enumerate(rollouts):
                     grouped_rollouts[prompt_index].append(rollout)
         finally:
-            if hasattr(self.actor, "set_live_rollout_candidate_index"):
-                self.actor.set_live_rollout_candidate_index(None)
+            self.serving_backend.set_live_rollout_candidate_index(None)
 
         flat_prompts: list[Prompt] = []
         flat_rollouts: list[RolloutOutput] = []
@@ -108,7 +103,7 @@ class UserDefinedRollout:
     ) -> list[RolloutOutput]:
         """Generate one rollout per prompt and validate the flat output shape."""
         self._apply_generation_defaults()
-        rollouts = self.rollout_fn(prompts, self.actor)
+        rollouts = self.rollout_fn(prompts, self.serving_backend)
         if len(rollouts) != len(prompts):
             raise ValueError(
                 "Rollout must return exactly one output per input prompt "
@@ -148,7 +143,7 @@ class UserDefinedRollout:
         """
         del max_turns
         self._apply_generation_defaults()
-        rollouts = self.rollout_fn([prompt], self.actor)
+        rollouts = self.rollout_fn([prompt], self.serving_backend)
         if rollouts:
             if len(rollouts) != 1:
                 raise ValueError(

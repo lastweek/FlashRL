@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import importlib
 from pathlib import Path
+import re
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -25,6 +27,9 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.run_logger import RunLogger
 from flashrl.framework.trainer.grpo import GRPOTrainer
+
+
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class FakeTokenizer:
@@ -170,6 +175,15 @@ class FakeActor:
     def eval(self) -> None:
         self.model.eval()
 
+    def set_live_rollout_debug(self, callback, context) -> None:
+        del callback, context
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        del candidate_index
+
+    def clear_live_rollout_debug(self) -> None:
+        return None
+
 
 class FakeTrainingBackend:
     """Training backend used for logging tests."""
@@ -190,7 +204,12 @@ class FakeTrainingBackend:
         self.actor.model.load_state_dict(torch.load(path, weights_only=False))
 
     def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.actor.model.load_state_dict(self.actor.model.state_dict())
+        serving_backend.sync_from_training_actor(self.actor)
+
+
+def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
+    tokens = [((ord(char) % (vocab_size - 1)) + 1) for char in text[:max_length]]
+    return tokens or [1]
 
 
 class FakeServingBackend:
@@ -199,10 +218,40 @@ class FakeServingBackend:
     init_count = 0
 
     def __init__(self, config) -> None:
-        del config
         type(self).init_count += 1
-        self.actor = FakeActor(bias_shift=0.1)
-        self.actor.eval()
+        self.config = config
+        self._actor = FakeActor(bias_shift=0.1)
+        self._actor.eval()
+        self.device = self._actor.device
+        self.generation_defaults: dict[str, object] = {}
+
+    def generate(self, prompts: list[str], **kwargs):
+        return self._actor.generate(prompts, **kwargs)
+
+    def generate_batch(self, prompts: list[str], **kwargs):
+        return self._actor.generate_batch(prompts, **kwargs)
+
+    def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
+        return self._actor.generate_grouped(prompts, group_size, **kwargs)
+
+    def set_generation_defaults(self, **kwargs) -> None:
+        self.generation_defaults = dict(kwargs)
+        self._actor.set_generation_defaults(**kwargs)
+
+    def sync_from_training_actor(self, training_actor) -> None:
+        self._actor.model.load_state_dict(training_actor.model.state_dict())
+
+    def set_live_rollout_debug(self, callback, context) -> None:
+        self._actor.set_live_rollout_debug(callback, context)
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        self._actor.set_live_rollout_candidate_index(candidate_index)
+
+    def clear_live_rollout_debug(self) -> None:
+        self._actor.clear_live_rollout_debug()
+
+    def close(self) -> None:
+        return None
 
 
 class FakeReferenceModel:
@@ -222,16 +271,14 @@ def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
 
     call_index = 0
 
-    def rollout_fn(prompts: list[Prompt], actor) -> list[RolloutOutput]:
+    def rollout_fn(prompts: list[Prompt], serving_backend) -> list[RolloutOutput]:
         nonlocal call_index
+        del serving_backend
         outputs = []
         for prompt in prompts:
-            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            prompt_token_ids = _encode_text(prompt.text)
             response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{call_index}"
-            response_token_ids = actor.tokenizer._encode(
-                response,
-                max_length=actor.config.max_length,
-            )[:4]
+            response_token_ids = _encode_text(response)[:4]
             response_token_logprobs = [
                 -0.05 - 0.01 * call_index - 0.001 * token_index
                 for token_index in range(len(response_token_ids))
@@ -273,7 +320,11 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeServingBackend.init_count = 0
     FakeReferenceModel.init_count = 0
     monkeypatch.setattr(flashrl_module, "TrainingBackend", FakeTrainingBackend)
-    monkeypatch.setattr(flashrl_module, "ServingBackend", FakeServingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_serving_backend",
+        lambda config, training_actor=None: FakeServingBackend(config),
+    )
     monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
 
@@ -293,6 +344,11 @@ def read_rollouts(run_dir: Path) -> list[dict]:
         for line in (run_dir / "rollouts.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def strip_ansi(text: str) -> str:
+    """Remove ANSI escape codes from terminal output."""
+    return ANSI_ESCAPE_RE.sub("", text)
 
 
 def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
@@ -319,6 +375,9 @@ def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
         reference_device="auto",
         group_size=2,
         clip_ratio=0.2,
+        prompts_per_step=2,
+        steps_per_epoch=2,
+        total_planned_steps=2,
     )
 
     assert logger.run_dir.exists()
@@ -386,12 +445,18 @@ def test_run_logger_sanitizes_model_name_in_run_dir(tmp_path: Path) -> None:
     assert "org-model-name-v1" in logger.run_dir.name
 
 
-def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
+def test_run_logger_compact_console_groups_step_output(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """Compact mode should render grouped step blocks instead of repeated prefixes."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     logger = RunLogger(
         LoggingConfig(
             log_dir=tmp_path,
-            console=False,
+            console=True,
             file=True,
             console_mode="compact",
         ),
@@ -411,6 +476,9 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
         reference_device="auto",
         group_size=2,
         clip_ratio=0.2,
+        prompts_per_step=2,
+        steps_per_epoch=2,
+        total_planned_steps=2,
     )
     logger.log_model_load(
         "training_backend",
@@ -432,6 +500,12 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "batch_size": 4,
             "prompt_count": 2,
             "group_size": 2,
+            "dataset_prompt_start": 1,
+            "dataset_prompt_end": 2,
+            "dataset_prompt_count": 4,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 4,
             "stage": "rollout",
             "latency_seconds": 0.25,
             "sample_count": 4,
@@ -451,6 +525,12 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "batch_size": 4,
             "prompt_count": 2,
             "group_size": 2,
+            "dataset_prompt_start": 1,
+            "dataset_prompt_end": 2,
+            "dataset_prompt_count": 4,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 4,
             "stage": "reward",
             "latency_seconds": 0.002,
             "reward_mean": 1.5,
@@ -470,6 +550,12 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
             "batch_size": 4,
             "prompt_count": 2,
             "group_size": 2,
+            "dataset_prompt_start": 1,
+            "dataset_prompt_end": 2,
+            "dataset_prompt_count": 4,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 4,
             "loss": 0.125,
             "policy_loss": 0.1,
             "kl_divergence": 0.025,
@@ -494,6 +580,64 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
         response="response text",
         reward=1.5,
     )
+    logger.log_step_stage(
+        {
+            "step": 2,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 2,
+            "batches_in_epoch": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
+            "dataset_prompt_start": 3,
+            "dataset_prompt_end": 4,
+            "dataset_prompt_count": 4,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 4,
+            "stage": "rollout",
+            "latency_seconds": 0.3,
+            "sample_count": 4,
+            "prompt_tokens_mean": 13.0,
+            "prompt_tokens_max": 17,
+            "response_tokens_mean": 25.0,
+            "response_tokens_max": 31,
+        }
+    )
+    logger.log_step_done(
+        {
+            "step": 2,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 2,
+            "batches_in_epoch": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
+            "dataset_prompt_start": 3,
+            "dataset_prompt_end": 4,
+            "dataset_prompt_count": 4,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 4,
+            "loss": 0.25,
+            "policy_loss": 0.2,
+            "kl_divergence": 0.05,
+            "reward_mean": 1.0,
+            "response_tokens_total": 50,
+            "tokens_per_second": 80.0,
+            "step_duration_seconds": 0.6,
+            "stage_timings": {
+                "rollout": 0.3,
+                "reference_forward": 0.0,
+            },
+            "stage_order": ["rollout"],
+            "reference_enabled": False,
+            "reference_active": False,
+            "dominant_stage": "rollout",
+        }
+    )
     logger.log_epoch_summary(
         {
             "epoch": 1,
@@ -512,11 +656,28 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
         lifecycle_totals={"startup_total_seconds": 1.25, "training_loop_seconds": 0.75},
     )
 
+    captured = capsys.readouterr().out
+    plain_captured = strip_ansi(captured)
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
+    assert "\x1b[" in captured
+    assert "FlashRL training run\n  run      " in plain_captured
+    assert "mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in plain_captured
+    assert "progress steps_per_epoch=2  total_steps=2" in plain_captured
+    assert (
+        "step 1/2  epoch 1/1  batch 1/2  prompt_window=1-2/4  "
+        "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
+        in plain_captured
+    )
     assert "FlashRL training run\n  run      " in transcript
-    assert "  grpo     group=2  clip=0.2000" in transcript
+    assert "  grpo     completions_per_prompt=2  clip=0.2000" in transcript
+    assert "  mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in transcript
+    assert "  progress steps_per_epoch=2  total_steps=2" in transcript
     assert "load training_backend" in transcript
-    assert "step 1/2  epoch 1/1  batch 1/2  prompts=2  group=2  samples=4" in transcript
+    assert (
+        "step 1/2  epoch 1/1  batch 1/2  prompt_window=1-2/4  "
+        "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
+        in transcript
+    )
     assert "  rollout" in transcript
     assert "prompt_tok 12.5/16" in transcript
     assert "response_tok 24.0/30" in transcript
@@ -524,26 +685,151 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
     assert "mean 1.5000" in transcript
     assert "  done" in transcript
     assert "dominant rollout" in transcript
+    assert (
+        "\n\nstep 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
+        "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
+        in transcript
+    )
+    assert (
+        "\n\nstep 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
+        "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
+        in plain_captured
+    )
+    assert "\n  done" in transcript
+    assert "\n\nepoch 1/1 summary" not in transcript
     assert "epoch 1/1 summary" in transcript
     assert "  lifecycle startup 1.250s | train_loop 750.0ms" in transcript
-    assert "  stages    rollout 250.0ms" in transcript
+    assert "  stages    rollout " in transcript
     assert "step=1 epoch=1/1" not in transcript
     assert "sample step" not in transcript
     assert "viewer" not in transcript
+    assert "\x1b[" not in transcript
 
     events = read_events(logger.run_dir)
     assert any(event["event"] == "sample_preview" for event in events)
     run_started = next(event for event in events if event["event"] == "run_started")
     assert run_started["payload"]["run_index"] == logger.run_index
+    assert run_started["payload"]["dataset_prompt_count"] == 4
+    assert run_started["payload"]["planned_prompts_per_step"] == 2
+    assert run_started["payload"]["planned_samples_per_step"] == 4
+    assert run_started["payload"]["steps_per_epoch"] == 2
+    assert run_started["payload"]["total_planned_steps"] == 2
 
     logger.close()
 
 
+def test_run_logger_verbose_console_separates_step_blocks(tmp_path: Path) -> None:
+    """Verbose mode should also insert one blank line between completed steps."""
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+            console_mode="verbose",
+        ),
+        model_name="org/model-name",
+    )
+
+    logger.log_epoch_start(epoch=1, total_epochs=1, num_batches=2)
+    logger.log_step_stage(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
+            "stage": "rollout",
+            "latency_seconds": 0.25,
+            "sample_count": 4,
+            "prompt_tokens_mean": 12.5,
+            "prompt_tokens_max": 16,
+            "response_tokens_mean": 24.0,
+            "response_tokens_max": 30,
+        }
+    )
+    logger.log_step_done(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 2,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 2,
+            "loss": 0.125,
+            "policy_loss": 0.1,
+            "kl_divergence": 0.025,
+            "reward_mean": 1.5,
+            "response_tokens_total": 48,
+            "tokens_per_second": 96.0,
+            "step_duration_seconds": 0.5,
+            "stage_timings": {"rollout": 0.25},
+            "stage_order": ["rollout"],
+            "reference_enabled": False,
+            "reference_active": False,
+            "dominant_stage": "rollout",
+        }
+    )
+    logger.log_step_stage(
+        {
+            "step": 2,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 2,
+            "batches_in_epoch": 2,
+            "batch_size": 2,
+            "prompt_count": 1,
+            "group_size": 2,
+            "dataset_prompt_start": 3,
+            "dataset_prompt_end": 3,
+            "dataset_prompt_count": 3,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 4,
+            "samples_this_step": 2,
+            "stage": "rollout",
+            "latency_seconds": 0.3,
+            "sample_count": 2,
+            "prompt_tokens_mean": 13.0,
+            "prompt_tokens_max": 17,
+            "response_tokens_mean": 25.0,
+            "response_tokens_max": 31,
+        }
+    )
+    logger.log_epoch_summary(
+        {
+            "epoch": 1,
+            "total_epochs": 1,
+            "loss": 0.125,
+            "reward": 1.5,
+            "kl_divergence": 0.025,
+            "tokens_per_second": 96.0,
+            "duration_seconds": 0.75,
+            "stage_totals": {"rollout": 0.25},
+        }
+    )
+
+    transcript = logger.console_path.read_text(encoding="utf-8")
+
+    assert (
+        "\n\nstep=2 epoch=1/1 batch=2/2 prompt_window=3-3/3 completions_this_step=2 "
+        "prompts_this_step=1 planned_prompts_per_step=2 completions_per_prompt=2 "
+        "planned_completions_per_step=4 stage=rollout"
+    ) in transcript
+    assert "\n\nepoch 1 summary" not in transcript
+
+
 def test_run_logger_serving_debug_streams_terminal_only_fragments(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Serving debug chunks should stream to terminal but not be persisted as fragments."""
+    monkeypatch.setenv("TERM", "xterm-256color")
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     logger = RunLogger(
         LoggingConfig(
             log_dir=tmp_path,
@@ -554,7 +840,7 @@ def test_run_logger_serving_debug_streams_terminal_only_fragments(
         model_name="org/model-name",
     )
 
-    payload = {
+    first_prompt_payload = {
         "step": 1,
         "epoch": 1,
         "total_epochs": 1,
@@ -563,32 +849,124 @@ def test_run_logger_serving_debug_streams_terminal_only_fragments(
         "prompt_count": 1,
         "group_size": 4,
         "prompt_index": 0,
-        "candidate_index": 1,
+        "candidate_index": 0,
         "ttft_seconds": 0.2,
         "tpot_seconds": 0.05,
         "generation_seconds": 0.35,
         "response_token_count": 6,
         "response_preview": "partial text",
+        "prompt_text": "Please solve this step by step.\nQuestion: What is 15 + 27?",
+        "prompt_preview": "Please solve this step by step.",
+    }
+    second_candidate_payload = {**first_prompt_payload, "candidate_index": 1, "response_preview": "second candidate"}
+    second_prompt_payload = {
+        **first_prompt_payload,
+        "prompt_count": 2,
+        "prompt_index": 1,
+        "candidate_index": 0,
+        "response_preview": "next prompt candidate",
+        "prompt_text": (
+            "This is a deliberately long prompt that should wrap across multiple lines and "
+            "eventually be truncated because the live rollout terminal view should show the "
+            "original prompt once, but keep it readable for debugging and inspection. "
+            "This extra sentence ensures the prompt grows beyond the adaptive terminal limit. "
+            "And this final sentence pushes it far enough that the logger must append the "
+            "truncated marker instead of printing the full text."
+        ),
+        "prompt_preview": "What is 8 × 7?",
     }
 
-    logger.log_serving_debug_start(payload)
-    logger.log_serving_debug_chunk({**payload, "text": "part"})
-    logger.log_serving_debug_chunk({**payload, "text": "ial"})
-    logger.log_serving_debug_done(payload)
+    logger.log_serving_debug_start(first_prompt_payload)
+    logger.log_serving_debug_chunk({**first_prompt_payload, "text": "part"})
+    logger.log_serving_debug_chunk({**first_prompt_payload, "text": "ial"})
+    logger.log_serving_debug_done(first_prompt_payload)
+    logger.log_serving_debug_start(second_candidate_payload)
+    logger.log_serving_debug_chunk({**second_candidate_payload, "text": "second"})
+    logger.log_serving_debug_done(second_candidate_payload)
+    logger.log_serving_debug_start(second_prompt_payload)
+    logger.log_serving_debug_chunk({**second_prompt_payload, "text": "next"})
+    logger.log_serving_debug_done(second_prompt_payload)
+    logger.log_step_done(
+        {
+            "step": 1,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 1,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 4,
+            "loss": 0.125,
+            "policy_loss": 0.1,
+            "kl_divergence": 0.025,
+            "reward_mean": 1.5,
+            "response_tokens_total": 48,
+            "tokens_per_second": 96.0,
+            "step_duration_seconds": 0.5,
+            "stage_timings": {"rollout": 0.25},
+            "stage_order": ["rollout"],
+            "reference_enabled": False,
+            "reference_active": False,
+            "dominant_stage": "rollout",
+        }
+    )
+    logger.log_step_stage(
+        {
+            "step": 2,
+            "epoch": 1,
+            "total_epochs": 1,
+            "batch_index": 1,
+            "batches_in_epoch": 1,
+            "batch_size": 4,
+            "prompt_count": 2,
+            "group_size": 4,
+            "dataset_prompt_start": 1,
+            "dataset_prompt_end": 2,
+            "dataset_prompt_count": 2,
+            "planned_prompts_per_step": 2,
+            "planned_samples_per_step": 8,
+            "samples_this_step": 4,
+            "stage": "rollout",
+            "latency_seconds": 0.25,
+            "sample_count": 4,
+            "prompt_tokens_mean": 12.5,
+            "prompt_tokens_max": 16,
+            "response_tokens_mean": 24.0,
+            "response_tokens_max": 30,
+        }
+    )
 
     captured = capsys.readouterr().out
+    plain_captured = strip_ansi(captured)
     transcript = logger.console_path.read_text(encoding="utf-8")
     events = read_events(logger.run_dir)
 
-    assert "serve step=1 epoch=1/1 batch=1/1 prompt=1/1 candidate=2/4" in captured
+    assert "\x1b[" in captured
+    assert "serve step=1 epoch=1/1 batch=1/1 prompt=1/1 completions_per_prompt=4" in plain_captured
+    assert "  prompt: Please solve this step by step." in plain_captured
+    assert "          Question: What is 15 + 27?" in plain_captured
+    assert "  candidate 1/4" in plain_captured
+    assert "  candidate 2/4" in plain_captured
+    assert "\n\n  candidate 2/4" in transcript
+    assert "  ========================================================================" in transcript
+    assert "serve step=1 epoch=1/1 batch=1/1 prompt=2/2 completions_per_prompt=4" in transcript
+    assert "  prompt: This is a deliberately long prompt that should wrap across multiple lines and" in transcript
+    assert "[truncated]" in transcript
     assert "partial" in captured
-    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in captured
+    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in plain_captured
+    assert (
+        "\n\nstep 2/?  epoch 1/1  batch 1/1  prompt_window=1-2/2  "
+        "prompts_this_step=2/2  completions_per_prompt=4  completions_this_step=4/8"
+        in transcript
+    )
+    assert "\n\n\nstep 2/?" not in transcript
     assert "part" not in transcript
     assert "ial" not in transcript
     assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in transcript
+    assert "\x1b[" not in transcript
     serving_events = [event for event in events if event["event"] == "serving_debug"]
-    assert len(serving_events) == 1
-    assert serving_events[0]["payload"]["candidate_index"] == 1
+    assert len(serving_events) == 3
+    assert serving_events[0]["payload"]["candidate_index"] == 0
     assert serving_events[0]["payload"]["response_preview"] == "partial text"
 
 
@@ -731,7 +1109,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     serving_backend = FakeServingBackend(config=None)
     rollout = UserDefinedRollout(
         rollout_fn=make_rollout_fn(response_suffix="sample", repeat=20),
-        actor=serving_backend.actor,
+        serving_backend=serving_backend,
         config=SimpleNamespace(),
     )
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
@@ -771,6 +1149,9 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         reference_device="auto",
         group_size=2,
         clip_ratio=0.2,
+        prompts_per_step=2,
+        steps_per_epoch=3,
+        total_planned_steps=3,
     )
     trainer.train(dataset)
     logger.finish_run(status="completed", total_steps=trainer.total_steps)
@@ -842,7 +1223,11 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "runtime=single-device-per-backend reference=disabled" in transcript
     assert "cpu_threads=1" in transcript
-    assert "step=1 epoch=1/1 batch=1/3 batch_size=4 prompt_count=2 group_size=2 stage=rollout" in transcript
+    assert (
+        "step=1 epoch=1/1 batch=1/3 prompt_window=1-2/6 completions_this_step=4 "
+        "prompts_this_step=2 planned_prompts_per_step=2 completions_per_prompt=2 "
+        "planned_completions_per_step=4 stage=rollout"
+    ) in transcript
     assert "stage=reward" in transcript
     assert "stage=loss_assembly" in transcript
     assert "stage=backward" in transcript
@@ -895,7 +1280,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
         rollout_generator=UserDefinedRollout(
             rollout_fn=make_rollout_fn(response_suffix="loss", repeat=2),
-            actor=serving_backend.actor,
+            serving_backend=serving_backend,
             config=SimpleNamespace(),
         ),
         run_logger=None,
@@ -904,7 +1289,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
         prompts,
-        serving_backend.actor,
+        serving_backend,
     )
     rollouts = grouped_rollouts
 
@@ -1007,7 +1392,7 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     serving_backend = FakeServingBackend(config=None)
     rollout = UserDefinedRollout(
         rollout_fn=make_rollout_fn(response_suffix="group", repeat=1),
-        actor=serving_backend.actor,
+        serving_backend=serving_backend,
         config=SimpleNamespace(),
     )
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
@@ -1029,11 +1414,11 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid_rollout = UserDefinedRollout(
-        rollout_fn=lambda prompts, actor: make_rollout_fn(
+        rollout_fn=lambda prompts, serving_backend: make_rollout_fn(
             response_suffix="invalid",
             repeat=1,
-        )(prompts[:-1], actor),
-        actor=serving_backend.actor,
+        )(prompts[:-1], serving_backend),
+        serving_backend=serving_backend,
         config=SimpleNamespace(),
     )
     with pytest.raises(ValueError, match="one output per input prompt"):
@@ -1042,16 +1427,17 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
 
 def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
     """GRPO advantages should be computed per prompt group, not across the whole flat batch."""
+    trainer_serving_backend = FakeServingBackend(config=None)
     trainer = GRPOTrainer(
         config=TrainerConfig(batch_size=4, max_epochs=1),
         grpo_config=GrpoConfig(group_size=2),
         training_backend=FakeTrainingBackend(config=None, learning_rate=1e-2),
-        serving_backend=FakeServingBackend(config=None),
+        serving_backend=trainer_serving_backend,
         reference=None,
         reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
         rollout_generator=UserDefinedRollout(
             rollout_fn=make_rollout_fn(response_suffix="adv", repeat=1),
-            actor=FakeServingBackend(config=None).actor,
+            serving_backend=trainer_serving_backend,
             config=SimpleNamespace(),
         ),
         run_logger=None,
@@ -1103,11 +1489,17 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "  run      " in output
     assert "cpu=1" in output
     assert "reference=disabled" in output
-    assert "group=2  clip=0.2000" in output
+    assert "completions_per_prompt=2  clip=0.2000" in output
     assert "load training_backend" in output
     assert "load serving_backend" in output
     assert "loaded reference_model" not in output
-    assert "step 1/2  epoch 1/1  batch 1/2  prompts=2  group=2  samples=4" in output
+    assert "mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in output
+    assert "progress steps_per_epoch=2  total_steps=2" in output
+    assert (
+        "step 1/2  epoch 1/1  batch 1/2  prompt_window=1-2/4  "
+        "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
+        in output
+    )
     assert "  rollout" in output
     assert "  reward" in output
     assert "  prepare_inputs" in output

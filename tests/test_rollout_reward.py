@@ -10,26 +10,26 @@ from flashrl.framework.config import RewardConfig, RolloutConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
-from tests.conftest import TinyActor, make_rollout_fn
+from tests.conftest import TinyServingBackend, make_rollout_fn
 
 pytestmark = pytest.mark.unit
 
 
 def test_user_defined_rollout_generate_applies_generation_defaults() -> None:
-    """Rollout wrapper should push generation defaults onto the actor before generation."""
-    actor = TinyActor()
+    """Rollout wrapper should push generation defaults onto the serving backend."""
+    serving_backend = TinyServingBackend()
     captured_defaults: list[dict[str, object]] = []
 
     def rollout_fn(
         prompts: list[Prompt],
-        wrapped_actor: TinyActor,
+        wrapped_backend: TinyServingBackend,
     ) -> list[RolloutOutput]:
-        captured_defaults.append(dict(wrapped_actor.generation_defaults))
-        return make_rollout_fn(response_suffix="rollout", repeat=1)(prompts, wrapped_actor)
+        captured_defaults.append(dict(wrapped_backend.generation_defaults))
+        return make_rollout_fn(response_suffix="rollout", repeat=1)(prompts, wrapped_backend)
 
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn,
-        actor=actor,
+        serving_backend=serving_backend,
         config=RolloutConfig(
             max_new_tokens=64,
             temperature=0.7,
@@ -55,10 +55,10 @@ def test_user_defined_rollout_generate_applies_generation_defaults() -> None:
 
 def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_count() -> None:
     """Grouped rollout should preserve prompt-major ordering and reject bad output counts."""
-    actor = TinyActor()
+    serving_backend = TinyServingBackend()
     rollout = UserDefinedRollout(
         rollout_fn=make_rollout_fn(response_suffix="grouped", repeat=1),
-        actor=actor,
+        serving_backend=serving_backend,
         config=RolloutConfig(),
     )
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
@@ -84,11 +84,11 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert candidate_indices == [0, 1, 0, 1]
 
     invalid = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor: make_rollout_fn(
+        rollout_fn=lambda prompts, wrapped_backend: make_rollout_fn(
             response_suffix="invalid",
             repeat=1,
-        )(prompts[:-1], wrapped_actor),
-        actor=actor,
+        )(prompts[:-1], wrapped_backend),
+        serving_backend=serving_backend,
         config=RolloutConfig(),
     )
     with pytest.raises(ValueError, match="one output per input prompt"):
@@ -97,20 +97,20 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
 
 def test_user_defined_rollout_generate_grouped_repeats_unique_prompt_batches_per_candidate() -> None:
     """Grouped rollout should repeat the same unique-prompt batch once per candidate pass."""
-    actor = TinyActor()
+    serving_backend = TinyServingBackend()
     observed_calls: list[list[str]] = []
 
     def rollout_fn(
         prompts: list[Prompt],
-        wrapped_actor: TinyActor,
+        wrapped_backend: TinyServingBackend,
     ) -> list[RolloutOutput]:
-        del wrapped_actor
+        del wrapped_backend
         observed_calls.append([prompt.text for prompt in prompts])
-        return make_rollout_fn(response_suffix="grouped", repeat=1)(prompts, actor)
+        return make_rollout_fn(response_suffix="grouped", repeat=1)(prompts, serving_backend)
 
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn,
-        actor=actor,
+        serving_backend=serving_backend,
         config=RolloutConfig(),
     )
 
@@ -128,15 +128,15 @@ def test_user_defined_rollout_generate_grouped_repeats_unique_prompt_batches_per
 
 def test_user_defined_rollout_generate_conversation_uses_first_rollout_and_handles_empty() -> None:
     """Conversation generation should reuse the first rollout conversation or return an empty one."""
-    actor = TinyActor()
+    serving_backend = TinyServingBackend()
     single = UserDefinedRollout(
         rollout_fn=make_rollout_fn(response_suffix="conv", repeat=1),
-        actor=actor,
+        serving_backend=serving_backend,
         config=RolloutConfig(),
     )
     empty = UserDefinedRollout(
-        rollout_fn=lambda prompts, wrapped_actor: [],
-        actor=actor,
+        rollout_fn=lambda prompts, wrapped_backend: [],
+        serving_backend=serving_backend,
         config=RolloutConfig(),
     )
 

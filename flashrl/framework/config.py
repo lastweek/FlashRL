@@ -47,6 +47,8 @@ class ModelConfig(BaseConfig):
 class ServingConfig(ModelConfig):
     """Configuration for the serving model copy."""
 
+    backend: Literal["huggingface", "vllm_metal"] = "huggingface"
+    runtime_python: str | None = None
     debug_live_rollout: bool = False
 
 
@@ -150,6 +152,8 @@ class ServingSectionConfig(CommonConfig):
     """YAML serving section: serving model-copy settings only."""
 
     num_threads: int | None = None
+    backend: Literal["huggingface", "vllm_metal"] = "huggingface"
+    runtime_python: str | None = None
     debug_live_rollout: bool = False
 
 

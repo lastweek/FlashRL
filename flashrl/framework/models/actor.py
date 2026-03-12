@@ -316,6 +316,8 @@ class ActorModel:
                 **self._live_rollout_debug_context,
                 "prompt_index": prompt_index,
                 "candidate_index": candidate_index,
+                "prompt_text": prompt,
+                "prompt_preview": prompt,
             }
             self._emit_live_rollout_debug("start", debug_payload)
 

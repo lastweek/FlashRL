@@ -129,6 +129,8 @@ class FakeActor:
                     **self._live_rollout_debug_context,
                     "prompt_index": prompt_index,
                     "candidate_index": self._live_rollout_candidate_index or 0,
+                    "prompt_text": prompt,
+                    "prompt_preview": prompt,
                 }
                 self._live_rollout_debug_callback("start", debug_payload)
                 self._live_rollout_debug_callback("chunk", {**debug_payload, "text": response})
@@ -227,7 +229,12 @@ class FakeTrainingBackend:
         self.actor.model.load_state_dict(torch.load(path, weights_only=False))
 
     def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.actor.model.load_state_dict(self.actor.model.state_dict())
+        serving_backend.sync_from_training_actor(self.actor)
+
+
+def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
+    tokens = [((ord(char) % (vocab_size - 1)) + 1) for char in text[:max_length]]
+    return tokens or [1]
 
 
 class FakeServingBackend:
@@ -238,16 +245,42 @@ class FakeServingBackend:
     def __init__(self, config) -> None:
         type(self).last_config = config
         self.config = config
-        self.actor = FakeActor(bias_shift=0.1)
-        self.actor.eval()
+        self._actor = FakeActor(bias_shift=0.1)
+        self._actor.eval()
+        self.device = self._actor.device
+        self.generation_defaults: dict[str, object] = {}
+
+    def generate(self, prompts: list[str], **kwargs):
+        return self._actor.generate(prompts, **kwargs)
+
+    def generate_batch(self, prompts: list[str], **kwargs):
+        return self._actor.generate_batch(prompts, **kwargs)
+
+    def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
+        return self._actor.generate_grouped(prompts, group_size, **kwargs)
+
+    def set_generation_defaults(self, **kwargs) -> None:
+        self.generation_defaults = dict(kwargs)
+        self._actor.set_generation_defaults(**kwargs)
+
+    def sync_from_training_actor(self, training_actor) -> None:
+        self._actor.model.load_state_dict(training_actor.model.state_dict())
 
     def set_live_rollout_debug(self, callback, context) -> None:
         if not getattr(self.config, "debug_live_rollout", False):
             return
-        self.actor.set_live_rollout_debug(callback, context)
+        self._actor.set_live_rollout_debug(callback, context)
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        if not getattr(self.config, "debug_live_rollout", False):
+            return
+        self._actor.set_live_rollout_candidate_index(candidate_index)
 
     def clear_live_rollout_debug(self) -> None:
-        self.actor.clear_live_rollout_debug()
+        self._actor.clear_live_rollout_debug()
+
+    def close(self) -> None:
+        return None
 
 
 class FakeReferenceModel:
@@ -266,16 +299,14 @@ def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
 
     call_index = 0
 
-    def rollout_fn(prompts: list[Prompt], actor) -> list[RolloutOutput]:
+    def rollout_fn(prompts: list[Prompt], serving_backend) -> list[RolloutOutput]:
         nonlocal call_index
+        del serving_backend
         outputs = []
         for prompt in prompts:
-            prompt_token_ids = actor.tokenizer._encode(prompt.text, max_length=actor.config.max_length)
+            prompt_token_ids = _encode_text(prompt.text)
             response = f"{response_suffix} " + ("detail " * repeat) + prompt.text + f"::{call_index}"
-            response_token_ids = actor.tokenizer._encode(
-                response,
-                max_length=actor.config.max_length,
-            )[:4]
+            response_token_ids = _encode_text(response)[:4]
             response_token_logprobs = [
                 -0.05 - 0.01 * call_index - 0.001 * token_index
                 for token_index in range(len(response_token_ids))
@@ -312,7 +343,11 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeServingBackend.last_config = None
     FakeReferenceModel.last_config = None
     monkeypatch.setattr(flashrl_module, "TrainingBackend", FakeTrainingBackend)
-    monkeypatch.setattr(flashrl_module, "ServingBackend", FakeServingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_serving_backend",
+        lambda config, training_actor=None: FakeServingBackend(config),
+    )
     monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
 
@@ -411,8 +446,8 @@ def create_yaml_hook_module(tmp_path: Path) -> str:
                 return [Prompt(text=text) for text in DATASET_TEXTS]
 
 
-            def rollout_fn(prompts, actor):
-                samples = actor.generate_batch([prompt.text for prompt in prompts])
+            def rollout_fn(prompts, serving_backend):
+                samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
                 outputs = []
                 for prompt, sample in zip(prompts, samples, strict=True):
                     outputs.append(
@@ -1096,8 +1131,13 @@ def test_flashrl_yaml_serving_debug_live_rollout_wires_events_artifacts_and_metr
         for line in trainer._run_logger.rollouts_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+    transcript = trainer._run_logger.console_path.read_text(encoding="utf-8")
 
     assert any(event["event"] == "serving_debug" for event in events)
+    assert "serve step=1 epoch=1/1 batch=1/4 prompt=1/1 completions_per_prompt=2" in transcript
+    assert "  prompt: yaml prompt 0" in transcript
+    assert "  candidate 1/2" in transcript
+    assert "\n\n  candidate 2/2" in transcript
     assert any(
         "ttft_seconds" in candidate["rollout"]["metadata"]
         and "tpot_seconds" in candidate["rollout"]["metadata"]
@@ -1241,12 +1281,14 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("examples/reasoning/__init__.py").exists()
     assert Path("examples/reasoning/train.py").exists()
     assert Path("examples/reasoning/config.yaml").exists()
+    assert Path("examples/reasoning/config_vllm_metal.yaml").exists()
 
     docs = Path("examples/README.md").read_text(encoding="utf-8")
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
     assert "python3 -m examples.reasoning.train" in docs
     assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in docs
+    assert "config_vllm_metal.yaml" in docs
     assert "model:" not in docs
     assert "trainer:" not in docs
     assert "common:" in docs
@@ -1258,8 +1300,13 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
+    assert "serving.backend: vllm_metal" in docs
+    assert "runtime_python: ~/.venv-vllm-metal/bin/python" in docs
 
     example_yaml = Path("examples/reasoning/config.yaml").read_text(encoding="utf-8")
+    vllm_example_yaml = Path("examples/reasoning/config_vllm_metal.yaml").read_text(
+        encoding="utf-8"
+    )
     assert "model:" not in example_yaml
     assert "trainer:" not in example_yaml
     assert "common:" in example_yaml
@@ -1268,8 +1315,10 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "grpo:" in example_yaml
     assert "common:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct\n  num_threads:" not in example_yaml
     assert "training:\n  num_threads: 1" in example_yaml
-    assert "serving:\n  num_threads: 1\n  debug_live_rollout: false" in example_yaml
-    assert "debug_live_rollout: false" in docs
+    assert "serving:\n  num_threads: 1\n  debug_live_rollout:" in example_yaml
+    assert "debug_live_rollout:" in docs
+    assert "backend: vllm_metal" in vllm_example_yaml
+    assert "runtime_python: ~/.venv-vllm-metal/bin/python" in vllm_example_yaml
 
 
 def test_dev_sh_metrics_commands_and_compose_validation() -> None:

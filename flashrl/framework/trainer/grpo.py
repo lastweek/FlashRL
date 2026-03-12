@@ -17,10 +17,10 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 
 if TYPE_CHECKING:
-    from flashrl.framework.backends.serving import ServingBackend
     from flashrl.framework.backends.training import TrainingBackend
     from flashrl.framework.metrics import PrometheusMetricsSink
     from flashrl.framework.run_logger import RunLogger
+    from flashrl.framework.serving import ServingBackend
 
 
 STAGE_ORDER = (
@@ -49,6 +49,11 @@ class StepContext:
     batch_size: int
     prompt_count: int
     group_size: int
+    dataset_prompt_start: int
+    dataset_prompt_end: int
+    dataset_prompt_count: int
+    planned_prompts_per_step: int
+    planned_samples_per_step: int
 
     def payload(self) -> dict[str, int]:
         """Return the event payload fields shared by all step-stage logs."""
@@ -61,6 +66,15 @@ class StepContext:
             "batch_size": self.batch_size,
             "prompt_count": self.prompt_count,
             "group_size": self.group_size,
+            "dataset_prompt_start": self.dataset_prompt_start,
+            "dataset_prompt_end": self.dataset_prompt_end,
+            "dataset_prompt_count": self.dataset_prompt_count,
+            "planned_prompts_per_step": self.planned_prompts_per_step,
+            "planned_samples_per_step": self.planned_samples_per_step,
+            "completions_per_prompt": self.group_size,
+            "planned_completions_per_step": self.planned_samples_per_step,
+            "samples_this_step": self.batch_size,
+            "completions_this_step": self.batch_size,
         }
 
 
@@ -146,6 +160,11 @@ class GRPOTrainer:
                     batch_size=sample_count,
                     prompt_count=len(prompts),
                     group_size=self.grpo_config.group_size,
+                    dataset_prompt_start=((batch_index - 1) * prompts_per_step) + 1,
+                    dataset_prompt_end=min(batch_index * prompts_per_step, len(dataset)),
+                    dataset_prompt_count=len(dataset),
+                    planned_prompts_per_step=prompts_per_step,
+                    planned_samples_per_step=prompts_per_step * self.grpo_config.group_size,
                 )
                 step_payload = self._run_logged_step(prompts, context)
                 epoch_step_payloads.append(step_payload)

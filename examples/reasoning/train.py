@@ -22,10 +22,6 @@ from flashrl.framework.data_models import (
 
 REASONING_PROMPTS = [
     "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 15 + 27?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I have 3 apples and get 5 more, how many do I have?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 8 × 7?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 100 - 37?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I divide 24 by 3, what do I get?",
     "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 12 + 15 + 8?",
     "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I have 20 items and give away 7, how many remain?",
     "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 9 × 6?",
@@ -37,10 +33,10 @@ REASON_BLOCK_PATTERN = re.compile(r"<reason>(.*?)</reason>", re.IGNORECASE | re.
 
 def reasoning_rollout_fn(
     prompts: list[Prompt],
-    actor,
+    serving_backend,
 ) -> list[RolloutOutput]:
-    """Generate one reasoning rollout per prompt with the actor model."""
-    samples = actor.generate_batch([prompt.text for prompt in prompts])
+    """Generate one reasoning rollout per prompt with the serving backend."""
+    samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
     rollouts: list[RolloutOutput] = []
     for prompt, sample in zip(prompts, samples, strict=True):
         rollouts.append(

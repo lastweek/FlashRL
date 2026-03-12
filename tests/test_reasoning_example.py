@@ -36,13 +36,13 @@ def make_rollout(prompt_text: str, response_text: str) -> RolloutOutput:
     ("prompt_text", "expected_answer"),
     [
         (REASONING_PROMPTS[0], 42),
-        (REASONING_PROMPTS[1], 8),
-        (REASONING_PROMPTS[2], 56),
-        (REASONING_PROMPTS[3], 63),
-        (REASONING_PROMPTS[4], 8),
-        (REASONING_PROMPTS[5], 35),
-        (REASONING_PROMPTS[6], 13),
-        (REASONING_PROMPTS[7], 54),
+        (REASONING_PROMPTS[1], 35),
+        (REASONING_PROMPTS[2], 13),
+        (REASONING_PROMPTS[3], 54),
+        (
+            "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I divide 24 by 3, what do I get?",
+            8,
+        ),
     ],
 )
 def test_reasoning_prompt_parser_supports_all_committed_patterns(
@@ -99,7 +99,7 @@ def test_reasoning_reward_metadata_explains_structure_and_correctness() -> None:
     """Reward metadata should expose the parsed answers and score breakdown."""
     reward = reasoning_reward_fn(
         make_rollout(
-            REASONING_PROMPTS[4],
+            "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I divide 24 by 3, what do I get?",
             "<reason>24 divided by 3 is 8, so the answer is 8.</reason>\n8",
         )
     )

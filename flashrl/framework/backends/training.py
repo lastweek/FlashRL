@@ -5,6 +5,7 @@ import torch
 from flashrl.framework.config import ModelConfig
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.models.device import set_num_threads
+from flashrl.framework.serving import ServingBackend
 
 
 class TrainingBackend:
@@ -49,12 +50,10 @@ class TrainingBackend:
         """
         self.actor.model.load_state_dict(torch.load(path, weights_only=False))
 
-    def sync_weights_to(self, serving_backend: "ServingBackend") -> None:
+    def sync_weights_to(self, serving_backend: ServingBackend) -> None:
         """Sync training weights to serving backend.
 
         Args:
             serving_backend: Serving backend to sync weights to.
         """
-        serving_backend.actor.model.load_state_dict(
-            self.actor.model.state_dict()
-        )
+        serving_backend.sync_from_training_actor(self.actor)

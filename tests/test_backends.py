@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 import torch
 
-import flashrl.framework.backends.serving as serving_module
 import flashrl.framework.backends.training as training_module
-from flashrl.framework.backends.serving import ServingBackend
 from flashrl.framework.backends.training import TrainingBackend
 from flashrl.framework.config import ModelConfig, ServingConfig
+import flashrl.framework.serving.huggingface as serving_module
+from flashrl.framework.serving import HuggingFaceServingBackend
 from tests.conftest import TinyActor
 
 pytestmark = pytest.mark.unit
@@ -50,7 +52,7 @@ def test_serving_backend_initializes_eval_mode_and_threads(
     monkeypatch.setattr(serving_module, "set_num_threads", lambda value: thread_calls.append(value))
     monkeypatch.setattr(serving_module, "ActorModel", BackendActor)
 
-    backend = ServingBackend(
+    backend = HuggingFaceServingBackend(
         ServingConfig(
             model_name="fake/model",
             num_threads=2,
@@ -59,7 +61,7 @@ def test_serving_backend_initializes_eval_mode_and_threads(
     )
 
     assert thread_calls == [2]
-    assert backend.actor.model.training is False
+    assert backend._actor.model.training is False
     assert backend.config.debug_live_rollout is True
 
 
@@ -75,11 +77,11 @@ def test_training_backend_checkpoint_round_trip_and_sync(
 
     config = ModelConfig(model_name="fake/model", num_threads=1)
     training_backend = TrainingBackend(config, learning_rate=1e-3)
-    serving_backend = ServingBackend(config)
+    serving_backend = HuggingFaceServingBackend(ServingConfig(**config.model_dump()))
 
     with torch.no_grad():
         training_backend.actor.model.logit_bias.fill_(2.0)
-        serving_backend.actor.model.logit_bias.fill_(0.0)
+        serving_backend._actor.model.logit_bias.fill_(0.0)
 
     checkpoint_path = tmp_path / "backend.pt"
     training_backend.save_checkpoint(str(checkpoint_path))
@@ -97,5 +99,5 @@ def test_training_backend_checkpoint_round_trip_and_sync(
 
     assert torch.allclose(
         training_backend.actor.model.logit_bias,
-        serving_backend.actor.model.logit_bias,
+        serving_backend._actor.model.logit_bias,
     )

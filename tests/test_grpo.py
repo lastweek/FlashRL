@@ -41,7 +41,7 @@ def build_trainer(
     serving_backend = serving_backend or TinyServingBackend()
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn or make_rollout_fn(response_suffix="grpo", repeat=2),
-        actor=serving_backend.actor,
+        serving_backend=serving_backend,
         config=SimpleNamespace(),
     )
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
@@ -67,9 +67,9 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
     prompt_batches: list[list[str]] = []
     rollout_impl = make_rollout_fn(response_suffix="batch", repeat=1)
 
-    def rollout_fn(prompts, actor):
+    def rollout_fn(prompts, serving_backend):
         prompt_batches.append([prompt.text for prompt in prompts])
-        return rollout_impl(prompts, actor)
+        return rollout_impl(prompts, serving_backend)
 
     trainer = build_trainer(batch_size=4, group_size=2, rollout_fn=rollout_fn)
     dataset = [Prompt(text=f"prompt {index}") for index in range(5)]
@@ -125,7 +125,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
         prompts,
-        trainer.serving_backend.actor,
+        trainer.serving_backend,
     )
     rollouts = grouped_rollouts
 
@@ -212,7 +212,7 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     grouped_rollouts = make_rollout_fn(response_suffix="align", repeat=2)(
         prompts,
-        trainer.serving_backend.actor,
+        trainer.serving_backend,
     )
     rollouts = grouped_rollouts
     rollout_response_log_probs = [rollout.response_token_logprobs for rollout in rollouts]
@@ -261,7 +261,7 @@ def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     rollouts = make_rollout_fn(response_suffix="zero", repeat=2)(
         prompts,
-        trainer.serving_backend.actor,
+        trainer.serving_backend,
     )
 
     input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
@@ -369,13 +369,37 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
     class DebugServingBackend:
         def __init__(self) -> None:
             self.config = SimpleNamespace(debug_live_rollout=True)
-            self.actor = DebugActor()
+            self._actor = DebugActor()
+            self.device = self._actor.device
+            self.generation_defaults: dict[str, object] = {}
+
+        def generate(self, prompts: list[str], **kwargs):
+            return self._actor.generate(prompts, **kwargs)
+
+        def generate_batch(self, prompts: list[str], **kwargs):
+            return self._actor.generate_batch(prompts, **kwargs)
+
+        def generate_grouped(self, prompts: list[str], group_size: int, **kwargs):
+            return self._actor.generate_grouped(prompts, group_size, **kwargs)
+
+        def set_generation_defaults(self, **kwargs) -> None:
+            self.generation_defaults = dict(kwargs)
+            self._actor.set_generation_defaults(**kwargs)
+
+        def sync_from_training_actor(self, training_actor) -> None:
+            self._actor.model.load_state_dict(training_actor.model.state_dict())
 
         def set_live_rollout_debug(self, callback, context) -> None:
-            self.actor.set_live_rollout_debug(callback, context)
+            self._actor.set_live_rollout_debug(callback, context)
+
+        def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+            self._actor.set_live_rollout_candidate_index(candidate_index)
 
         def clear_live_rollout_debug(self) -> None:
-            self.actor.clear_live_rollout_debug()
+            self._actor.clear_live_rollout_debug()
+
+        def close(self) -> None:
+            return None
 
     serving_backend = DebugServingBackend()
     trainer = build_trainer(
@@ -386,10 +410,10 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
 
     trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
 
-    assert serving_backend.actor.debug_events[0][0] == "set"
-    assert ("candidate", 0) in serving_backend.actor.debug_events
-    assert ("candidate", 1) in serving_backend.actor.debug_events
-    assert serving_backend.actor.debug_events[-1] == ("clear", None)
+    assert serving_backend._actor.debug_events[0][0] == "set"
+    assert ("candidate", 0) in serving_backend._actor.debug_events
+    assert ("candidate", 1) in serving_backend._actor.debug_events
+    assert serving_backend._actor.debug_events[-1] == ("clear", None)
 
 
 def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> None:
