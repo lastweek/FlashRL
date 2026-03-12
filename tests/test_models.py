@@ -3,13 +3,14 @@
 from __future__ import annotations
 
 from types import SimpleNamespace
+from queue import Queue
 
 import pytest
 import torch
 
 import flashrl.framework.models.actor as actor_module
 import flashrl.framework.models.reference as reference_module
-from flashrl.framework.config import ModelConfig
+from flashrl.framework.config import ModelConfig, ServingConfig
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.models.reference import ReferenceModel
 from tests.conftest import TinyCausalLM, TinyTokenizer
@@ -117,6 +118,73 @@ def test_actor_model_generate_batch_returns_structured_samples(
     assert tiny_model.last_generate_kwargs["temperature"] == pytest.approx(0.6)
     assert all(sample.prompt_token_ids for sample in samples)
     assert all(len(sample.response_token_logprobs) == len(sample.response_token_ids) for sample in samples)
+
+
+def test_actor_model_debug_live_rollout_uses_sequential_path_and_emits_timings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Debug live rollout should switch to sequential generation and attach timing metadata."""
+
+    class FakeStreamer:
+        def __init__(self, *args, **kwargs) -> None:
+            del args, kwargs
+            self._queue: Queue[object] = Queue()
+
+        def push(self, text: str) -> None:
+            self._queue.put(text)
+
+        def end(self) -> None:
+            self._queue.put(StopIteration)
+
+        def __iter__(self):
+            return self
+
+        def __next__(self) -> str:
+            item = self._queue.get(timeout=1.0)
+            if item is StopIteration:
+                raise StopIteration
+            return str(item)
+
+    tiny_model, _ = patch_hf_loaders(monkeypatch, actor_module)
+    monkeypatch.setattr(actor_module, "TextIteratorStreamer", FakeStreamer)
+
+    original_generate = tiny_model.generate
+
+    def generate_with_streamer(**kwargs):
+        streamer = kwargs.pop("streamer")
+        streamer.push("partial ")
+        streamer.push("text")
+        streamer.end()
+        return original_generate(**kwargs)
+
+    tiny_model.generate = generate_with_streamer  # type: ignore[method-assign]
+
+    perf_values = iter([10.0, 10.2, 10.8])
+    monkeypatch.setattr(actor_module.time, "perf_counter", lambda: next(perf_values))
+
+    events: list[tuple[str, dict[str, object]]] = []
+    actor = ActorModel(
+        ServingConfig(
+            model_name="fake/model",
+            device="cpu",
+            debug_live_rollout=True,
+        )
+    )
+    actor.set_live_rollout_debug(
+        lambda kind, payload: events.append((kind, payload)),
+        {"step": 1, "epoch": 1, "total_epochs": 1, "batch_index": 1, "batches_in_epoch": 1, "prompt_count": 1, "group_size": 1},
+    )
+
+    grouped = actor.generate_grouped(["ab"], group_size=1)
+
+    assert len(grouped) == 1
+    assert len(grouped[0]) == 1
+    sample = grouped[0][0]
+    assert sample.metadata["ttft_seconds"] == pytest.approx(0.2)
+    assert sample.metadata["tpot_seconds"] == pytest.approx(0.6)
+    assert sample.metadata["generation_seconds"] == pytest.approx(0.8)
+    assert sample.metadata["response_token_count"] == len(sample.response_token_ids)
+    assert [kind for kind, _ in events] == ["start", "chunk", "chunk", "done"]
 
 
 def test_actor_model_compute_log_probs_returns_logits_on_target_device(

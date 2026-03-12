@@ -325,11 +325,48 @@ def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
     assert (logger.run_dir / "events.jsonl").exists()
     assert (logger.run_dir / "console.log").exists()
     assert (logger.run_dir / "rollouts.jsonl").exists()
+    assert not (logger.run_dir / "rollouts.html").exists()
 
     events = read_events(logger.run_dir)
-    assert any(event["event"] == "run_started" for event in events)
+    run_started = next(event for event in events if event["event"] == "run_started")
+    assert run_started["run_id"] == logger.run_id
+    assert run_started["run_index"] == logger.run_index
+    assert run_started["payload"]["run_index"] == logger.run_index
 
     logger.close()
+
+
+def test_logging_config_defaults_to_visible_logs_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """Default logging should use a visible logs/ root instead of a hidden dotdir."""
+    monkeypatch.chdir(tmp_path)
+
+    default_config = LoggingConfig(console=False, file=True)
+    assert default_config.log_dir == "logs"
+
+    logger = RunLogger(default_config, model_name="org/model-name")
+    assert logger.run_dir.parent.resolve() == (tmp_path / "logs").resolve()
+
+    custom_root = tmp_path / "custom-logs"
+    custom_logger = RunLogger(
+        LoggingConfig(log_dir=custom_root, console=False, file=True),
+        model_name="org/model-name",
+    )
+    assert custom_logger.run_dir.parent.resolve() == custom_root.resolve()
+
+
+def test_run_logger_allocates_monotonic_run_indices(tmp_path: Path) -> None:
+    """Run indices should increase monotonically under one log root."""
+    config = LoggingConfig(
+        log_dir=tmp_path,
+        console=False,
+        file=True,
+    )
+    first = RunLogger(config, model_name="org/model-a")
+    second = RunLogger(config, model_name="org/model-b")
+
+    assert second.run_index == first.run_index + 1
+    assert first.run_dir.name.startswith(f"{first.run_index:06d}-")
+    assert second.run_dir.name.startswith(f"{second.run_index:06d}-")
 
 
 def test_run_logger_sanitizes_model_name_in_run_dir(tmp_path: Path) -> None:
@@ -344,6 +381,8 @@ def test_run_logger_sanitizes_model_name_in_run_dir(tmp_path: Path) -> None:
     )
 
     assert "/" not in logger.run_dir.name
+    assert logger.run_dir.name[:6].isdigit()
+    assert logger.run_dir.name[6] == "-"
     assert "org-model-name-v1" in logger.run_dir.name
 
 
@@ -490,11 +529,89 @@ def test_run_logger_compact_console_groups_step_output(tmp_path: Path) -> None:
     assert "  stages    rollout 250.0ms" in transcript
     assert "step=1 epoch=1/1" not in transcript
     assert "sample step" not in transcript
+    assert "viewer" not in transcript
 
     events = read_events(logger.run_dir)
     assert any(event["event"] == "sample_preview" for event in events)
+    run_started = next(event for event in events if event["event"] == "run_started")
+    assert run_started["payload"]["run_index"] == logger.run_index
 
     logger.close()
+
+
+def test_run_logger_serving_debug_streams_terminal_only_fragments(
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Serving debug chunks should stream to terminal but not be persisted as fragments."""
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=True,
+            file=True,
+            console_mode="compact",
+        ),
+        model_name="org/model-name",
+    )
+
+    payload = {
+        "step": 1,
+        "epoch": 1,
+        "total_epochs": 1,
+        "batch_index": 1,
+        "batches_in_epoch": 1,
+        "prompt_count": 1,
+        "group_size": 4,
+        "prompt_index": 0,
+        "candidate_index": 1,
+        "ttft_seconds": 0.2,
+        "tpot_seconds": 0.05,
+        "generation_seconds": 0.35,
+        "response_token_count": 6,
+        "response_preview": "partial text",
+    }
+
+    logger.log_serving_debug_start(payload)
+    logger.log_serving_debug_chunk({**payload, "text": "part"})
+    logger.log_serving_debug_chunk({**payload, "text": "ial"})
+    logger.log_serving_debug_done(payload)
+
+    captured = capsys.readouterr().out
+    transcript = logger.console_path.read_text(encoding="utf-8")
+    events = read_events(logger.run_dir)
+
+    assert "serve step=1 epoch=1/1 batch=1/1 prompt=1/1 candidate=2/4" in captured
+    assert "partial" in captured
+    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in captured
+    assert "part" not in transcript
+    assert "ial" not in transcript
+    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in transcript
+    serving_events = [event for event in events if event["event"] == "serving_debug"]
+    assert len(serving_events) == 1
+    assert serving_events[0]["payload"]["candidate_index"] == 1
+    assert serving_events[0]["payload"]["response_preview"] == "partial text"
+
+
+def test_static_run_viewer_exists_and_contains_expected_sections() -> None:
+    """The shared run viewer should be a committed static HTML app."""
+    viewer_path = Path("docs/run_viewer.html")
+
+    assert viewer_path.exists()
+    html = viewer_path.read_text(encoding="utf-8")
+    assert "Open run folder" in html
+    assert ".flashrl-runs" not in html
+    assert "logs/" in html
+    assert "showDirectoryPicker" in html
+    assert "Run List" in html
+    assert "Overview" in html
+    assert "Timeline" in html
+    assert "Console" in html
+    assert "Rollouts" in html
+    assert "step-filter" in html
+    assert "epoch-filter" in html
+    assert "events.jsonl" in html
+    assert "console.log" in html
+    assert "rollouts.jsonl" in html
 
 
 def test_framework_is_the_only_supported_flashrl_import_surface() -> None:
@@ -733,25 +850,29 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert "phase=" not in transcript
     assert "━" not in transcript
     assert "sample step" not in transcript
+    assert "viewer" not in transcript
 
     rollouts = read_rollouts(logger.run_dir)
-    assert len(rollouts) == len(dataset) * 2
+    assert len(rollouts) == len(dataset)
     first_rollout = rollouts[0]
     assert first_rollout["run_id"] == logger.run_id
+    assert first_rollout["run_index"] == logger.run_index
     assert first_rollout["step"] == 1
-    assert first_rollout["sample_index"] == 1
     assert first_rollout["prompt_index"] == 0
-    assert first_rollout["candidate_index"] == 0
     assert first_rollout["group_size"] == 2
     assert first_rollout["prompt_count"] == 2
     assert first_rollout["sample_count"] == 4
     assert first_rollout["prompt"]["text"] == "prompt 0"
-    assert first_rollout["rollout"]["response_text"].startswith("sample detail")
-    assert first_rollout["rollout"]["prompt_token_count"] > 0
-    assert first_rollout["rollout"]["response_token_count"] > 0
-    assert first_rollout["conversation"]["messages"][0]["role"] == "user"
-    assert first_rollout["conversation"]["messages"][1]["role"] == "assistant"
-    assert first_rollout["reward"]["value"] > 0.0
+    assert "sample_index" not in first_rollout
+    assert len(first_rollout["candidates"]) == 2
+    assert [candidate["candidate_index"] for candidate in first_rollout["candidates"]] == [0, 1]
+    first_candidate = first_rollout["candidates"][0]
+    assert first_candidate["rollout"]["response_text"].startswith("sample detail")
+    assert first_candidate["rollout"]["prompt_token_count"] > 0
+    assert first_candidate["rollout"]["response_token_count"] > 0
+    assert first_candidate["conversation"]["messages"][0]["role"] == "user"
+    assert first_candidate["conversation"]["messages"][1]["role"] == "assistant"
+    assert first_candidate["reward"]["value"] > 0.0
 
     logger.close()
 
@@ -1001,6 +1122,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "phase=" not in output
     assert "stage initializing" not in output
     assert "━" not in output
+    assert "viewer" not in output
 
     events = read_events(trainer._run_logger.run_dir)
     assert all(
@@ -1018,12 +1140,13 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "phase_group_totals" not in run_finished["payload"]
 
     rollouts = read_rollouts(trainer._run_logger.run_dir)
-    assert len(rollouts) == len(dataset) * 2
+    assert len(rollouts) == len(dataset)
     assert rollouts[0]["prompt"]["text"] == "prompt 0"
-    assert rollouts[0]["reward"]["value"] > 0.0
-    assert rollouts[0]["conversation"]["messages"][0]["content"] == "prompt 0"
+    assert rollouts[0]["candidates"][0]["reward"]["value"] > 0.0
+    assert rollouts[0]["candidates"][0]["conversation"]["messages"][0]["content"] == "prompt 0"
     assert rollouts[0]["prompt_index"] == 0
-    assert rollouts[0]["candidate_index"] == 0
+    assert rollouts[0]["candidates"][0]["candidate_index"] == 0
+    assert "sample_index" not in rollouts[0]
 
     trainer._run_logger.close()
 

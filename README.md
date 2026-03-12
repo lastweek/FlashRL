@@ -58,6 +58,23 @@ python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 
 See [examples/README.md](examples/README.md) for details.
 
+### Inspect Run Artifacts
+
+FlashRL writes machine-readable per-run artifacts under `logs/` by default:
+- `events.jsonl`
+- `console.log`
+- `rollouts.jsonl`
+
+To inspect them, open the static viewer in Chrome or Edge:
+
+```bash
+open docs/run_viewer.html
+```
+
+Then click `Open run folder` and choose the `logs/` folder.
+
+Older `.flashrl-runs/` directories remain viewable if you already have them.
+
 ## Current Status
 
 ✅ **Step 1 Complete** - Core abstractions (data models, config, base classes)

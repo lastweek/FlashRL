@@ -9,9 +9,10 @@ training:
 
 serving:
   num_threads: 1
+  debug_live_rollout: false
 
 grpo:
-  group_size: 2
+  group_size: 4
   clip_ratio: 0.2
   kl_coefficient: 0.0
   max_new_tokens: 256

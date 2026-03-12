@@ -1,0 +1,1359 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>FlashRL Run Viewer</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --bg: #f3f1eb;
+      --panel: #fffdf8;
+      --panel-2: #f7f4ee;
+      --border: #d8d2c7;
+      --text: #192126;
+      --muted: #5b6570;
+      --accent: #b14d2c;
+      --accent-soft: #f4dfd6;
+      --code: #101820;
+      --code-text: #f8fafc;
+      --success: #2d6a4f;
+      --warn: #b45309;
+      --error: #b42318;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      font-family: "SF Pro Text", "Segoe UI", sans-serif;
+      background: radial-gradient(circle at top, #fbf8f1 0%, var(--bg) 55%);
+      color: var(--text);
+    }
+
+    button,
+    input,
+    select {
+      font: inherit;
+    }
+
+    .page {
+      min-height: 100vh;
+      display: flex;
+      flex-direction: column;
+    }
+
+    .topbar {
+      padding: 20px 24px 16px;
+      border-bottom: 1px solid rgba(25, 33, 38, 0.08);
+      background: rgba(255, 253, 248, 0.88);
+      backdrop-filter: blur(10px);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+
+    .topbar-row {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+    }
+
+    h1 {
+      margin: 0;
+      font-size: 28px;
+      line-height: 1.1;
+    }
+
+    .subtitle {
+      margin: 6px 0 0;
+      color: var(--muted);
+      max-width: 720px;
+    }
+
+    .topbar-actions {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .primary-button,
+    .secondary-button,
+    .tab-button {
+      border: 1px solid transparent;
+      border-radius: 999px;
+      padding: 10px 16px;
+      cursor: pointer;
+      transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .primary-button {
+      background: var(--text);
+      color: white;
+    }
+
+    .secondary-button {
+      background: var(--panel);
+      color: var(--text);
+      border-color: var(--border);
+    }
+
+    .primary-button:hover,
+    .secondary-button:hover,
+    .tab-button:hover {
+      transform: translateY(-1px);
+    }
+
+    .status-pill {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: var(--accent-soft);
+      color: var(--text);
+      font-size: 13px;
+      font-weight: 600;
+    }
+
+    .app-shell {
+      display: grid;
+      grid-template-columns: 320px minmax(0, 1fr);
+      gap: 20px;
+      padding: 20px 24px 24px;
+    }
+
+    .sidebar,
+    .content-card {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: 0 16px 32px rgba(25, 33, 38, 0.05);
+    }
+
+    .sidebar {
+      padding: 18px;
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      min-height: calc(100vh - 120px);
+    }
+
+    .sidebar h2,
+    .section-title {
+      margin: 0;
+      font-size: 16px;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .sidebar-controls {
+      display: grid;
+      gap: 10px;
+    }
+
+    .field {
+      display: grid;
+      gap: 6px;
+    }
+
+    .field label {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      color: var(--muted);
+      letter-spacing: 0.05em;
+    }
+
+    .field input,
+    .field select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: white;
+    }
+
+    .run-list {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      min-height: 0;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .run-button {
+      text-align: left;
+      width: 100%;
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel-2);
+      cursor: pointer;
+    }
+
+    .run-button.is-selected {
+      border-color: var(--accent);
+      background: var(--accent-soft);
+    }
+
+    .run-button-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      margin-bottom: 6px;
+      font-weight: 700;
+    }
+
+    .run-button-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 12px;
+      font-size: 12px;
+      color: var(--muted);
+    }
+
+    .main {
+      min-width: 0;
+    }
+
+    .empty-state,
+    .content-card {
+      padding: 22px;
+    }
+
+    .empty-state {
+      background: var(--panel);
+      border: 1px dashed var(--border);
+      border-radius: 20px;
+      color: var(--muted);
+    }
+
+    .run-header {
+      display: flex;
+      flex-wrap: wrap;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 18px;
+    }
+
+    .run-title {
+      margin: 0;
+      font-size: 24px;
+    }
+
+    .run-subtitle {
+      margin-top: 8px;
+      color: var(--muted);
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+    }
+
+    .summary-grid {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-bottom: 20px;
+    }
+
+    .summary-card {
+      padding: 14px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel-2);
+    }
+
+    .summary-label {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .summary-value {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .tab-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .tab-button {
+      background: var(--panel-2);
+      border-color: var(--border);
+      color: var(--text);
+    }
+
+    .tab-button.is-active {
+      background: var(--text);
+      color: white;
+    }
+
+    .panel {
+      display: none;
+      gap: 18px;
+    }
+
+    .panel.is-active {
+      display: grid;
+    }
+
+    .stack {
+      display: grid;
+      gap: 16px;
+    }
+
+    .two-column {
+      display: grid;
+      gap: 16px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .detail-card {
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      padding: 16px;
+      background: var(--panel-2);
+    }
+
+    .detail-list,
+    .stage-table,
+    .event-list,
+    .artifact-list {
+      display: grid;
+      gap: 10px;
+    }
+
+    .detail-row,
+    .event-card {
+      display: grid;
+      gap: 4px;
+      padding: 12px;
+      border: 1px solid rgba(25, 33, 38, 0.08);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.65);
+    }
+
+    .detail-key,
+    .event-meta {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+    }
+
+    .event-title {
+      font-weight: 700;
+    }
+
+    .event-body {
+      color: var(--muted);
+      white-space: pre-wrap;
+    }
+
+    .event-card.error {
+      border-color: rgba(180, 35, 24, 0.25);
+      background: #fff1ef;
+    }
+
+    .event-card.warn {
+      border-color: rgba(180, 83, 9, 0.25);
+      background: #fff7ed;
+    }
+
+    .console-controls,
+    .rollout-controls {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .console-output,
+    .json-block {
+      margin: 0;
+      white-space: pre-wrap;
+      background: var(--code);
+      color: var(--code-text);
+      border-radius: 16px;
+      padding: 16px;
+      overflow: auto;
+      min-height: 280px;
+    }
+
+    .rollout-list {
+      display: grid;
+      gap: 16px;
+    }
+
+    .prompt-card {
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      padding: 16px;
+      background: var(--panel-2);
+    }
+
+    .prompt-card-header {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 14px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .prompt-text {
+      margin-bottom: 12px;
+      padding: 14px;
+      background: white;
+      border-radius: 14px;
+      white-space: pre-wrap;
+    }
+
+    .candidate-grid {
+      display: grid;
+      gap: 14px;
+      grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+    }
+
+    .candidate-card {
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 14px;
+      background: rgba(255, 255, 255, 0.75);
+    }
+
+    .candidate-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 12px;
+      align-items: baseline;
+      margin-bottom: 10px;
+    }
+
+    .candidate-title {
+      margin: 0;
+      font-size: 16px;
+    }
+
+    .candidate-reward {
+      font-size: 13px;
+      font-weight: 700;
+      color: var(--accent);
+    }
+
+    .candidate-stats {
+      display: grid;
+      gap: 8px 12px;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .candidate-response {
+      padding: 12px;
+      background: white;
+      border-radius: 12px;
+      white-space: pre-wrap;
+      margin-bottom: 10px;
+    }
+
+    details {
+      margin-top: 8px;
+    }
+
+    details > summary {
+      cursor: pointer;
+      font-weight: 700;
+    }
+
+    .unsupported {
+      color: var(--error);
+      font-weight: 700;
+    }
+
+    @media (max-width: 1080px) {
+      .app-shell {
+        grid-template-columns: 1fr;
+      }
+
+      .sidebar {
+        min-height: auto;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="page">
+    <header class="topbar">
+      <div class="topbar-row">
+        <div>
+          <h1>FlashRL Run Viewer</h1>
+          <p class="subtitle">
+            Open this file directly in Chrome or Edge, click <strong>Open run folder</strong>,
+            and inspect run summaries, event timelines, console logs, and grouped GRPO rollouts.
+          </p>
+        </div>
+        <div class="topbar-actions">
+          <button class="primary-button" id="open-root-button" type="button">Open run folder</button>
+          <span class="status-pill" id="status-pill">No run directory selected</span>
+        </div>
+      </div>
+    </header>
+
+    <div class="app-shell">
+      <aside class="sidebar">
+        <h2>Run List</h2>
+        <div class="sidebar-controls">
+          <div class="field">
+            <label for="run-search">Filter Runs</label>
+            <input id="run-search" type="search" placeholder="Search run id, model, status">
+          </div>
+          <div class="field">
+            <label for="run-sort">Sort</label>
+            <select id="run-sort">
+              <option value="newest">Newest first</option>
+              <option value="oldest">Oldest first</option>
+              <option value="model">Model name</option>
+              <option value="status">Status</option>
+            </select>
+          </div>
+        </div>
+        <div class="run-list" id="run-list"></div>
+      </aside>
+
+      <main class="main">
+        <section class="empty-state" id="empty-state">
+          <p>
+            Choose the default `logs/` folder, or any older run root, to load available runs. The viewer uses the File System Access API,
+            so Chrome and Edge are the supported browsers for this local workflow.
+          </p>
+          <p class="unsupported" id="unsupported-message" hidden>
+            This browser does not support `showDirectoryPicker`. Use Chrome or Edge for the local viewer.
+          </p>
+        </section>
+
+        <section class="content-card" id="run-content" hidden>
+          <div class="run-header">
+            <div>
+              <h2 class="run-title" id="run-title"></h2>
+              <div class="run-subtitle" id="run-subtitle"></div>
+            </div>
+            <div class="artifact-list" id="artifact-list"></div>
+          </div>
+
+          <div class="summary-grid" id="summary-grid"></div>
+
+          <div class="tab-row">
+            <button class="tab-button is-active" data-tab="overview" type="button">Overview</button>
+            <button class="tab-button" data-tab="timeline" type="button">Timeline</button>
+            <button class="tab-button" data-tab="console" type="button">Console</button>
+            <button class="tab-button" data-tab="rollouts" type="button">Rollouts</button>
+          </div>
+
+          <section class="panel is-active" id="panel-overview"></section>
+          <section class="panel" id="panel-timeline"></section>
+          <section class="panel" id="panel-console"></section>
+          <section class="panel" id="panel-rollouts"></section>
+        </section>
+      </main>
+    </div>
+  </div>
+
+  <script>
+    const state = {
+      rootHandle: null,
+      runs: [],
+      selectedKey: null,
+      details: new Map(),
+      activeTab: "overview",
+    };
+
+    const dom = {
+      openRootButton: document.getElementById("open-root-button"),
+      statusPill: document.getElementById("status-pill"),
+      runSearch: document.getElementById("run-search"),
+      runSort: document.getElementById("run-sort"),
+      runList: document.getElementById("run-list"),
+      emptyState: document.getElementById("empty-state"),
+      unsupportedMessage: document.getElementById("unsupported-message"),
+      runContent: document.getElementById("run-content"),
+      runTitle: document.getElementById("run-title"),
+      runSubtitle: document.getElementById("run-subtitle"),
+      artifactList: document.getElementById("artifact-list"),
+      summaryGrid: document.getElementById("summary-grid"),
+      panelOverview: document.getElementById("panel-overview"),
+      panelTimeline: document.getElementById("panel-timeline"),
+      panelConsole: document.getElementById("panel-console"),
+      panelRollouts: document.getElementById("panel-rollouts"),
+      tabButtons: Array.from(document.querySelectorAll(".tab-button")),
+    };
+
+    function setStatus(message) {
+      dom.statusPill.textContent = message;
+    }
+
+    function formatDuration(value) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return "n/a";
+      }
+      const seconds = Number(value);
+      if (seconds < 1) {
+        return `${(seconds * 1000).toFixed(1)}ms`;
+      }
+      return `${seconds.toFixed(3)}s`;
+    }
+
+    function formatNumber(value, decimals = 2) {
+      if (value === null || value === undefined || Number.isNaN(Number(value))) {
+        return "n/a";
+      }
+      return Number(value).toFixed(decimals);
+    }
+
+    function safeArray(value) {
+      return Array.isArray(value) ? value : [];
+    }
+
+    async function getOptionalFileHandle(directoryHandle, name) {
+      try {
+        return await directoryHandle.getFileHandle(name);
+      } catch {
+        return null;
+      }
+    }
+
+    async function readText(fileHandle) {
+      if (!fileHandle) {
+        return "";
+      }
+      const file = await fileHandle.getFile();
+      return await file.text();
+    }
+
+    function parseJsonl(text) {
+      const records = [];
+      for (const line of text.split(/\r?\n/)) {
+        if (!line.trim()) {
+          continue;
+        }
+        try {
+          records.push(JSON.parse(line));
+        } catch (error) {
+          records.push({
+            event: "viewer_parse_error",
+            payload: {
+              line,
+              error: String(error),
+            },
+          });
+        }
+      }
+      return records;
+    }
+
+    function summarizeRun(folderName, events, fileFlags) {
+      const runStarted = events.find((event) => event.event === "run_started");
+      const runFinished = [...events].reverse().find((event) => event.event === "run_finished");
+      const modelLoads = events.filter((event) => event.event === "model_load");
+      const checkpoints = events.filter((event) => event.event === "checkpoint");
+      const exceptions = events.filter((event) => event.event === "exception");
+
+      const startedPayload = runStarted?.payload || {};
+      const finishedPayload = runFinished?.payload || {};
+      const lifecycle = finishedPayload.lifecycle_totals || {};
+
+      return {
+        key: folderName,
+        folderName,
+        runId: runStarted?.run_id || startedPayload.run_id || folderName,
+        runIndex: runStarted?.run_index || startedPayload.run_index || null,
+        timestamp: runStarted?.timestamp || null,
+        modelName: startedPayload.model_name || "unknown",
+        status: finishedPayload.status || "running",
+        totalSteps: finishedPayload.total_steps ?? 0,
+        durationSeconds:
+          (lifecycle.startup_total_seconds || 0) +
+          (lifecycle.training_loop_seconds || 0) +
+          (lifecycle.checkpoint_save_seconds || 0) +
+          (lifecycle.checkpoint_load_seconds || 0),
+        avgStepSeconds: finishedPayload.avg_step_seconds ?? null,
+        dominantStage: finishedPayload.dominant_stage || "n/a",
+        stageTotals: finishedPayload.stage_totals || {},
+        lifecycleTotals: lifecycle,
+        datasetSize: startedPayload.dataset_size ?? null,
+        batchSize: startedPayload.batch_size ?? null,
+        maxEpochs: startedPayload.max_epochs ?? null,
+        totalBatches: startedPayload.total_batches ?? null,
+        runtimeShape: startedPayload.runtime_shape || "unknown",
+        referenceEnabled: Boolean(startedPayload.reference_enabled),
+        checkpointCount: checkpoints.length,
+        exceptionCount: exceptions.length,
+        modelLoadCount: modelLoads.length,
+        files: fileFlags,
+      };
+    }
+
+    function compareRuns(left, right, mode) {
+      if (mode === "oldest") {
+        return compareRuns(right, left, "newest");
+      }
+      if (mode === "model") {
+        return left.modelName.localeCompare(right.modelName) || compareRuns(left, right, "newest");
+      }
+      if (mode === "status") {
+        return left.status.localeCompare(right.status) || compareRuns(left, right, "newest");
+      }
+      const leftIndex = left.runIndex ?? -1;
+      const rightIndex = right.runIndex ?? -1;
+      if (leftIndex !== rightIndex) {
+        return rightIndex - leftIndex;
+      }
+      return right.folderName.localeCompare(left.folderName);
+    }
+
+    function visibleRuns() {
+      const query = dom.runSearch.value.trim().toLowerCase();
+      const mode = dom.runSort.value;
+      return [...state.runs]
+        .filter((run) => {
+          if (!query) {
+            return true;
+          }
+          return [
+            run.runId,
+            run.modelName,
+            run.status,
+            run.folderName,
+          ]
+            .join(" ")
+            .toLowerCase()
+            .includes(query);
+        })
+        .sort((left, right) => compareRuns(left, right, mode));
+    }
+
+    function renderRunList() {
+      dom.runList.innerHTML = "";
+      const runs = visibleRuns();
+      if (runs.length === 0) {
+        const empty = document.createElement("p");
+        empty.textContent = "No runs match the current filter.";
+        dom.runList.appendChild(empty);
+        return;
+      }
+
+      for (const run of runs) {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "run-button";
+        if (run.key === state.selectedKey) {
+          button.classList.add("is-selected");
+        }
+        button.addEventListener("click", () => void selectRun(run.key));
+
+        const header = document.createElement("div");
+        header.className = "run-button-header";
+        const title = document.createElement("span");
+        title.textContent = run.runIndex !== null ? `#${String(run.runIndex).padStart(6, "0")}` : run.folderName;
+        const status = document.createElement("span");
+        status.textContent = run.status;
+        header.append(title, status);
+
+        const model = document.createElement("div");
+        model.textContent = run.modelName;
+        model.style.fontWeight = "700";
+        model.style.marginBottom = "6px";
+
+        const meta = document.createElement("div");
+        meta.className = "run-button-meta";
+        for (const text of [
+          `steps ${run.totalSteps}`,
+          `duration ${formatDuration(run.durationSeconds)}`,
+          `dominant ${run.dominantStage}`,
+          `exceptions ${run.exceptionCount}`,
+        ]) {
+          const item = document.createElement("span");
+          item.textContent = text;
+          meta.appendChild(item);
+        }
+
+        button.append(header, model, meta);
+        dom.runList.appendChild(button);
+      }
+    }
+
+    function createSummaryCard(label, value) {
+      const card = document.createElement("div");
+      card.className = "summary-card";
+      const labelEl = document.createElement("div");
+      labelEl.className = "summary-label";
+      labelEl.textContent = label;
+      const valueEl = document.createElement("div");
+      valueEl.className = "summary-value";
+      valueEl.textContent = value;
+      card.append(labelEl, valueEl);
+      return card;
+    }
+
+    function createDetailRow(label, value) {
+      const row = document.createElement("div");
+      row.className = "detail-row";
+      const key = document.createElement("div");
+      key.className = "detail-key";
+      key.textContent = label;
+      const content = document.createElement("div");
+      content.textContent = value;
+      row.append(key, content);
+      return row;
+    }
+
+    function renderOverview(run, details) {
+      dom.panelOverview.innerHTML = "";
+
+      const columns = document.createElement("div");
+      columns.className = "two-column";
+
+      const metadataCard = document.createElement("section");
+      metadataCard.className = "detail-card";
+      const metadataTitle = document.createElement("h3");
+      metadataTitle.className = "section-title";
+      metadataTitle.textContent = "Run Metadata";
+      metadataCard.appendChild(metadataTitle);
+      const metadataList = document.createElement("div");
+      metadataList.className = "detail-list";
+      for (const [label, value] of [
+        ["Run ID", run.runId],
+        ["Folder", run.folderName],
+        ["Dataset Size", String(run.datasetSize ?? "n/a")],
+        ["Batch Size", String(run.batchSize ?? "n/a")],
+        ["Epochs", String(run.maxEpochs ?? "n/a")],
+        ["Total Batches", String(run.totalBatches ?? "n/a")],
+        ["Runtime", run.runtimeShape],
+        ["Reference", run.referenceEnabled ? "enabled" : "disabled"],
+      ]) {
+        metadataList.appendChild(createDetailRow(label, value));
+      }
+      metadataCard.appendChild(metadataList);
+
+      const lifecycleCard = document.createElement("section");
+      lifecycleCard.className = "detail-card";
+      const lifecycleTitle = document.createElement("h3");
+      lifecycleTitle.className = "section-title";
+      lifecycleTitle.textContent = "Lifecycle";
+      lifecycleCard.appendChild(lifecycleTitle);
+      const lifecycleList = document.createElement("div");
+      lifecycleList.className = "detail-list";
+      const lifecycleTotals = run.lifecycleTotals || {};
+      if (Object.keys(lifecycleTotals).length === 0) {
+        lifecycleList.appendChild(createDetailRow("No lifecycle totals", "n/a"));
+      } else {
+        for (const [key, value] of Object.entries(lifecycleTotals)) {
+          lifecycleList.appendChild(createDetailRow(key, formatDuration(value)));
+        }
+      }
+      lifecycleCard.appendChild(lifecycleList);
+
+      columns.append(metadataCard, lifecycleCard);
+      dom.panelOverview.appendChild(columns);
+
+      const lower = document.createElement("div");
+      lower.className = "two-column";
+
+      const stagesCard = document.createElement("section");
+      stagesCard.className = "detail-card";
+      const stagesTitle = document.createElement("h3");
+      stagesTitle.className = "section-title";
+      stagesTitle.textContent = "Stage Totals";
+      stagesCard.appendChild(stagesTitle);
+      const stagesList = document.createElement("div");
+      stagesList.className = "stage-table";
+      const stageEntries = Object.entries(run.stageTotals || {});
+      if (stageEntries.length === 0) {
+        stagesList.appendChild(createDetailRow("No completed steps", "n/a"));
+      } else {
+        for (const [key, value] of stageEntries.sort((left, right) => right[1] - left[1])) {
+          stagesList.appendChild(createDetailRow(key, formatDuration(value)));
+        }
+      }
+      stagesCard.appendChild(stagesList);
+
+      const incidentsCard = document.createElement("section");
+      incidentsCard.className = "detail-card";
+      const incidentsTitle = document.createElement("h3");
+      incidentsTitle.className = "section-title";
+      incidentsTitle.textContent = "Exceptions and Checkpoints";
+      incidentsCard.appendChild(incidentsTitle);
+      const incidentList = document.createElement("div");
+      incidentList.className = "event-list";
+      const incidentEvents = details.events.filter((event) => ["exception", "checkpoint"].includes(event.event));
+      if (incidentEvents.length === 0) {
+        incidentList.appendChild(createDetailRow("No exceptions or checkpoints", "n/a"));
+      } else {
+        for (const event of incidentEvents) {
+          incidentList.appendChild(renderEventCard(event));
+        }
+      }
+      incidentsCard.appendChild(incidentList);
+
+      lower.append(stagesCard, incidentsCard);
+      dom.panelOverview.appendChild(lower);
+    }
+
+    function summarizeEvent(event) {
+      const payload = event.payload || {};
+      switch (event.event) {
+        case "run_started":
+          return `dataset=${payload.dataset_size} batch=${payload.batch_size} epochs=${payload.max_epochs}`;
+        case "model_load":
+          return `${payload.component} ${payload.status}`;
+        case "epoch_start":
+          return `epoch ${payload.epoch}/${payload.total_epochs} batches=${payload.num_batches}`;
+        case "step_stage":
+          return `step ${payload.step} stage=${payload.stage} latency=${formatDuration(payload.latency_seconds)}`;
+        case "step_done":
+          return `step ${payload.step} loss=${formatNumber(payload.loss, 4)} reward=${formatNumber(payload.reward_mean, 4)}`;
+        case "checkpoint":
+          return `${payload.action} ${payload.path}`;
+        case "exception":
+          return `${payload.type}: ${payload.message}`;
+        case "run_finished":
+          return `${payload.status} total_steps=${payload.total_steps}`;
+        default:
+          return JSON.stringify(payload);
+      }
+    }
+
+    function renderEventCard(event) {
+      const card = document.createElement("article");
+      card.className = "event-card";
+      if (event.event === "exception") {
+        card.classList.add("error");
+      } else if (event.event === "checkpoint") {
+        card.classList.add("warn");
+      }
+
+      const meta = document.createElement("div");
+      meta.className = "event-meta";
+      meta.textContent = `${event.timestamp || "n/a"} | ${event.event}`;
+
+      const title = document.createElement("div");
+      title.className = "event-title";
+      title.textContent = summarizeEvent(event);
+
+      card.append(meta, title);
+
+      if (event.event === "exception" || event.event === "checkpoint") {
+        const body = document.createElement("div");
+        body.className = "event-body";
+        body.textContent = JSON.stringify(event.payload || {}, null, 2);
+        card.appendChild(body);
+      }
+
+      return card;
+    }
+
+    function renderTimeline(details) {
+      dom.panelTimeline.innerHTML = "";
+      const stack = document.createElement("div");
+      stack.className = "stack";
+      const events = details.events.slice().sort((left, right) => String(left.timestamp || "").localeCompare(String(right.timestamp || "")));
+      for (const event of events) {
+        stack.appendChild(renderEventCard(event));
+      }
+      dom.panelTimeline.appendChild(stack);
+    }
+
+    function renderConsole(run, details) {
+      dom.panelConsole.innerHTML = "";
+
+      const controls = document.createElement("div");
+      controls.className = "console-controls";
+
+      const searchField = document.createElement("div");
+      searchField.className = "field";
+      const searchLabel = document.createElement("label");
+      searchLabel.setAttribute("for", "console-search");
+      searchLabel.textContent = "Search Console";
+      const searchInput = document.createElement("input");
+      searchInput.id = "console-search";
+      searchInput.type = "search";
+      searchInput.placeholder = "Filter console lines";
+      searchField.append(searchLabel, searchInput);
+
+      const copyButton = document.createElement("button");
+      copyButton.type = "button";
+      copyButton.className = "secondary-button";
+      copyButton.textContent = "Copy Console";
+      copyButton.addEventListener("click", async () => {
+        try {
+          await navigator.clipboard.writeText(details.consoleText || "");
+          setStatus(`Copied console log for ${run.runId}`);
+        } catch (error) {
+          setStatus(`Copy failed: ${error}`);
+        }
+      });
+
+      controls.append(searchField, copyButton);
+
+      const output = document.createElement("pre");
+      output.className = "console-output";
+      output.textContent = details.consoleText || "console.log missing";
+
+      function updateConsoleView() {
+        const query = searchInput.value.trim().toLowerCase();
+        if (!query) {
+          output.textContent = details.consoleText || "console.log missing";
+          return;
+        }
+        const lines = (details.consoleText || "")
+          .split(/\r?\n/)
+          .filter((line) => line.toLowerCase().includes(query));
+        output.textContent = lines.join("\n") || "No console lines matched the search.";
+      }
+
+      searchInput.addEventListener("input", updateConsoleView);
+
+      dom.panelConsole.append(controls, output);
+    }
+
+    function rolloutFilterValues(rollouts, key) {
+      return [...new Set(rollouts.map((record) => record[key]).filter((value) => value !== undefined && value !== null))]
+        .sort((left, right) => Number(left) - Number(right));
+    }
+
+    function renderRollouts(details) {
+      dom.panelRollouts.innerHTML = "";
+
+      if (!details.rollouts.length) {
+        const empty = document.createElement("div");
+        empty.className = "empty-state";
+        empty.textContent = "No rollouts.jsonl data found for this run.";
+        dom.panelRollouts.appendChild(empty);
+        return;
+      }
+
+      const controls = document.createElement("div");
+      controls.className = "rollout-controls";
+
+      const epochField = document.createElement("div");
+      epochField.className = "field";
+      const epochLabel = document.createElement("label");
+      epochLabel.setAttribute("for", "epoch-filter");
+      epochLabel.textContent = "Epoch";
+      const epochSelect = document.createElement("select");
+      epochSelect.id = "epoch-filter";
+      epochSelect.innerHTML = '<option value="all">All</option>';
+      for (const value of rolloutFilterValues(details.rollouts, "epoch")) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = String(value);
+        epochSelect.appendChild(option);
+      }
+      epochField.append(epochLabel, epochSelect);
+
+      const stepField = document.createElement("div");
+      stepField.className = "field";
+      const stepLabel = document.createElement("label");
+      stepLabel.setAttribute("for", "step-filter");
+      stepLabel.textContent = "Step";
+      const stepSelect = document.createElement("select");
+      stepSelect.id = "step-filter";
+      stepSelect.innerHTML = '<option value="all">All</option>';
+      for (const value of rolloutFilterValues(details.rollouts, "step")) {
+        const option = document.createElement("option");
+        option.value = String(value);
+        option.textContent = String(value);
+        stepSelect.appendChild(option);
+      }
+      stepField.append(stepLabel, stepSelect);
+
+      controls.append(epochField, stepField);
+
+      const list = document.createElement("div");
+      list.className = "rollout-list";
+
+      function updateRollouts() {
+        list.innerHTML = "";
+        const selectedEpoch = epochSelect.value;
+        const selectedStep = stepSelect.value;
+        const filtered = details.rollouts.filter((record) => {
+          const epochMatch = selectedEpoch === "all" || String(record.epoch) === selectedEpoch;
+          const stepMatch = selectedStep === "all" || String(record.step) === selectedStep;
+          return epochMatch && stepMatch;
+        });
+
+        if (!filtered.length) {
+          const empty = document.createElement("div");
+          empty.className = "empty-state";
+          empty.textContent = "No rollout groups match the current filters.";
+          list.appendChild(empty);
+          return;
+        }
+
+        for (const record of filtered) {
+          const promptCard = document.createElement("section");
+          promptCard.className = "prompt-card";
+
+          const header = document.createElement("div");
+          header.className = "prompt-card-header";
+          for (const value of [
+            `step ${record.step}`,
+            `epoch ${record.epoch}`,
+            `batch ${record.batch_index}/${record.batches_in_epoch}`,
+            `prompt_index ${record.prompt_index}`,
+            `group_size ${record.group_size}`,
+          ]) {
+            const item = document.createElement("span");
+            item.textContent = value;
+            header.appendChild(item);
+          }
+
+          const promptText = document.createElement("div");
+          promptText.className = "prompt-text";
+          promptText.textContent = record.prompt?.text || "";
+
+          const grid = document.createElement("div");
+          grid.className = "candidate-grid";
+
+          for (const candidate of safeArray(record.candidates)) {
+            const card = document.createElement("article");
+            card.className = "candidate-card";
+
+            const candidateHeader = document.createElement("div");
+            candidateHeader.className = "candidate-header";
+            const candidateTitle = document.createElement("h3");
+            candidateTitle.className = "candidate-title";
+            candidateTitle.textContent = `Candidate ${candidate.candidate_index}`;
+            const candidateReward = document.createElement("div");
+            candidateReward.className = "candidate-reward";
+            candidateReward.textContent = `reward ${formatNumber(candidate.reward?.value, 4)}`;
+            candidateHeader.append(candidateTitle, candidateReward);
+
+            const stats = document.createElement("div");
+            stats.className = "candidate-stats";
+            for (const [label, value] of [
+              ["Log Prob", candidate.rollout?.log_prob],
+              ["Prompt Tokens", candidate.rollout?.prompt_token_count],
+              ["Response Tokens", candidate.rollout?.response_token_count],
+              ["Response Length", candidate.rollout?.response_text?.length ?? 0],
+            ]) {
+              const item = document.createElement("div");
+              item.textContent = `${label}: ${value ?? "n/a"}`;
+              stats.appendChild(item);
+            }
+
+            const response = document.createElement("div");
+            response.className = "candidate-response";
+            response.textContent = candidate.rollout?.response_text || "";
+
+            card.append(candidateHeader, stats, response);
+
+            for (const [label, value] of [
+              ["Conversation", candidate.conversation],
+              ["Rollout Metadata", candidate.rollout?.metadata],
+              ["Reward Metadata", candidate.reward?.metadata],
+            ]) {
+              const details = document.createElement("details");
+              const summary = document.createElement("summary");
+              summary.textContent = label;
+              const pre = document.createElement("pre");
+              pre.className = "json-block";
+              pre.textContent = JSON.stringify(value ?? {}, null, 2);
+              details.append(summary, pre);
+              card.appendChild(details);
+            }
+
+            grid.appendChild(card);
+          }
+
+          promptCard.append(header, promptText, grid);
+          list.appendChild(promptCard);
+        }
+      }
+
+      epochSelect.addEventListener("change", updateRollouts);
+      stepSelect.addEventListener("change", updateRollouts);
+      updateRollouts();
+
+      dom.panelRollouts.append(controls, list);
+    }
+
+    function renderSelectedRun() {
+      const run = state.runs.find((item) => item.key === state.selectedKey);
+      if (!run) {
+        dom.emptyState.hidden = false;
+        dom.runContent.hidden = true;
+        return;
+      }
+
+      const details = state.details.get(run.key);
+      dom.emptyState.hidden = true;
+      dom.runContent.hidden = false;
+
+      dom.runTitle.textContent = run.runId;
+      dom.runSubtitle.innerHTML = "";
+      for (const text of [
+        run.runIndex !== null ? `run #${String(run.runIndex).padStart(6, "0")}` : run.folderName,
+        run.modelName,
+        run.status,
+        `duration ${formatDuration(run.durationSeconds)}`,
+      ]) {
+        const item = document.createElement("span");
+        item.textContent = text;
+        dom.runSubtitle.appendChild(item);
+      }
+
+      dom.artifactList.innerHTML = "";
+      for (const [label, value] of [
+        ["events.jsonl", run.files.hasEvents ? "available" : "missing"],
+        ["console.log", run.files.hasConsole ? "available" : "missing"],
+        ["rollouts.jsonl", run.files.hasRollouts ? "available" : "missing"],
+      ]) {
+        dom.artifactList.appendChild(createDetailRow(label, value));
+      }
+
+      dom.summaryGrid.innerHTML = "";
+      for (const [label, value] of [
+        ["Status", run.status],
+        ["Model", run.modelName],
+        ["Duration", formatDuration(run.durationSeconds)],
+        ["Steps", String(run.totalSteps)],
+        ["Avg Step", formatDuration(run.avgStepSeconds)],
+        ["Dominant Stage", run.dominantStage],
+        ["Exceptions", String(run.exceptionCount)],
+        ["Checkpoints", String(run.checkpointCount)],
+      ]) {
+        dom.summaryGrid.appendChild(createSummaryCard(label, value));
+      }
+
+      renderOverview(run, details);
+      renderTimeline(details);
+      renderConsole(run, details);
+      renderRollouts(details);
+      applyActiveTab();
+      renderRunList();
+    }
+
+    function applyActiveTab() {
+      for (const button of dom.tabButtons) {
+        const isActive = button.dataset.tab === state.activeTab;
+        button.classList.toggle("is-active", isActive);
+      }
+      for (const panel of [
+        dom.panelOverview,
+        dom.panelTimeline,
+        dom.panelConsole,
+        dom.panelRollouts,
+      ]) {
+        panel.classList.toggle("is-active", panel.id === `panel-${state.activeTab}`);
+      }
+    }
+
+    async function loadRunDetails(run) {
+      if (state.details.has(run.key)) {
+        return state.details.get(run.key);
+      }
+
+      const eventsHandle = await getOptionalFileHandle(run.dirHandle, "events.jsonl");
+      const consoleHandle = await getOptionalFileHandle(run.dirHandle, "console.log");
+      const rolloutsHandle = await getOptionalFileHandle(run.dirHandle, "rollouts.jsonl");
+      const details = {
+        events: parseJsonl(await readText(eventsHandle)),
+        consoleText: await readText(consoleHandle),
+        rollouts: parseJsonl(await readText(rolloutsHandle)),
+      };
+      state.details.set(run.key, details);
+      return details;
+    }
+
+    async function selectRun(key) {
+      const run = state.runs.find((item) => item.key === key);
+      if (!run) {
+        return;
+      }
+      setStatus(`Loading ${run.runId}`);
+      state.selectedKey = key;
+      await loadRunDetails(run);
+      renderSelectedRun();
+      setStatus(`Loaded ${run.runId}`);
+    }
+
+    async function scanRuns(rootHandle) {
+      setStatus(`Scanning ${rootHandle.name}`);
+      const runs = [];
+      for await (const [name, handle] of rootHandle.entries()) {
+        if (handle.kind !== "directory") {
+          continue;
+        }
+        const eventsHandle = await getOptionalFileHandle(handle, "events.jsonl");
+        if (!eventsHandle) {
+          continue;
+        }
+        const events = parseJsonl(await readText(eventsHandle));
+        runs.push({
+          ...summarizeRun(name, events, {
+            hasEvents: true,
+            hasConsole: Boolean(await getOptionalFileHandle(handle, "console.log")),
+            hasRollouts: Boolean(await getOptionalFileHandle(handle, "rollouts.jsonl")),
+          }),
+          dirHandle: handle,
+        });
+      }
+
+      state.runs = runs.sort((left, right) => compareRuns(left, right, "newest"));
+      renderRunList();
+      if (state.runs.length) {
+        await selectRun(state.runs[0].key);
+      } else {
+        dom.emptyState.hidden = false;
+        dom.runContent.hidden = true;
+        setStatus(`No run folders found under ${rootHandle.name}`);
+      }
+    }
+
+    async function openRootDirectory() {
+      if (!("showDirectoryPicker" in window)) {
+        dom.unsupportedMessage.hidden = false;
+        setStatus("showDirectoryPicker is unavailable in this browser");
+        return;
+      }
+
+      try {
+        const rootHandle = await window.showDirectoryPicker({ mode: "read" });
+        state.rootHandle = rootHandle;
+        await scanRuns(rootHandle);
+      } catch (error) {
+        if (error?.name === "AbortError") {
+          setStatus("Directory selection cancelled");
+          return;
+        }
+        setStatus(`Failed to open directory: ${error}`);
+      }
+    }
+
+    dom.openRootButton.addEventListener("click", () => void openRootDirectory());
+    dom.runSearch.addEventListener("input", renderRunList);
+    dom.runSort.addEventListener("change", renderRunList);
+    dom.tabButtons.forEach((button) => {
+      button.addEventListener("click", () => {
+        state.activeTab = button.dataset.tab;
+        applyActiveTab();
+      });
+    });
+  </script>
+</body>
+</html>

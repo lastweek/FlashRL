@@ -78,10 +78,16 @@ class UserDefinedRollout:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
 
         grouped_rollouts: list[list[RolloutOutput]] = [[] for _ in prompts]
-        for _ in range(group_size):
-            rollouts = self._generate_once(prompts)
-            for prompt_index, rollout in enumerate(rollouts):
-                grouped_rollouts[prompt_index].append(rollout)
+        try:
+            for candidate_index in range(group_size):
+                if hasattr(self.actor, "set_live_rollout_candidate_index"):
+                    self.actor.set_live_rollout_candidate_index(candidate_index)
+                rollouts = self._generate_once(prompts)
+                for prompt_index, rollout in enumerate(rollouts):
+                    grouped_rollouts[prompt_index].append(rollout)
+        finally:
+            if hasattr(self.actor, "set_live_rollout_candidate_index"):
+                self.actor.set_live_rollout_candidate_index(None)
 
         flat_prompts: list[Prompt] = []
         flat_rollouts: list[RolloutOutput] = []

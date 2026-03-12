@@ -9,7 +9,7 @@ import flashrl.framework.backends.serving as serving_module
 import flashrl.framework.backends.training as training_module
 from flashrl.framework.backends.serving import ServingBackend
 from flashrl.framework.backends.training import TrainingBackend
-from flashrl.framework.config import ModelConfig
+from flashrl.framework.config import ModelConfig, ServingConfig
 from tests.conftest import TinyActor
 
 pytestmark = pytest.mark.unit
@@ -50,10 +50,17 @@ def test_serving_backend_initializes_eval_mode_and_threads(
     monkeypatch.setattr(serving_module, "set_num_threads", lambda value: thread_calls.append(value))
     monkeypatch.setattr(serving_module, "ActorModel", BackendActor)
 
-    backend = ServingBackend(ModelConfig(model_name="fake/model", num_threads=2))
+    backend = ServingBackend(
+        ServingConfig(
+            model_name="fake/model",
+            num_threads=2,
+            debug_live_rollout=True,
+        )
+    )
 
     assert thread_calls == [2]
     assert backend.actor.model.training is False
+    assert backend.config.debug_live_rollout is True
 
 
 def test_training_backend_checkpoint_round_trip_and_sync(
@@ -92,4 +99,3 @@ def test_training_backend_checkpoint_round_trip_and_sync(
         training_backend.actor.model.logit_bias,
         serving_backend.actor.model.logit_bias,
     )
-

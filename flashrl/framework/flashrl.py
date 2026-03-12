@@ -70,6 +70,7 @@ MODEL_SECTION_FIELDS = {
     "load_in_8bit",
     "trust_remote_code",
     "num_threads",
+    "debug_live_rollout",
     "metadata",
 }
 

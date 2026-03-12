@@ -170,9 +170,13 @@ class GRPOTrainer:
         step_started_at = time.perf_counter()
 
         rollout_started_at = time.perf_counter()
-        grouped_prompts, rollouts, prompt_indices, candidate_indices = (
-            self.rollout_generator.generate_grouped(prompts, context.group_size)
-        )
+        self._install_serving_debug(context)
+        try:
+            grouped_prompts, rollouts, prompt_indices, candidate_indices = (
+                self.rollout_generator.generate_grouped(prompts, context.group_size)
+            )
+        finally:
+            self._clear_serving_debug()
         rollout_seconds = time.perf_counter() - rollout_started_at
         prompt_lengths = [len(rollout.prompt_token_ids) for rollout in rollouts]
         response_lengths = [len(rollout.response_token_ids) for rollout in rollouts]
@@ -716,6 +720,42 @@ class GRPOTrainer:
             self.run_logger.log_step_stage(payload)
         if self.metrics_sink is not None:
             self.metrics_sink.observe_stage(stage, latency_seconds)
+
+    def _install_serving_debug(self, context: StepContext) -> None:
+        """Install serving live-rollout debug hooks for the current step when enabled."""
+        config = getattr(self.serving_backend, "config", None)
+        if not getattr(config, "debug_live_rollout", False):
+            return
+        if not hasattr(self.serving_backend, "set_live_rollout_debug"):
+            return
+        self.serving_backend.set_live_rollout_debug(
+            callback=self._handle_serving_debug_event,
+            context=context.payload(),
+        )
+
+    def _clear_serving_debug(self) -> None:
+        """Clear serving live-rollout debug hooks after the rollout stage completes."""
+        if hasattr(self.serving_backend, "clear_live_rollout_debug"):
+            self.serving_backend.clear_live_rollout_debug()
+
+    def _handle_serving_debug_event(self, kind: str, payload: dict[str, Any]) -> None:
+        """Dispatch actor-level live-rollout debug events to logging and metrics."""
+        if kind == "start":
+            if self.run_logger is not None:
+                self.run_logger.log_serving_debug_start(payload)
+            return
+        if kind == "chunk":
+            if self.run_logger is not None:
+                self.run_logger.log_serving_debug_chunk(payload)
+            return
+        if kind == "done":
+            if self.run_logger is not None:
+                self.run_logger.log_serving_debug_done(payload)
+            if self.metrics_sink is not None:
+                self.metrics_sink.observe_serving_debug(
+                    ttft_seconds=float(payload["ttft_seconds"]),
+                    tpot_seconds=float(payload["tpot_seconds"]),
+                )
 
     def _compute_advantages(
         self,

@@ -47,6 +47,8 @@ class ModelConfig(BaseConfig):
 class ServingConfig(ModelConfig):
     """Configuration for the serving model copy."""
 
+    debug_live_rollout: bool = False
+
 
 class RolloutConfig(BaseConfig):
     """Configuration for rollout generation."""
@@ -88,7 +90,7 @@ class LoggingConfig(BaseConfig):
     """Configuration for run logging and terminal UX."""
 
     level: str = "INFO"
-    log_dir: str | Path = ".flashrl-runs"
+    log_dir: str | Path = "logs"
     log_every_steps: int = 1
     sample_every_steps: int = 10
     console: bool = True
@@ -148,6 +150,7 @@ class ServingSectionConfig(CommonConfig):
     """YAML serving section: serving model-copy settings only."""
 
     num_threads: int | None = None
+    debug_live_rollout: bool = False
 
 
 class RunConfig(BaseConfig):

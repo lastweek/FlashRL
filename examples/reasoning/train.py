@@ -31,11 +31,14 @@ REASONING_PROMPTS = [
     "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 9 × 6?",
 ]
 
+NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
+REASON_BLOCK_PATTERN = re.compile(r"<reason>(.*?)</reason>", re.IGNORECASE | re.DOTALL)
+
 
 def reasoning_rollout_fn(
     prompts: list[Prompt],
     actor,
-    ) -> list[RolloutOutput]:
+) -> list[RolloutOutput]:
     """Generate one reasoning rollout per prompt with the actor model."""
     samples = actor.generate_batch([prompt.text for prompt in prompts])
     rollouts: list[RolloutOutput] = []
@@ -47,6 +50,7 @@ def reasoning_rollout_fn(
                 prompt_token_ids=sample.prompt_token_ids,
                 response_token_ids=sample.response_token_ids,
                 response_token_logprobs=sample.response_token_logprobs,
+                metadata=dict(sample.metadata),
                 conversation=Conversation(
                     messages=[
                         Message(role="user", content=prompt.text),
@@ -58,29 +62,156 @@ def reasoning_rollout_fn(
     return rollouts
 
 
+def _normalize_number(value: float) -> int | float:
+    """Return integral values as ints so metadata stays readable."""
+    if float(value).is_integer():
+        return int(value)
+    return float(value)
+
+
+def _parse_number(text: str) -> int | float:
+    """Parse one numeric literal into an int or float."""
+    return _normalize_number(float(text))
+
+
+def _extract_question_text(prompt_text: str) -> str:
+    """Extract the arithmetic question from the full user prompt."""
+    _, separator, question = prompt_text.rpartition("Question:")
+    if separator:
+        return question.strip()
+    return prompt_text.strip()
+
+
+def _parse_expected_answer(prompt_text: str) -> int | float | None:
+    """Parse the expected arithmetic answer from the committed prompt patterns."""
+    question = _extract_question_text(prompt_text)
+    matchers = [
+        (
+            re.compile(r"What is (\d+) \+ (\d+) \+ (\d+)\?$"),
+            lambda match: int(match.group(1)) + int(match.group(2)) + int(match.group(3)),
+        ),
+        (
+            re.compile(r"What is (\d+) \+ (\d+)\?$"),
+            lambda match: int(match.group(1)) + int(match.group(2)),
+        ),
+        (
+            re.compile(r"What is (\d+) (?:×|x|\*) (\d+)\?$"),
+            lambda match: int(match.group(1)) * int(match.group(2)),
+        ),
+        (
+            re.compile(r"What is (\d+) - (\d+)\?$"),
+            lambda match: int(match.group(1)) - int(match.group(2)),
+        ),
+        (
+            re.compile(r"If I divide (\d+) by (\d+), what do I get\?$"),
+            lambda match: _normalize_number(int(match.group(1)) / int(match.group(2))),
+        ),
+        (
+            re.compile(r"If I have (\d+) apples and get (\d+) more, how many do I have\?$"),
+            lambda match: int(match.group(1)) + int(match.group(2)),
+        ),
+        (
+            re.compile(r"If I have (\d+) items and give away (\d+), how many remain\?$"),
+            lambda match: int(match.group(1)) - int(match.group(2)),
+        ),
+    ]
+
+    for pattern, resolver in matchers:
+        match = pattern.fullmatch(question)
+        if match is not None:
+            return resolver(match)
+    return None
+
+
+def _extract_predicted_answer(response_text: str) -> int | float | None:
+    """Extract the model's predicted final numeric answer deterministically."""
+    lines = [line.strip() for line in response_text.splitlines() if line.strip()]
+    candidates: list[str] = []
+    if lines:
+        candidates.append(lines[-1])
+
+    sentences = [
+        sentence.strip()
+        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(lines or [response_text]))
+        if sentence.strip()
+    ]
+    if sentences:
+        candidates.append(sentences[-1])
+
+    for candidate in candidates:
+        numbers = NUMBER_PATTERN.findall(candidate)
+        if numbers:
+            return _parse_number(numbers[-1])
+
+    numbers = NUMBER_PATTERN.findall(response_text)
+    if numbers:
+        return _parse_number(numbers[-1])
+    return None
+
+
+def _prompt_text_from_rollout(rollout: RolloutOutput) -> str:
+    """Recover the original user prompt text from the rollout conversation."""
+    last_user_message = rollout.conversation.last_user_message()
+    if last_user_message is not None:
+        return last_user_message.content
+    for message in rollout.conversation.messages:
+        if message.role == "user":
+            return message.content
+    return ""
+
+
+def _numbers_equal(left: int | float | None, right: int | float | None) -> bool:
+    """Compare numeric answers with a small float tolerance."""
+    if left is None or right is None:
+        return False
+    return abs(float(left) - float(right)) < 1e-9
+
+
 def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
-    """Reward correct reasoning-tag structure and detailed reasoning text."""
+    """Reward reasoning structure heavily and arithmetic correctness second."""
     text = rollout.text
-    reward = 0.0
+    prompt_text = _prompt_text_from_rollout(rollout)
+    expected_answer = _parse_expected_answer(prompt_text)
+    predicted_answer = _extract_predicted_answer(text)
 
-    has_open_tag = "<reason>" in text
-    has_close_tag = "</reason>" in text
-    has_reason = has_open_tag and has_close_tag
+    has_open_tag = "<reason>" in text.lower()
+    has_close_tag = "</reason>" in text.lower()
+    reason_match = REASON_BLOCK_PATTERN.search(text)
+    reason_content = reason_match.group(1).strip() if reason_match is not None else ""
+    has_reason_content = bool(reason_content)
 
-    if has_reason:
-        match = re.search(r"<reason>(.*?)</reason>", text, re.DOTALL)
-        if match:
-            reason_content = match.group(1).strip()
-            reward = min(len(reason_content) / 50.0, 10.0)
-        else:
-            reward = 0.5
+    structure_score = 0.0
+    if has_open_tag:
+        structure_score += 0.20
+    if has_close_tag:
+        structure_score += 0.20
+    if has_reason_content:
+        structure_score += 0.20
+    if has_reason_content and len(reason_content.split()) >= 8:
+        structure_score += 0.10
+
+    correctness_score = 0.0
+    if predicted_answer is not None:
+        correctness_score += 0.05
+    if _numbers_equal(predicted_answer, expected_answer):
+        correctness_score += 0.25
+
+    reward = min(structure_score + correctness_score, 1.0)
+    is_correct = _numbers_equal(predicted_answer, expected_answer)
 
     return RewardOutput(
         reward=reward,
         metadata={
-            "has_reason": has_reason,
+            "expected_answer": expected_answer,
+            "predicted_answer": predicted_answer,
             "has_open_tag": has_open_tag,
             "has_close_tag": has_close_tag,
+            "has_reason_content": has_reason_content,
+            "reason_content_length": len(reason_content),
+            "structure_score": structure_score,
+            "correctness_score": correctness_score,
+            "answer_parseable": predicted_answer is not None,
+            "is_correct": is_correct,
         },
     )
 

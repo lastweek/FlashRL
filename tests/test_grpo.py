@@ -7,15 +7,17 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from examples.reasoning.train import REASONING_PROMPTS, reasoning_reward_fn
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
-from flashrl.framework.data_models import Prompt, RewardOutput
+from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.trainer.grpo import GRPOTrainer
 from tests.conftest import (
     TinyReferenceModel,
+    TinyActor,
     TinyServingBackend,
     TinyTrainingBackend,
     make_rollout_fn,
@@ -32,10 +34,11 @@ def build_trainer(
     kl_coefficient: float = 0.0,
     rollout_fn=None,
     reference=None,
+    serving_backend=None,
 ) -> GRPOTrainer:
     """Build a small offline GRPO trainer for algorithm tests."""
     training_backend = TinyTrainingBackend(learning_rate=1e-2)
-    serving_backend = TinyServingBackend()
+    serving_backend = serving_backend or TinyServingBackend()
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn or make_rollout_fn(response_suffix="grpo", repeat=2),
         actor=serving_backend.actor,
@@ -252,6 +255,79 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
         )
 
 
+def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
+    """Flat rewards with beta=0 should collapse to zero policy and total loss."""
+    trainer = build_trainer(batch_size=2, group_size=2, kl_coefficient=0.0)
+    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+    rollouts = make_rollout_fn(response_suffix="zero", repeat=2)(
+        prompts,
+        trainer.serving_backend.actor,
+    )
+
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
+        SimpleNamespace(rollouts=rollouts),
+        trainer.training_backend.actor,
+        trainer.training_backend.actor.device,
+    )
+    actor_logits = trainer.training_backend.actor.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits
+
+    loss, policy_loss, kl_divergence, _ = trainer._assemble_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=None,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=torch.zeros(2, dtype=torch.float32),
+        kl_coefficient=0.0,
+        clip_ratio=trainer.grpo_config.clip_ratio,
+    )
+
+    assert policy_loss.item() == pytest.approx(0.0)
+    assert kl_divergence.item() == pytest.approx(0.0)
+    assert loss.item() == pytest.approx(0.0)
+
+
+def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
+    """The example reward should separate GRPO candidates within one prompt group."""
+    trainer = build_trainer(batch_size=4, group_size=4)
+    prompt_text = REASONING_PROMPTS[0]
+    responses = [
+        "<reason>Add 15 and 27 to get 42 in the final line.</reason>\n42",
+        "<reason>Add 15 and 27 to get 41 in the final line.</reason>\n41",
+        "42",
+        "<reason>Add 15 and 27 and stop early\n42",
+    ]
+    rewards = [
+        reasoning_reward_fn(
+            RolloutOutput(
+                text=response,
+                log_prob=-0.1,
+                prompt_token_ids=[1, 2, 3],
+                response_token_ids=[4, 5, 6],
+                response_token_logprobs=[-0.1, -0.1, -0.1],
+                conversation=Conversation(
+                    messages=[
+                        Message(role="user", content=prompt_text),
+                        Message(role="assistant", content=response),
+                    ]
+                ),
+            )
+        )
+        for response in responses
+    ]
+
+    reward_values = [reward.reward for reward in rewards]
+    advantages = trainer._compute_advantages(rewards, prompt_count=1, group_size=4)
+
+    assert any(value > 0.0 for value in reward_values)
+    assert any(abs(float(value)) > 1e-6 for value in advantages.tolist())
+    assert sum(advantages.tolist()) == pytest.approx(0.0, abs=1e-6)
+
+
 def test_grpo_prepare_inputs_reuses_rollout_token_ids_without_tokenizer_calls() -> None:
     """Input preparation should use rollout token ids directly and avoid tokenizer calls."""
     trainer = build_trainer(batch_size=4, group_size=2)
@@ -271,6 +347,49 @@ def test_grpo_prepare_inputs_reuses_rollout_token_ids_without_tokenizer_calls() 
     assert attention_mask.sum(dim=1).tolist() == full_lengths
     assert prompt_lengths.tolist() == [len(rollout.prompt_token_ids) for rollout in rollouts]
     assert rollout_response_log_probs == [rollout.response_token_logprobs for rollout in rollouts]
+
+
+def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
+    """Serving live-rollout debug hooks should be installed for rollout and cleared afterward."""
+
+    class DebugActor(TinyActor):
+        def __init__(self) -> None:
+            super().__init__(bias_shift=0.1)
+            self.debug_events: list[tuple[str, object]] = []
+
+        def set_live_rollout_debug(self, callback, context) -> None:
+            self.debug_events.append(("set", dict(context)))
+
+        def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+            self.debug_events.append(("candidate", candidate_index))
+
+        def clear_live_rollout_debug(self) -> None:
+            self.debug_events.append(("clear", None))
+
+    class DebugServingBackend:
+        def __init__(self) -> None:
+            self.config = SimpleNamespace(debug_live_rollout=True)
+            self.actor = DebugActor()
+
+        def set_live_rollout_debug(self, callback, context) -> None:
+            self.actor.set_live_rollout_debug(callback, context)
+
+        def clear_live_rollout_debug(self) -> None:
+            self.actor.clear_live_rollout_debug()
+
+    serving_backend = DebugServingBackend()
+    trainer = build_trainer(
+        batch_size=2,
+        group_size=2,
+        serving_backend=serving_backend,
+    )
+
+    trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
+
+    assert serving_backend.actor.debug_events[0][0] == "set"
+    assert ("candidate", 0) in serving_backend.actor.debug_events
+    assert ("candidate", 1) in serving_backend.actor.debug_events
+    assert serving_backend.actor.debug_events[-1] == ("clear", None)
 
 
 def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> None:

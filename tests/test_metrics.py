@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 import shutil
@@ -18,6 +19,7 @@ import yaml
 
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.metrics as metrics_module
+from examples.reasoning import train as reasoning_example
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.metrics import PrometheusMetricsSink
@@ -98,6 +100,9 @@ class FakeActor:
         self.model = FakeCausalLM(self.tokenizer.vocab_size, bias_shift=bias_shift)
         self.generation_defaults: dict[str, object] = {}
         self._batch_call_index = 0
+        self._live_rollout_debug_callback = None
+        self._live_rollout_debug_context: dict[str, object] = {}
+        self._live_rollout_candidate_index: int | None = None
 
     def generate(self, prompts: list[str], **kwargs) -> list[str]:
         return [sample.text for sample in self.generate_batch(prompts, **kwargs)]
@@ -107,7 +112,7 @@ class FakeActor:
         call_index = self._batch_call_index
         self._batch_call_index += 1
         outputs = []
-        for prompt in prompts:
+        for prompt_index, prompt in enumerate(prompts):
             prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
             response = f"generated::{prompt}::{call_index}"
             response_token_ids = self.tokenizer._encode(
@@ -118,6 +123,29 @@ class FakeActor:
                 -0.1 - 0.01 * call_index - 0.001 * token_index
                 for token_index in range(len(response_token_ids))
             ]
+            metadata = {}
+            if self._live_rollout_debug_callback is not None:
+                debug_payload = {
+                    **self._live_rollout_debug_context,
+                    "prompt_index": prompt_index,
+                    "candidate_index": self._live_rollout_candidate_index or 0,
+                }
+                self._live_rollout_debug_callback("start", debug_payload)
+                self._live_rollout_debug_callback("chunk", {**debug_payload, "text": response})
+                metadata = {
+                    "ttft_seconds": 0.1,
+                    "tpot_seconds": 0.02,
+                    "generation_seconds": 0.16,
+                    "response_token_count": len(response_token_ids),
+                }
+                self._live_rollout_debug_callback(
+                    "done",
+                    {
+                        **debug_payload,
+                        **metadata,
+                        "response_preview": response,
+                    },
+                )
             outputs.append(
                 SimpleNamespace(
                     text=response,
@@ -125,6 +153,7 @@ class FakeActor:
                     response_token_ids=response_token_ids,
                     response_token_logprobs=response_token_logprobs,
                     log_prob=float(sum(response_token_logprobs)),
+                    metadata=metadata,
                 )
             )
         return outputs
@@ -152,6 +181,7 @@ class FakeActor:
                         response_token_ids=response_token_ids,
                         response_token_logprobs=response_token_logprobs,
                         log_prob=float(sum(response_token_logprobs)),
+                        metadata={},
                     )
                 )
             grouped_outputs.append(prompt_outputs)
@@ -165,6 +195,18 @@ class FakeActor:
 
     def eval(self) -> None:
         self.model.eval()
+
+    def set_live_rollout_debug(self, callback, context) -> None:
+        self._live_rollout_debug_callback = callback
+        self._live_rollout_debug_context = dict(context)
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        self._live_rollout_candidate_index = candidate_index
+
+    def clear_live_rollout_debug(self) -> None:
+        self._live_rollout_debug_callback = None
+        self._live_rollout_debug_context = {}
+        self._live_rollout_candidate_index = None
 
 
 class FakeTrainingBackend:
@@ -195,8 +237,17 @@ class FakeServingBackend:
 
     def __init__(self, config) -> None:
         type(self).last_config = config
+        self.config = config
         self.actor = FakeActor(bias_shift=0.1)
         self.actor.eval()
+
+    def set_live_rollout_debug(self, callback, context) -> None:
+        if not getattr(self.config, "debug_live_rollout", False):
+            return
+        self.actor.set_live_rollout_debug(callback, context)
+
+    def clear_live_rollout_debug(self) -> None:
+        self.actor.clear_live_rollout_debug()
 
 
 class FakeReferenceModel:
@@ -272,6 +323,15 @@ def sample_value(registry, name: str) -> tuple[float, dict[str, str]]:
             if sample.name == name:
                 return float(sample.value), dict(sample.labels)
     raise AssertionError(f"Metric sample not found: {name}")
+
+
+def read_events(run_dir: Path) -> list[dict]:
+    """Load structured run events from events.jsonl."""
+    return [
+        json.loads(line)
+        for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -362,6 +422,7 @@ def create_yaml_hook_module(tmp_path: Path) -> str:
                             prompt_token_ids=sample.prompt_token_ids,
                             response_token_ids=sample.response_token_ids,
                             response_token_logprobs=sample.response_token_logprobs,
+                            metadata=dict(getattr(sample, "metadata", {})),
                             conversation=Conversation(
                                 messages=[
                                     Message(role="user", content=prompt.text),
@@ -390,6 +451,7 @@ def write_yaml_run_config(
     metrics_enabled: bool = False,
     common_dtype: str | None = None,
     serving_num_threads: int = 3,
+    serving_debug_live_rollout: bool = False,
     training_num_threads: int | None = 1,
     group_size: int = 2,
     clip_ratio: float = 0.2,
@@ -405,9 +467,10 @@ def write_yaml_run_config(
     if training_num_threads is not None:
         training_section["num_threads"] = training_num_threads
 
-    serving_section: dict[str, int] = {}
+    serving_section: dict[str, object] = {}
     if serving_num_threads is not None:
         serving_section["num_threads"] = serving_num_threads
+    serving_section["debug_live_rollout"] = serving_debug_live_rollout
 
     common_section: dict[str, object] = {"model_name": "fake/model"}
     if common_dtype is not None:
@@ -477,6 +540,7 @@ def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> N
         kl_mean=0.25,
         step_duration_seconds=2.0,
     )
+    sink.observe_serving_debug(ttft_seconds=0.12, tpot_seconds=0.03)
     sink.push()
 
     assert {metric.name for metric in sink.registry.collect()} == {
@@ -486,6 +550,8 @@ def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> N
         "flashrl_rollout_latency_seconds",
         "flashrl_reward_latency_seconds",
         "flashrl_step_duration_seconds",
+        "flashrl_serving_ttft_seconds",
+        "flashrl_serving_tpot_seconds",
     }
     assert sample_value(sink.registry, "flashrl_train_loss")[0] == pytest.approx(0.75)
     assert sample_value(sink.registry, "flashrl_reward_mean")[0] == pytest.approx(1.5)
@@ -494,6 +560,8 @@ def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> N
     assert sample_value(sink.registry, "flashrl_reward_latency_seconds")[0] == pytest.approx(0.5)
     step_duration, labels = sample_value(sink.registry, "flashrl_step_duration_seconds")
     assert step_duration == pytest.approx(2.0)
+    assert sample_value(sink.registry, "flashrl_serving_ttft_seconds")[0] == pytest.approx(0.12)
+    assert sample_value(sink.registry, "flashrl_serving_tpot_seconds")[0] == pytest.approx(0.03)
     assert labels == {
         "model": "fake/model",
         "algorithm": "grpo",
@@ -999,6 +1067,48 @@ def test_flashrl_train_requires_dataset_without_yaml_loader(
     assert trainer._run_logger.run_dir.exists()
 
 
+def test_flashrl_yaml_serving_debug_live_rollout_wires_events_artifacts_and_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Serving debug YAML should reach runtime and emit debug events, artifacts, and metrics."""
+    patch_backends(monkeypatch)
+    monkeypatch.setattr(metrics_module, "push_to_gateway", lambda *args, **kwargs: None)
+    hook_module = create_yaml_hook_module(tmp_path)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    config_path = write_yaml_run_config(
+        tmp_path,
+        hook_module=hook_module,
+        log_dir=tmp_path / "debug-logs",
+        metrics_enabled=True,
+        serving_debug_live_rollout=True,
+    )
+
+    trainer = FlashRL.from_yaml(config_path)
+    assert trainer.serving_config.debug_live_rollout is True
+
+    trainer.train()
+
+    assert trainer._run_logger is not None
+    events = read_events(trainer._run_logger.run_dir)
+    rollout_records = [
+        json.loads(line)
+        for line in trainer._run_logger.rollouts_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    assert any(event["event"] == "serving_debug" for event in events)
+    assert any(
+        "ttft_seconds" in candidate["rollout"]["metadata"]
+        and "tpot_seconds" in candidate["rollout"]["metadata"]
+        for record in rollout_records
+        for candidate in record["candidates"]
+    )
+    assert trainer._metrics_sink is not None
+    assert sample_value(trainer._metrics_sink.registry, "flashrl_serving_ttft_seconds")[0] == pytest.approx(0.1)
+    assert sample_value(trainer._metrics_sink.registry, "flashrl_serving_tpot_seconds")[0] == pytest.approx(0.02)
+
+
 def test_flashrl_cli_main_runs_yaml_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1026,6 +1136,44 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     patch_backends(monkeypatch)
     monkeypatch.setattr(metrics_module, "push_to_gateway", lambda *args, **kwargs: None)
 
+    def scripted_generate_batch(self, prompts: list[str], **kwargs):
+        del kwargs
+        outputs = []
+        for prompt in prompts:
+            expected = reasoning_example._parse_expected_answer(prompt)
+            assert expected is not None
+            prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
+            response_templates = [
+                f"<reason>Work through the arithmetic carefully and conclude the answer is {expected}.</reason>\n{expected}",
+                f"<reason>Work through the arithmetic carefully but conclude the answer is {int(expected) - 1}.</reason>\n{int(expected) - 1}",
+                f"{expected}",
+                f"<reason>Work through the arithmetic carefully and conclude the answer is {expected}\n{expected}",
+            ]
+            call_index = self._batch_call_index % len(response_templates)
+            response = response_templates[call_index]
+            self._batch_call_index += 1
+            response_token_ids = self.tokenizer._encode(
+                response,
+                max_length=self.config.max_length,
+            )[:16]
+            response_token_logprobs = [
+                -0.1 - 0.01 * call_index - 0.001 * token_index
+                for token_index in range(len(response_token_ids))
+            ]
+            outputs.append(
+                SimpleNamespace(
+                    text=response,
+                    prompt_token_ids=prompt_token_ids,
+                    response_token_ids=response_token_ids,
+                    response_token_logprobs=response_token_logprobs,
+                    log_prob=float(sum(response_token_logprobs)),
+                    metadata={},
+                )
+            )
+        return outputs
+
+    monkeypatch.setattr(FakeActor, "generate_batch", scripted_generate_batch)
+
     trainer = FlashRL.from_yaml("examples/reasoning/config.yaml")
     trainer.logging_config = LoggingConfig(
         log_dir=tmp_path,
@@ -1047,6 +1195,36 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     trainer.train()
 
     assert trainer._run_logger.run_dir.exists()
+    rollout_records = [
+        json.loads(line)
+        for line in trainer._run_logger.rollouts_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    step_done_events = [
+        json.loads(line)
+        for line in trainer._run_logger.events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+
+    reward_values = [
+        candidate["reward"]["value"]
+        for record in rollout_records
+        for candidate in record["candidates"]
+    ]
+    losses = [
+        event["payload"]["loss"]
+        for event in step_done_events
+        if event["event"] == "step_done"
+    ]
+
+    assert any(value > 0.0 for value in reward_values)
+    assert any(abs(loss) > 1e-6 for loss in losses)
+    assert any(
+        "structure_score" in candidate["reward"]["metadata"]
+        and "correctness_score" in candidate["reward"]["metadata"]
+        for record in rollout_records
+        for candidate in record["candidates"]
+    )
 
 
 def test_observability_stack_files_and_docs_exist() -> None:
@@ -1090,7 +1268,8 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "grpo:" in example_yaml
     assert "common:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct\n  num_threads:" not in example_yaml
     assert "training:\n  num_threads: 1" in example_yaml
-    assert "serving:\n  num_threads: 1" in example_yaml
+    assert "serving:\n  num_threads: 1\n  debug_live_rollout: false" in example_yaml
+    assert "debug_live_rollout: false" in docs
 
 
 def test_dev_sh_metrics_commands_and_compose_validation() -> None:

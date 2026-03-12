@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import fcntl
 import json
+import os
 from pathlib import Path
 import re
+import sys
 from typing import Any
 from uuid import uuid4
 
@@ -25,11 +28,38 @@ STAGE_DISPLAY_ORDER = [
     "sync",
 ]
 
+RUN_INDEX_WIDTH = 6
+
 
 def _sanitize_model_name(model_name: str) -> str:
     """Convert a model name into a filesystem-safe slug."""
     slug = re.sub(r"[^A-Za-z0-9]+", "-", model_name).strip("-").lower()
     return slug or "model"
+
+
+def _allocate_run_index(log_dir: Path) -> int:
+    """Allocate the next global run index under the run root."""
+    log_dir.mkdir(parents=True, exist_ok=True)
+    counter_path = log_dir / ".run_counter"
+    counter_path.touch(exist_ok=True)
+
+    with counter_path.open("r+", encoding="utf-8") as handle:
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+        text = handle.read().strip()
+        current = int(text) if text else 0
+        run_index = current + 1
+        handle.seek(0)
+        handle.write(f"{run_index}\n")
+        handle.truncate()
+        handle.flush()
+        os.fsync(handle.fileno())
+        fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+    return run_index
+
+
+def _format_run_index(run_index: int) -> str:
+    """Format a run index with stable zero padding."""
+    return f"{run_index:0{RUN_INDEX_WIDTH}d}"
 
 
 class RunLogger:
@@ -39,12 +69,16 @@ class RunLogger:
         """Initialize the run logger."""
         self.config = config
         self.model_name = model_name
+        self.log_root = Path(config.log_dir)
+        self.run_index = _allocate_run_index(self.log_root)
+        formatted_run_index = _format_run_index(self.run_index)
         self.run_id = (
+            f"{formatted_run_index}-"
             f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
             f"{_sanitize_model_name(model_name)}-"
             f"{uuid4().hex[:8]}"
         )
-        self.run_dir = Path(config.log_dir) / self.run_id
+        self.run_dir = self.log_root / self.run_id
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
         self.console_path = self.run_dir / "console.log"
@@ -60,6 +94,7 @@ class RunLogger:
         self._stage_totals: dict[str, float] = {}
         self._total_batches = 0
         self._current_step_header: int | None = None
+        self._serving_stream_open = False
 
     def start_run(
         self,
@@ -82,6 +117,7 @@ class RunLogger:
 
         payload = {
             "run_id": self.run_id,
+            "run_index": self.run_index,
             "model_name": self.model_name,
             "dataset_size": dataset_size,
             "batch_size": batch_size,
@@ -274,42 +310,117 @@ class RunLogger:
         group_size: int,
         prompt_count: int,
     ) -> None:
-        """Persist one full-fidelity rollout record per sample."""
+        """Persist one full-fidelity grouped rollout record per unique prompt."""
         sample_count = len(prompts)
-        for sample_index, (prompt, rollout, reward, prompt_index, candidate_index) in enumerate(
-            zip(prompts, rollouts, rewards, prompt_indices, candidate_indices, strict=True),
-            start=1,
+        grouped_records: dict[int, dict[str, Any]] = {}
+        for prompt, rollout, reward, prompt_index, candidate_index in zip(
+            prompts,
+            rollouts,
+            rewards,
+            prompt_indices,
+            candidate_indices,
+            strict=True,
         ):
-            record = {
-                "run_id": self.run_id,
-                "step": step,
-                "epoch": epoch,
-                "batch_index": batch_index,
-                "batches_in_epoch": batches_in_epoch,
-                "sample_index": sample_index,
-                "prompt_index": prompt_index,
-                "candidate_index": candidate_index,
-                "group_size": group_size,
-                "prompt_count": prompt_count,
-                "sample_count": sample_count,
-                "prompt": {
-                    "text": prompt.text,
-                    "metadata": self._serialize_for_json(prompt.metadata),
+            record = grouped_records.setdefault(
+                prompt_index,
+                {
+                    "run_id": self.run_id,
+                    "run_index": self.run_index,
+                    "step": step,
+                    "epoch": epoch,
+                    "batch_index": batch_index,
+                    "batches_in_epoch": batches_in_epoch,
+                    "prompt_index": prompt_index,
+                    "group_size": group_size,
+                    "prompt_count": prompt_count,
+                    "sample_count": sample_count,
+                    "prompt": {
+                        "text": prompt.text,
+                        "metadata": self._serialize_for_json(prompt.metadata),
+                    },
+                    "candidates": [],
                 },
-                "rollout": {
-                    "response_text": rollout.text,
-                    "log_prob": rollout.log_prob,
-                    "prompt_token_count": len(getattr(rollout, "prompt_token_ids", [])),
-                    "response_token_count": len(getattr(rollout, "response_token_ids", [])),
-                    "metadata": self._serialize_for_json(rollout.metadata),
-                },
-                "conversation": self._serialize_for_json(rollout.conversation),
-                "reward": {
-                    "value": reward.reward,
-                    "metadata": self._serialize_for_json(reward.metadata),
-                },
-            }
+            )
+            record["candidates"].append(
+                {
+                    "candidate_index": candidate_index,
+                    "rollout": {
+                        "response_text": rollout.text,
+                        "log_prob": rollout.log_prob,
+                        "prompt_token_count": len(getattr(rollout, "prompt_token_ids", [])),
+                        "response_token_count": len(getattr(rollout, "response_token_ids", [])),
+                        "metadata": self._serialize_for_json(rollout.metadata),
+                    },
+                    "conversation": self._serialize_for_json(rollout.conversation),
+                    "reward": {
+                        "value": reward.reward,
+                        "metadata": self._serialize_for_json(reward.metadata),
+                    },
+                }
+            )
+
+        for prompt_index in sorted(grouped_records):
+            record = grouped_records[prompt_index]
+            record["candidates"].sort(key=lambda candidate: int(candidate["candidate_index"]))
             self._emit_rollout_record(record)
+
+    def log_serving_debug_start(self, payload: dict[str, Any]) -> None:
+        """Log the start of one live serving candidate stream."""
+        header = (
+            f"serve step={payload['step']} epoch={payload['epoch']}/{payload['total_epochs']} "
+            f"batch={payload['batch_index']}/{payload['batches_in_epoch']} "
+            f"prompt={int(payload['prompt_index']) + 1}/{payload['prompt_count']} "
+            f"candidate={int(payload['candidate_index']) + 1}/{payload['group_size']}"
+        )
+        self._emit_console(header)
+        if self.config.console:
+            sys.stdout.write("  ")
+            sys.stdout.flush()
+        self._serving_stream_open = True
+
+    def log_serving_debug_chunk(self, payload: dict[str, Any]) -> None:
+        """Write one terminal-only streamed text fragment."""
+        if not self.config.console:
+            return
+        sys.stdout.write(str(payload.get("text", "")))
+        sys.stdout.flush()
+
+    def log_serving_debug_done(self, payload: dict[str, Any]) -> None:
+        """Log the completion of one live serving candidate stream."""
+        if self._serving_stream_open and self.config.console:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+        self._serving_stream_open = False
+
+        event_payload = {
+            key: payload[key]
+            for key in (
+                "step",
+                "epoch",
+                "total_epochs",
+                "batch_index",
+                "batches_in_epoch",
+                "prompt_count",
+                "group_size",
+                "prompt_index",
+                "candidate_index",
+                "ttft_seconds",
+                "tpot_seconds",
+                "generation_seconds",
+                "response_token_count",
+            )
+            if key in payload
+        }
+        event_payload["response_preview"] = self._truncate(str(payload.get("response_preview", "")))
+        self._emit_event("serving_debug", event_payload)
+
+        self._emit_console(
+            "  serve_done "
+            f"ttft={self._format_duration(float(payload['ttft_seconds']))} "
+            f"tpot={self._format_duration(float(payload['tpot_seconds']))} "
+            f"tokens={self._format_compact_scalar(payload['response_token_count'])} "
+            f"total={self._format_duration(float(payload['generation_seconds']))}"
+        )
 
     def log_epoch_summary(self, payload: dict[str, Any]) -> None:
         """Log a summarized view of one epoch."""
@@ -483,7 +594,7 @@ class RunLogger:
         reference_state = "enabled" if reference_enabled else "disabled"
         lines = [
             "FlashRL training run",
-            f"  run      {self.run_id}",
+            f"  run      #{_format_run_index(self.run_index)}  {self.run_id}",
             f"  model    {self.model_name}  device={device} dtype={dtype} cpu={cpu_threads}",
             f"  data     dataset={dataset_size} batch={batch_size} epochs={max_epochs} total_batches={total_batches}",
             f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
@@ -729,6 +840,10 @@ class RunLogger:
         return step == 1 or step % interval == 0
 
     def _emit_console(self, line: str) -> None:
+        if self._serving_stream_open and self.config.console:
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._serving_stream_open = False
         if self.config.console:
             print(line)
         if self.config.file:
@@ -745,6 +860,8 @@ class RunLogger:
         record = {
             "timestamp": datetime.now(timezone.utc).isoformat(timespec="milliseconds"),
             "event": event,
+            "run_id": self.run_id,
+            "run_index": self.run_index,
             "payload": payload,
         }
         with self.events_path.open("a", encoding="utf-8") as handle:

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from threading import Thread
+import time
 from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer
+from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
 
 from flashrl.framework.config import ModelConfig
 from flashrl.framework.models.device import get_device
@@ -22,6 +24,7 @@ class GeneratedSample:
     response_token_ids: list[int]
     response_token_logprobs: list[float]
     log_prob: float
+    metadata: dict[str, Any]
 
 
 class ActorModel:
@@ -46,6 +49,9 @@ class ActorModel:
         self.model.to(self.device)
         self.model.eval()
         self.generation_defaults: dict[str, Any] = {}
+        self._live_rollout_debug_callback: Any = None
+        self._live_rollout_debug_context: dict[str, Any] = {}
+        self._live_rollout_candidate_index: int | None = None
 
         self.tokenizer = AutoTokenizer.from_pretrained(
             config.model_name,
@@ -75,7 +81,18 @@ class ActorModel:
             raise ValueError(f"group_size must be >= 1, got {group_size}")
         if not prompts:
             return []
+        if getattr(self.config, "debug_live_rollout", False):
+            return self._generate_grouped_sequential(prompts, group_size, **kwargs)
 
+        return self._generate_grouped_fast(prompts, group_size, **kwargs)
+
+    def _generate_grouped_fast(
+        self,
+        prompts: list[str],
+        group_size: int,
+        **kwargs: Any,
+    ) -> list[list[GeneratedSample]]:
+        """Generate grouped candidates in the default fast batched path."""
         generation_kwargs = {
             **self.generation_defaults,
             **kwargs,
@@ -132,12 +149,40 @@ class ActorModel:
                             response_token_ids=response_token_ids,
                             response_token_logprobs=response_token_logprobs,
                             log_prob=float(sum(response_token_logprobs)),
+                            metadata={},
                         )
                     )
                 grouped_outputs.append(candidates)
             return grouped_outputs
         finally:
             self.tokenizer.padding_side = original_padding_side
+
+    def _generate_grouped_sequential(
+        self,
+        prompts: list[str],
+        group_size: int,
+        **kwargs: Any,
+    ) -> list[list[GeneratedSample]]:
+        """Generate grouped candidates sequentially for live debug streaming."""
+        grouped_outputs: list[list[GeneratedSample]] = []
+        for prompt_index, prompt in enumerate(prompts):
+            candidates: list[GeneratedSample] = []
+            for candidate_index in range(group_size):
+                effective_candidate_index = (
+                    self._live_rollout_candidate_index
+                    if group_size == 1 and self._live_rollout_candidate_index is not None
+                    else candidate_index
+                )
+                candidates.append(
+                    self._generate_debug_sample(
+                        prompt=prompt,
+                        prompt_index=prompt_index,
+                        candidate_index=effective_candidate_index,
+                        **kwargs,
+                    )
+                )
+            grouped_outputs.append(candidates)
+        return grouped_outputs
 
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
         """Generate text from prompts."""
@@ -146,6 +191,26 @@ class ActorModel:
     def set_generation_defaults(self, **kwargs: Any) -> None:
         """Set default generation kwargs used when rollout code does not pass them explicitly."""
         self.generation_defaults = dict(kwargs)
+
+    def set_live_rollout_debug(
+        self,
+        callback: Any,
+        context: dict[str, Any],
+    ) -> None:
+        """Install a live-rollout debug callback and step-scoped context."""
+        self._live_rollout_debug_callback = callback
+        self._live_rollout_debug_context = dict(context)
+        self._live_rollout_candidate_index = None
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        """Update the current framework-owned candidate index for debug streaming."""
+        self._live_rollout_candidate_index = candidate_index
+
+    def clear_live_rollout_debug(self) -> None:
+        """Clear the current live-rollout debug callback and context."""
+        self._live_rollout_debug_callback = None
+        self._live_rollout_debug_context = {}
+        self._live_rollout_candidate_index = None
 
     def compute_log_probs(
         self,
@@ -214,6 +279,140 @@ class ActorModel:
                 trimmed_logprobs.pop()
 
         return trimmed_token_ids, trimmed_logprobs
+
+    def _generate_debug_sample(
+        self,
+        *,
+        prompt: str,
+        prompt_index: int,
+        candidate_index: int,
+        **kwargs: Any,
+    ) -> GeneratedSample:
+        """Generate one sample with live text streaming and timing capture."""
+        generation_kwargs = {
+            **self.generation_defaults,
+            **kwargs,
+            "num_return_sequences": 1,
+            "return_dict_in_generate": True,
+            "output_scores": True,
+        }
+
+        original_padding_side = self.tokenizer.padding_side
+        self.tokenizer.padding_side = "left"
+        try:
+            inputs = self.tokenizer(
+                [prompt],
+                padding=True,
+                truncation=True,
+                max_length=self.config.max_length,
+                return_tensors="pt",
+            )
+            inputs = {key: value.to(self.device) for key, value in inputs.items()}
+            prompt_token_ids = inputs["input_ids"][0][
+                inputs["attention_mask"][0].to(dtype=torch.bool)
+            ].tolist()
+
+            debug_payload = {
+                **self._live_rollout_debug_context,
+                "prompt_index": prompt_index,
+                "candidate_index": candidate_index,
+            }
+            self._emit_live_rollout_debug("start", debug_payload)
+
+            streamer = TextIteratorStreamer(
+                self.tokenizer,
+                skip_prompt=True,
+                skip_special_tokens=True,
+            )
+            generation_started_at = time.perf_counter()
+            first_text_at: float | None = None
+            outputs_holder: dict[str, Any] = {}
+            error_holder: dict[str, BaseException] = {}
+
+            def run_generate() -> None:
+                try:
+                    with torch.no_grad():
+                        outputs_holder["outputs"] = self.model.generate(
+                            **inputs,
+                            streamer=streamer,
+                            **generation_kwargs,
+                        )
+                except BaseException as exc:  # pragma: no cover - propagated after join
+                    error_holder["error"] = exc
+
+            thread = Thread(target=run_generate, daemon=True)
+            thread.start()
+
+            for fragment in streamer:
+                if not fragment:
+                    continue
+                if first_text_at is None:
+                    first_text_at = time.perf_counter()
+                self._emit_live_rollout_debug(
+                    "chunk",
+                    {
+                        **debug_payload,
+                        "text": fragment,
+                    },
+                )
+
+            thread.join()
+            if "error" in error_holder:
+                raise error_holder["error"]
+
+            outputs = outputs_holder["outputs"]
+            transition_scores = self._transition_scores(outputs)
+            prompt_width = inputs["input_ids"].shape[1]
+            response_tokens = outputs.sequences[:, prompt_width:]
+            response_token_ids, response_token_logprobs = self._trim_generated_response(
+                response_tokens[0].tolist(),
+                transition_scores[0].tolist() if len(transition_scores) else [],
+            )
+            generation_seconds = time.perf_counter() - generation_started_at
+            ttft_seconds = (
+                (first_text_at - generation_started_at)
+                if first_text_at is not None
+                else generation_seconds
+            )
+            if response_token_ids:
+                tpot_seconds = (generation_seconds - ttft_seconds) / max(len(response_token_ids) - 1, 1)
+            else:
+                tpot_seconds = 0.0
+
+            text = self.tokenizer.batch_decode(
+                [response_token_ids],
+                skip_special_tokens=True,
+            )[0]
+            metadata = {
+                "ttft_seconds": float(ttft_seconds),
+                "tpot_seconds": float(tpot_seconds),
+                "generation_seconds": float(generation_seconds),
+                "response_token_count": len(response_token_ids),
+            }
+            self._emit_live_rollout_debug(
+                "done",
+                {
+                    **debug_payload,
+                    **metadata,
+                    "response_preview": text,
+                },
+            )
+            return GeneratedSample(
+                text=text,
+                prompt_token_ids=prompt_token_ids,
+                response_token_ids=response_token_ids,
+                response_token_logprobs=response_token_logprobs,
+                log_prob=float(sum(response_token_logprobs)),
+                metadata=metadata,
+            )
+        finally:
+            self.tokenizer.padding_side = original_padding_side
+
+    def _emit_live_rollout_debug(self, kind: str, payload: dict[str, Any]) -> None:
+        """Emit a live-rollout debug callback event when configured."""
+        if self._live_rollout_debug_callback is None:
+            return
+        self._live_rollout_debug_callback(kind, payload)
 
     def to(self, device: torch.device) -> None:
         """Move model to device."""

@@ -75,6 +75,18 @@ class PrometheusMetricsSink:
             LABEL_NAMES,
             registry=self.registry,
         )
+        self._serving_ttft_seconds = Gauge(
+            "flashrl_serving_ttft_seconds",
+            "Current FlashRL serving time-to-first-token in seconds.",
+            LABEL_NAMES,
+            registry=self.registry,
+        )
+        self._serving_tpot_seconds = Gauge(
+            "flashrl_serving_tpot_seconds",
+            "Current FlashRL serving time-per-output-token in seconds.",
+            LABEL_NAMES,
+            registry=self.registry,
+        )
 
     def observe_stage(self, stage: str, latency_seconds: float) -> None:
         """Update the latency gauges for stages we track in v1."""
@@ -96,6 +108,16 @@ class PrometheusMetricsSink:
         self._reward_mean.labels(**self.labels).set(reward_mean)
         self._kl_mean.labels(**self.labels).set(kl_mean)
         self._step_duration_seconds.labels(**self.labels).set(step_duration_seconds)
+
+    def observe_serving_debug(
+        self,
+        *,
+        ttft_seconds: float,
+        tpot_seconds: float,
+    ) -> None:
+        """Update serving-debug gauges for one completed candidate generation."""
+        self._serving_ttft_seconds.labels(**self.labels).set(ttft_seconds)
+        self._serving_tpot_seconds.labels(**self.labels).set(tpot_seconds)
 
     def push(self) -> None:
         """Push the current registry to Pushgateway on a best-effort basis."""

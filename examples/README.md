@@ -26,6 +26,17 @@ python3 -m examples.reasoning.train
 python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```
 
+**Inspect runs after training:**
+```bash
+open docs/run_viewer.html
+```
+
+In Chrome or Edge, click `Open run folder` and choose the default `logs/`
+folder to inspect run summaries, events, console logs, and grouped GRPO rollouts.
+
+Older `.flashrl-runs/` directories can still be opened manually if you already
+have them.
+
 **What the YAML does:**
 - chooses shared defaults plus separate training and serving settings
 - configures grouped GRPO rollout and optimization
@@ -34,6 +45,7 @@ python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 - wires the rollout, reward, and dataset hooks through Python import strings
 - keeps the public rollout hook sample-oriented: one rollout per input prompt
 - treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
+- supports `serving.debug_live_rollout: true` for slower token-level live serving debug with TTFT/TPOT capture
 
 **Shared defaults with training/serving overrides:**
 ```yaml
@@ -47,6 +59,7 @@ training:
 
 serving:
   num_threads: 1
+  debug_live_rollout: false
 
 grpo:
   group_size: 2

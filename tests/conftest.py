@@ -197,6 +197,7 @@ class TinyActor:
                     response_token_ids=response_token_ids,
                     response_token_logprobs=response_token_logprobs,
                     log_prob=float(sum(response_token_logprobs)),
+                    metadata={},
                 )
             )
         return outputs
@@ -229,6 +230,7 @@ class TinyActor:
                         response_token_ids=response_token_ids,
                         response_token_logprobs=response_token_logprobs,
                         log_prob=float(sum(response_token_logprobs)),
+                        metadata={},
                     )
                 )
             grouped_outputs.append(prompt_outputs)
@@ -242,6 +244,15 @@ class TinyActor:
 
     def eval(self) -> None:
         self.model.eval()
+
+    def set_live_rollout_debug(self, callback: Any, context: dict[str, Any]) -> None:
+        del callback, context
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        del candidate_index
+
+    def clear_live_rollout_debug(self) -> None:
+        return None
 
 
 class TinyTrainingBackend:

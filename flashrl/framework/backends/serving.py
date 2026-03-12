@@ -52,3 +52,19 @@ class ServingBackend:
     ) -> list[list[Any]]:
         """Generate grouped candidates from prompts."""
         return self.actor.generate_grouped(prompts, group_size, **kwargs)
+
+    def set_live_rollout_debug(self, callback: Any, context: dict[str, Any]) -> None:
+        """Install a serving-side live-rollout debug callback when enabled."""
+        if not getattr(self.config, "debug_live_rollout", False):
+            return
+        self.actor.set_live_rollout_debug(callback, context)
+
+    def set_live_rollout_candidate_index(self, candidate_index: int | None) -> None:
+        """Update the current framework-owned candidate index for debug streaming."""
+        if not getattr(self.config, "debug_live_rollout", False):
+            return
+        self.actor.set_live_rollout_candidate_index(candidate_index)
+
+    def clear_live_rollout_debug(self) -> None:
+        """Clear any serving-side live-rollout debug hooks."""
+        self.actor.clear_live_rollout_debug()
