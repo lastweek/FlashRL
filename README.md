@@ -15,6 +15,9 @@ python3 -m pytest tests/ -v
 
 # Test imports
 python3 -c "from flashrl.framework import FlashRL, RunConfig"
+
+# Browser-based viewer tests (one-time)
+python3 -m playwright install chromium
 ```
 
 ### Project Structure
@@ -65,13 +68,14 @@ FlashRL writes machine-readable per-run artifacts under `logs/` by default:
 - `console.log`
 - `rollouts.jsonl`
 
-To inspect them, open the static viewer in Chrome or Edge:
+To inspect them, open the unified static viewer in Chrome or Edge:
 
 ```bash
-open docs/run_viewer.html
+open docs/viewer.html
 ```
 
-Then click `Open run folder` and choose the `logs/` folder.
+Then switch between `Run History` and `Live Runtime` as needed. For run artifacts,
+click `Open run folder` and choose the `logs/` folder.
 
 Older `.flashrl-runs/` directories remain viewable if you already have them.
 

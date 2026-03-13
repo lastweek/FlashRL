@@ -133,6 +133,10 @@ class RunLogger:
         prompts_per_step: int | None = None,
         steps_per_epoch: int | None = None,
         total_planned_steps: int | None = None,
+        serving_backend: str | None = None,
+        serving_device: str | None = None,
+        serving_num_replicas: int | None = None,
+        admin_base_url: str | None = None,
     ) -> None:
         """Log the start of a training run."""
         self._total_batches = total_batches
@@ -163,6 +167,10 @@ class RunLogger:
             "planned_completions_per_step": batch_size,
             "steps_per_epoch": steps_per_epoch,
             "total_planned_steps": total_planned_steps,
+            "serving_backend": serving_backend,
+            "serving_device": serving_device,
+            "serving_num_replicas": serving_num_replicas,
+            "admin_base_url": admin_base_url,
             "run_dir": str(self.run_dir),
         }
         self._emit_event("run_started", payload)
@@ -185,6 +193,10 @@ class RunLogger:
                     prompts_per_step=prompts_per_step,
                     steps_per_epoch=steps_per_epoch,
                     total_planned_steps=total_planned_steps,
+                    serving_backend=serving_backend,
+                    serving_device=serving_device,
+                    serving_num_replicas=serving_num_replicas,
+                    admin_base_url=admin_base_url,
                 )
             )
             return
@@ -200,6 +212,15 @@ class RunLogger:
         self._emit_console(
             f"  runtime={runtime_shape} reference={reference_state} reference_device={reference_device}"
         )
+        serving_line = self._format_verbose_serving_line(
+            serving_backend=serving_backend,
+            serving_device=serving_device,
+            serving_num_replicas=serving_num_replicas,
+        )
+        if serving_line is not None:
+            self._emit_console(serving_line)
+        if admin_base_url is not None:
+            self._emit_console(f"  admin={admin_base_url}")
         if group_size is not None:
             line = f"  grpo=completions_per_prompt:{group_size}"
             if clip_ratio is not None:
@@ -666,6 +687,10 @@ class RunLogger:
         prompts_per_step: int | None,
         steps_per_epoch: int | None,
         total_planned_steps: int | None,
+        serving_backend: str | None,
+        serving_device: str | None,
+        serving_num_replicas: int | None,
+        admin_base_url: str | None,
     ) -> list[str]:
         reference_state = "enabled" if reference_enabled else "disabled"
         lines = [
@@ -675,6 +700,15 @@ class RunLogger:
             f"  data     dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}",
             f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
         ]
+        serving_line = self._format_compact_serving_line(
+            serving_backend=serving_backend,
+            serving_device=serving_device,
+            serving_num_replicas=serving_num_replicas,
+        )
+        if serving_line is not None:
+            lines.append(serving_line)
+        if admin_base_url is not None:
+            lines.append(f"  admin    {admin_base_url}")
         if group_size is not None:
             grpo_line = f"  grpo     completions_per_prompt={group_size}"
             if clip_ratio is not None:
@@ -694,6 +728,34 @@ class RunLogger:
             )
         lines.append(f"  logs     {self.run_dir}")
         return lines
+
+    def _format_compact_serving_line(
+        self,
+        *,
+        serving_backend: str | None,
+        serving_device: str | None,
+        serving_num_replicas: int | None,
+    ) -> str | None:
+        if serving_backend is None or serving_device is None:
+            return None
+        line = f"  serving  backend={serving_backend}  device={serving_device}"
+        if serving_backend == "vllm" and serving_num_replicas is not None:
+            line += f"  replicas={serving_num_replicas}"
+        return line
+
+    def _format_verbose_serving_line(
+        self,
+        *,
+        serving_backend: str | None,
+        serving_device: str | None,
+        serving_num_replicas: int | None,
+    ) -> str | None:
+        if serving_backend is None or serving_device is None:
+            return None
+        line = f"  serving backend={serving_backend} device={serving_device}"
+        if serving_backend == "vllm" and serving_num_replicas is not None:
+            line += f" replicas={serving_num_replicas}"
+        return line
 
     def _format_compact_load_line(self, component: str, metadata: dict[str, Any]) -> str:
         device = metadata.get("device", "unknown")
@@ -1089,7 +1151,10 @@ class RunLogger:
             label, value = line.split(": ", 1)
             return f"{self._color(label + ':', 'meta_label')} {value}"
 
-        compact_label_match = re.match(r"^(  )(run|model|data|runtime|grpo|logs)(\s+)(.*)$", line)
+        compact_label_match = re.match(
+            r"^(  )(run|model|data|runtime|serving|admin|grpo|mapping|progress|logs)(\s+)(.*)$",
+            line,
+        )
         if compact_label_match:
             indent, label, spacing, value = compact_label_match.groups()
             return f"{indent}{self._color(label, 'meta_label')}{spacing}{value}"

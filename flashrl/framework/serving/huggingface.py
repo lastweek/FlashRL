@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from typing import Callable
 from typing import Any
 
 from flashrl.framework.config import ServingConfig
@@ -13,7 +14,12 @@ from flashrl.framework.serving.base import ServingBackend
 class HuggingFaceServingBackend(ServingBackend):
     """In-process Hugging Face serving backend."""
 
-    def __init__(self, config: ServingConfig) -> None:
+    def __init__(
+        self,
+        config: ServingConfig,
+        startup_logger: Callable[[str], None] | None = None,
+    ) -> None:
+        del startup_logger
         self.config = config
 
         # Set CPU thread limit before loading model.

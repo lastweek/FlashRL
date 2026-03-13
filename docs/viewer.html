@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>FlashRL Run Viewer</title>
+  <title>FlashRL Viewer</title>
   <style>
     :root {
       color-scheme: light;
@@ -15,11 +15,15 @@
       --muted: #5b6570;
       --accent: #b14d2c;
       --accent-soft: #f4dfd6;
+      --accent-deep: #8d3517;
+      --live-accent: #215f53;
+      --live-soft: #dcefe7;
       --code: #101820;
       --code-text: #f8fafc;
       --success: #2d6a4f;
       --warn: #b45309;
       --error: #b42318;
+      --shadow: 0 16px 32px rgba(25, 33, 38, 0.05);
     }
 
     * {
@@ -29,14 +33,20 @@
     body {
       margin: 0;
       font-family: "SF Pro Text", "Segoe UI", sans-serif;
-      background: radial-gradient(circle at top, #fbf8f1 0%, var(--bg) 55%);
       color: var(--text);
+      background:
+        radial-gradient(circle at top, rgba(177, 77, 44, 0.08) 0%, transparent 36%),
+        linear-gradient(180deg, #fbf8f1 0%, var(--bg) 68%);
     }
 
     button,
     input,
     select {
       font: inherit;
+    }
+
+    code {
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
     }
 
     .page {
@@ -48,11 +58,11 @@
     .topbar {
       padding: 20px 24px 16px;
       border-bottom: 1px solid rgba(25, 33, 38, 0.08);
-      background: rgba(255, 253, 248, 0.88);
+      background: rgba(255, 253, 248, 0.9);
       backdrop-filter: blur(10px);
       position: sticky;
       top: 0;
-      z-index: 10;
+      z-index: 20;
     }
 
     .topbar-row {
@@ -65,14 +75,19 @@
 
     h1 {
       margin: 0;
-      font-size: 28px;
-      line-height: 1.1;
+      font-size: 30px;
+      line-height: 1.05;
+    }
+
+    h2,
+    h3 {
+      margin: 0;
     }
 
     .subtitle {
-      margin: 6px 0 0;
+      margin: 8px 0 0;
+      max-width: 780px;
       color: var(--muted);
-      max-width: 720px;
     }
 
     .topbar-actions {
@@ -80,16 +95,39 @@
       flex-wrap: wrap;
       gap: 12px;
       align-items: center;
+      justify-content: flex-end;
     }
 
+    .workspace-switch {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 6px;
+      border-radius: 999px;
+      background: rgba(25, 33, 38, 0.06);
+      border: 1px solid rgba(25, 33, 38, 0.08);
+    }
+
+    .workspace-button,
     .primary-button,
     .secondary-button,
-    .tab-button {
+    .run-tab-button {
       border: 1px solid transparent;
       border-radius: 999px;
       padding: 10px 16px;
       cursor: pointer;
       transition: transform 0.15s ease, background 0.15s ease, border-color 0.15s ease;
+    }
+
+    .workspace-button {
+      background: transparent;
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .workspace-button.is-active {
+      background: var(--text);
+      color: white;
     }
 
     .primary-button {
@@ -103,9 +141,12 @@
       border-color: var(--border);
     }
 
+    .workspace-button:hover,
     .primary-button:hover,
     .secondary-button:hover,
-    .tab-button:hover {
+    .run-tab-button:hover,
+    .object-item:hover,
+    .run-button:hover {
       transform: translateY(-1px);
     }
 
@@ -115,22 +156,247 @@
       background: var(--accent-soft);
       color: var(--text);
       font-size: 13px;
-      font-weight: 600;
+      font-weight: 700;
+      max-width: min(48vw, 520px);
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .status-pill.is-success {
+      background: #dff1e7;
+      color: var(--success);
+    }
+
+    .status-pill.is-warn {
+      background: #fff0d8;
+      color: var(--warn);
+    }
+
+    .status-pill.is-error {
+      background: #fde7e4;
+      color: var(--error);
+    }
+
+    .workspace {
+      display: none;
+      padding: 20px 24px 24px;
+    }
+
+    .workspace.is-active {
+      display: block;
+    }
+
+    .workspace-intro {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 18px;
+    }
+
+    .workspace-eyebrow {
+      font-size: 12px;
+      font-weight: 800;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--muted);
+    }
+
+    .workspace-copy {
+      color: var(--muted);
+      max-width: 900px;
+      margin: 0;
+    }
+
+    .toolbar,
+    .sidebar,
+    .content-card,
+    .panel-card,
+    .empty-state {
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      box-shadow: var(--shadow);
+    }
+
+    .toolbar,
+    .content-card,
+    .panel-card,
+    .empty-state {
+      padding: 20px;
+    }
+
+    .toolbar {
+      display: grid;
+      gap: 12px;
+      margin-bottom: 18px;
+    }
+
+    .toolbar-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px;
+      align-items: center;
+    }
+
+    .toolbar input[type="text"],
+    .field input,
+    .field select {
+      width: 100%;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: white;
+      color: var(--text);
+    }
+
+    .toolbar input[type="text"] {
+      flex: 1 1 420px;
+    }
+
+    .muted {
+      color: var(--muted);
+    }
+
+    .summary {
+      display: grid;
+      gap: 12px;
+      grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+      margin-bottom: 18px;
+    }
+
+    .summary-card {
+      padding: 16px;
+      border: 1px solid var(--border);
+      border-radius: 16px;
+      background: var(--panel-2);
+    }
+
+    .summary-card.live {
+      background: linear-gradient(180deg, rgba(33, 95, 83, 0.08), rgba(255, 255, 255, 0.92));
+      border-color: rgba(33, 95, 83, 0.18);
+    }
+
+    .summary-label {
+      font-size: 12px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--muted);
+      margin-bottom: 6px;
+    }
+
+    .summary-value {
+      font-size: 20px;
+      font-weight: 700;
+    }
+
+    .summary-meta {
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+
+    .live-grid {
+      display: grid;
+      gap: 18px;
+      grid-template-columns: minmax(0, 1.45fr) minmax(280px, 0.95fr);
+      margin-bottom: 18px;
+    }
+
+    .panel-heading {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+      margin-bottom: 14px;
+    }
+
+    .panel-title {
+      font-size: 18px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      border-radius: 999px;
+      padding: 4px 10px;
+      background: #edf3ef;
+      color: var(--live-accent);
+      font-size: 12px;
+      font-weight: 700;
+    }
+
+    .pill.bad {
+      background: #f7e8e8;
+      color: var(--error);
+    }
+
+    .pill.warn {
+      background: #fbf1da;
+      color: var(--warn);
+    }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 14px;
+    }
+
+    th,
+    td {
+      text-align: left;
+      padding: 10px 8px;
+      border-bottom: 1px solid rgba(25, 33, 38, 0.08);
+      vertical-align: top;
+    }
+
+    th {
+      color: var(--muted);
+      font-weight: 700;
+    }
+
+    .object-list {
+      display: grid;
+      gap: 10px;
+      max-height: 520px;
+      overflow: auto;
+      padding-right: 2px;
+    }
+
+    .object-item {
+      padding: 12px 14px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: rgba(255, 255, 255, 0.68);
+      cursor: pointer;
+      text-align: left;
+    }
+
+    .object-item.active {
+      border-color: var(--live-accent);
+      background: rgba(33, 95, 83, 0.07);
+    }
+
+    .json-block,
+    .console-output {
+      margin: 0;
+      white-space: pre-wrap;
+      background: var(--code);
+      color: var(--code-text);
+      border-radius: 16px;
+      padding: 16px;
+      overflow: auto;
+      min-height: 280px;
+      font-family: "SFMono-Regular", Menlo, Consolas, monospace;
+      font-size: 12px;
+      line-height: 1.5;
     }
 
     .app-shell {
       display: grid;
       grid-template-columns: 320px minmax(0, 1fr);
       gap: 20px;
-      padding: 20px 24px 24px;
-    }
-
-    .sidebar,
-    .content-card {
-      background: var(--panel);
-      border: 1px solid var(--border);
-      border-radius: 20px;
-      box-shadow: 0 16px 32px rgba(25, 33, 38, 0.05);
     }
 
     .sidebar {
@@ -138,7 +404,7 @@
       display: flex;
       flex-direction: column;
       gap: 14px;
-      min-height: calc(100vh - 120px);
+      min-height: calc(100vh - 220px);
     }
 
     .sidebar h2,
@@ -150,11 +416,7 @@
       color: var(--muted);
     }
 
-    .sidebar-controls {
-      display: grid;
-      gap: 10px;
-    }
-
+    .sidebar-controls,
     .field {
       display: grid;
       gap: 6px;
@@ -166,15 +428,6 @@
       text-transform: uppercase;
       color: var(--muted);
       letter-spacing: 0.05em;
-    }
-
-    .field input,
-    .field select {
-      width: 100%;
-      padding: 10px 12px;
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      background: white;
     }
 
     .run-list {
@@ -221,15 +474,8 @@
       min-width: 0;
     }
 
-    .empty-state,
-    .content-card {
-      padding: 22px;
-    }
-
     .empty-state {
-      background: var(--panel);
-      border: 1px dashed var(--border);
-      border-radius: 20px;
+      border-style: dashed;
       color: var(--muted);
     }
 
@@ -242,8 +488,8 @@
     }
 
     .run-title {
-      margin: 0;
       font-size: 24px;
+      margin: 0;
     }
 
     .run-subtitle {
@@ -261,41 +507,20 @@
       margin-bottom: 20px;
     }
 
-    .summary-card {
-      padding: 14px;
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      background: var(--panel-2);
-    }
-
-    .summary-label {
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-      color: var(--muted);
-      margin-bottom: 6px;
-    }
-
-    .summary-value {
-      font-size: 20px;
-      font-weight: 700;
-    }
-
-    .tab-row {
+    .run-tab-row {
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
       margin-bottom: 18px;
     }
 
-    .tab-button {
+    .run-tab-button {
       background: var(--panel-2);
       border-color: var(--border);
       color: var(--text);
     }
 
-    .tab-button.is-active {
+    .run-tab-button.is-active {
       background: var(--text);
       color: white;
     }
@@ -309,15 +534,20 @@
       display: grid;
     }
 
-    .stack {
+    .stack,
+    .two-column,
+    .detail-list,
+    .stage-table,
+    .event-list,
+    .artifact-list,
+    .rollout-list {
       display: grid;
-      gap: 16px;
+      gap: 10px;
     }
 
     .two-column {
-      display: grid;
-      gap: 16px;
       grid-template-columns: repeat(auto-fit, minmax(280px, 1fr));
+      gap: 16px;
     }
 
     .detail-card {
@@ -325,14 +555,6 @@
       border-radius: 16px;
       padding: 16px;
       background: var(--panel-2);
-    }
-
-    .detail-list,
-    .stage-table,
-    .event-list,
-    .artifact-list {
-      display: grid;
-      gap: 10px;
     }
 
     .detail-row,
@@ -379,23 +601,6 @@
       flex-wrap: wrap;
       gap: 12px;
       align-items: center;
-    }
-
-    .console-output,
-    .json-block {
-      margin: 0;
-      white-space: pre-wrap;
-      background: var(--code);
-      color: var(--code-text);
-      border-radius: 16px;
-      padding: 16px;
-      overflow: auto;
-      min-height: 280px;
-    }
-
-    .rollout-list {
-      display: grid;
-      gap: 16px;
     }
 
     .prompt-card {
@@ -485,7 +690,8 @@
       font-weight: 700;
     }
 
-    @media (max-width: 1080px) {
+    @media (max-width: 1180px) {
+      .live-grid,
       .app-shell {
         grid-template-columns: 1fr;
       }
@@ -501,90 +707,213 @@
     <header class="topbar">
       <div class="topbar-row">
         <div>
-          <h1>FlashRL Run Viewer</h1>
+          <h1>FlashRL Viewer</h1>
           <p class="subtitle">
-            Open this file directly in Chrome or Edge, click <strong>Open run folder</strong>,
-            and inspect run summaries, event timelines, console logs, and grouped GRPO rollouts.
+            One local operational console for live runtimes and finished run artifacts. Connect to a running
+            FlashRL admin endpoint, or open a local <code>logs/</code> directory to inspect timelines,
+            console output, and grouped GRPO rollouts.
           </p>
         </div>
         <div class="topbar-actions">
-          <button class="primary-button" id="open-root-button" type="button">Open run folder</button>
-          <span class="status-pill" id="status-pill">No run directory selected</span>
+          <div class="workspace-switch" role="tablist" aria-label="Viewer workspace">
+            <button
+              class="workspace-button"
+              id="workspace-live-button"
+              type="button"
+              data-workspace="live"
+              role="tab"
+            >Live Runtime</button>
+            <button
+              class="workspace-button"
+              id="workspace-runs-button"
+              type="button"
+              data-workspace="runs"
+              role="tab"
+            >Run History</button>
+          </div>
+          <span class="status-pill" id="status-pill">Choose a workspace to begin</span>
         </div>
       </div>
     </header>
 
-    <div class="app-shell">
-      <aside class="sidebar">
-        <h2>Run List</h2>
-        <div class="sidebar-controls">
-          <div class="field">
-            <label for="run-search">Filter Runs</label>
-            <input id="run-search" type="search" placeholder="Search run id, model, status">
-          </div>
-          <div class="field">
-            <label for="run-sort">Sort</label>
-            <select id="run-sort">
-              <option value="newest">Newest first</option>
-              <option value="oldest">Oldest first</option>
-              <option value="model">Model name</option>
-              <option value="status">Status</option>
-            </select>
-          </div>
+    <section class="workspace" id="workspace-live">
+      <div class="workspace-intro">
+        <div class="workspace-eyebrow">Live Runtime</div>
+        <p class="workspace-copy">
+          Inspect the active FlashRL runtime directly from <code>/admin/v1/objects</code>. The live view
+          prioritizes runtime phase, serving backend state, and managed <code>VLLMInstance</code> health.
+        </p>
+      </div>
+
+      <section class="toolbar">
+        <div class="toolbar-row">
+          <input id="base-url" type="text" placeholder="http://127.0.0.1:8080">
+          <button class="primary-button" id="refresh-button" type="button">Refresh</button>
+          <button class="secondary-button" id="reset-button" type="button">Reset</button>
         </div>
-        <div class="run-list" id="run-list"></div>
-      </aside>
+        <div class="toolbar-row">
+          <label><input id="auto-refresh" type="checkbox" checked> Auto refresh</label>
+          <span class="muted">Reads directly from the FlashRL admin API.</span>
+        </div>
+      </section>
 
-      <main class="main">
-        <section class="empty-state" id="empty-state">
-          <p>
-            Choose the default `logs/` folder, or any older run root, to load available runs. The viewer uses the File System Access API,
-            so Chrome and Edge are the supported browsers for this local workflow.
-          </p>
-          <p class="unsupported" id="unsupported-message" hidden>
-            This browser does not support `showDirectoryPicker`. Use Chrome or Edge for the local viewer.
-          </p>
+      <section class="summary" id="summary"></section>
+
+      <div class="live-grid">
+        <section class="panel-card">
+          <div class="panel-heading">
+            <h2 class="panel-title">Managed VLLM Instances</h2>
+            <span class="pill" id="instance-count">0 instances</span>
+          </div>
+          <table>
+            <thead>
+              <tr>
+                <th>Name</th>
+                <th>Phase</th>
+                <th>PID</th>
+                <th>Port</th>
+                <th>Health</th>
+                <th>Model Source</th>
+                <th>stderr</th>
+              </tr>
+            </thead>
+            <tbody id="vllm-body">
+              <tr><td colspan="7" class="muted">No VLLMInstance objects loaded.</td></tr>
+            </tbody>
+          </table>
         </section>
 
-        <section class="content-card" id="run-content" hidden>
-          <div class="run-header">
-            <div>
-              <h2 class="run-title" id="run-title"></h2>
-              <div class="run-subtitle" id="run-subtitle"></div>
+        <section class="panel-card">
+          <div class="panel-heading">
+            <h2 class="panel-title">Objects</h2>
+            <span class="pill" id="object-count">0 objects</span>
+          </div>
+          <div class="object-list" id="object-list"></div>
+        </section>
+      </div>
+
+      <section class="panel-card">
+        <div class="panel-heading">
+          <h2 class="panel-title">Raw JSON</h2>
+          <span class="muted">Selected object payload</span>
+        </div>
+        <pre class="json-block" id="json-output">{}</pre>
+      </section>
+    </section>
+
+    <section class="workspace" id="workspace-runs">
+      <div class="workspace-intro">
+        <div class="workspace-eyebrow">Run History</div>
+        <p class="workspace-copy">
+          Open a local run root with the File System Access API and inspect <code>events.jsonl</code>,
+          <code>console.log</code>, and <code>rollouts.jsonl</code> without any server dependency.
+        </p>
+      </div>
+
+      <div class="app-shell">
+        <aside class="sidebar">
+          <h2>Run List</h2>
+          <div class="sidebar-controls">
+            <button class="primary-button" id="open-root-button" type="button">Open run folder</button>
+            <div class="field">
+              <label for="run-search">Filter Runs</label>
+              <input id="run-search" type="search" placeholder="Search run id, model, status">
             </div>
-            <div class="artifact-list" id="artifact-list"></div>
+            <div class="field">
+              <label for="run-sort">Sort</label>
+              <select id="run-sort">
+                <option value="newest">Newest first</option>
+                <option value="oldest">Oldest first</option>
+                <option value="model">Model name</option>
+                <option value="status">Status</option>
+              </select>
+            </div>
           </div>
+          <div class="run-list" id="run-list"></div>
+        </aside>
 
-          <div class="summary-grid" id="summary-grid"></div>
+        <main class="main">
+          <section class="empty-state" id="empty-state">
+            <p>
+              Choose the default <code>logs/</code> folder, or any older run root, to load available runs.
+              Chrome and Edge are the supported browsers for the local folder workflow.
+            </p>
+            <p class="unsupported" id="unsupported-message" hidden>
+              This browser does not support <code>showDirectoryPicker</code>. Use Chrome or Edge for the local viewer.
+            </p>
+          </section>
 
-          <div class="tab-row">
-            <button class="tab-button is-active" data-tab="overview" type="button">Overview</button>
-            <button class="tab-button" data-tab="timeline" type="button">Timeline</button>
-            <button class="tab-button" data-tab="console" type="button">Console</button>
-            <button class="tab-button" data-tab="rollouts" type="button">Rollouts</button>
-          </div>
+          <section class="content-card" id="run-content" hidden>
+            <div class="run-header">
+              <div>
+                <h2 class="run-title" id="run-title"></h2>
+                <div class="run-subtitle" id="run-subtitle"></div>
+              </div>
+              <div class="artifact-list" id="artifact-list"></div>
+            </div>
 
-          <section class="panel is-active" id="panel-overview"></section>
-          <section class="panel" id="panel-timeline"></section>
-          <section class="panel" id="panel-console"></section>
-          <section class="panel" id="panel-rollouts"></section>
-        </section>
-      </main>
-    </div>
+            <div class="summary-grid" id="summary-grid"></div>
+
+            <div class="run-tab-row">
+              <button class="run-tab-button is-active" data-tab="overview" type="button">Overview</button>
+              <button class="run-tab-button" data-tab="timeline" type="button">Timeline</button>
+              <button class="run-tab-button" data-tab="console" type="button">Console</button>
+              <button class="run-tab-button" data-tab="rollouts" type="button">Rollouts</button>
+            </div>
+
+            <section class="panel is-active" id="panel-overview"></section>
+            <section class="panel" id="panel-timeline"></section>
+            <section class="panel" id="panel-console"></section>
+            <section class="panel" id="panel-rollouts"></section>
+          </section>
+        </main>
+      </div>
+    </section>
   </div>
 
   <script>
+    const STORAGE_KEYS = {
+      workspace: "flashrl-viewer-workspace",
+      adminBaseUrl: "flashrl-viewer-admin-base-url",
+      runRootName: "flashrl-viewer-run-root-name",
+      selectedRunKey: "flashrl-viewer-run-selected-key",
+    };
+    const POLL_INTERVAL_MS = 2000;
+
     const state = {
-      rootHandle: null,
-      runs: [],
-      selectedKey: null,
-      details: new Map(),
-      activeTab: "overview",
+      workspace: "runs",
+      live: {
+        items: [],
+        selectedObjectKey: null,
+        pollHandle: null,
+      },
+      runs: {
+        rootHandle: null,
+        runs: [],
+        selectedKey: null,
+        details: new Map(),
+        activeTab: "overview",
+      },
     };
 
     const dom = {
-      openRootButton: document.getElementById("open-root-button"),
       statusPill: document.getElementById("status-pill"),
+      workspaceButtons: Array.from(document.querySelectorAll(".workspace-button")),
+      workspaceLive: document.getElementById("workspace-live"),
+      workspaceRuns: document.getElementById("workspace-runs"),
+
+      baseUrl: document.getElementById("base-url"),
+      refreshButton: document.getElementById("refresh-button"),
+      resetButton: document.getElementById("reset-button"),
+      autoRefresh: document.getElementById("auto-refresh"),
+      summary: document.getElementById("summary"),
+      vllmBody: document.getElementById("vllm-body"),
+      objectList: document.getElementById("object-list"),
+      jsonOutput: document.getElementById("json-output"),
+      objectCount: document.getElementById("object-count"),
+      instanceCount: document.getElementById("instance-count"),
+
+      openRootButton: document.getElementById("open-root-button"),
       runSearch: document.getElementById("run-search"),
       runSort: document.getElementById("run-sort"),
       runList: document.getElementById("run-list"),
@@ -599,11 +928,19 @@
       panelTimeline: document.getElementById("panel-timeline"),
       panelConsole: document.getElementById("panel-console"),
       panelRollouts: document.getElementById("panel-rollouts"),
-      tabButtons: Array.from(document.querySelectorAll(".tab-button")),
+      runTabButtons: Array.from(document.querySelectorAll(".run-tab-button")),
     };
 
-    function setStatus(message) {
+    function setStatus(message, tone = "default") {
       dom.statusPill.textContent = message;
+      dom.statusPill.classList.remove("is-success", "is-warn", "is-error");
+      if (tone === "success") {
+        dom.statusPill.classList.add("is-success");
+      } else if (tone === "warn") {
+        dom.statusPill.classList.add("is-warn");
+      } else if (tone === "error") {
+        dom.statusPill.classList.add("is-error");
+      }
     }
 
     function formatDuration(value) {
@@ -626,6 +963,252 @@
 
     function safeArray(value) {
       return Array.isArray(value) ? value : [];
+    }
+
+    function workspaceSection(name) {
+      return name === "live" ? dom.workspaceLive : dom.workspaceRuns;
+    }
+
+    function setWorkspace(name) {
+      state.workspace = name;
+      window.localStorage.setItem(STORAGE_KEYS.workspace, name);
+      for (const button of dom.workspaceButtons) {
+        const active = button.dataset.workspace === name;
+        button.classList.toggle("is-active", active);
+        button.setAttribute("aria-selected", active ? "true" : "false");
+      }
+      dom.workspaceLive.classList.toggle("is-active", name === "live");
+      dom.workspaceRuns.classList.toggle("is-active", name === "runs");
+      updateLivePolling();
+
+      if (name === "live") {
+        if (dom.baseUrl.value.trim()) {
+          void refreshLive();
+        } else {
+          setStatus("Enter an admin base URL to inspect a running FlashRL runtime", "warn");
+        }
+      } else if (!state.runs.rootHandle) {
+        setStatus("No run directory selected", "warn");
+      } else {
+        setStatus(`Browsing ${state.runs.rootHandle.name}`, "success");
+      }
+    }
+
+    function initialWorkspace() {
+      const saved = window.localStorage.getItem(STORAGE_KEYS.workspace);
+      if (saved === "live" || saved === "runs") {
+        return saved;
+      }
+      return window.localStorage.getItem(STORAGE_KEYS.adminBaseUrl) ? "live" : "runs";
+    }
+
+    function loadStoredBaseUrl() {
+      const saved = window.localStorage.getItem(STORAGE_KEYS.adminBaseUrl);
+      dom.baseUrl.value = saved || "http://127.0.0.1:8080";
+    }
+
+    function liveEndpoint(path) {
+      const base = dom.baseUrl.value.trim().replace(/\/+$/, "");
+      return `${base}${path}`;
+    }
+
+    function phasePill(phase, healthy) {
+      const pill = document.createElement("span");
+      pill.className = "pill";
+      if (phase === "Failed" || healthy === false) {
+        pill.classList.add("bad");
+      } else if (phase === "Starting" || phase === "Degraded" || phase === "Closing") {
+        pill.classList.add("warn");
+      }
+      pill.textContent = phase || "Unknown";
+      return pill;
+    }
+
+    function buildSummaryCard(label, value, meta = "", live = false) {
+      const card = document.createElement("article");
+      card.className = `summary-card${live ? " live" : ""}`;
+      const labelEl = document.createElement("div");
+      labelEl.className = "summary-label";
+      labelEl.textContent = label;
+      const valueEl = document.createElement("div");
+      valueEl.className = "summary-value";
+      valueEl.textContent = value;
+      card.append(labelEl, valueEl);
+      if (meta) {
+        const metaEl = document.createElement("div");
+        metaEl.className = "summary-meta";
+        metaEl.textContent = meta;
+        card.appendChild(metaEl);
+      }
+      return card;
+    }
+
+    function renderLiveSummary(items) {
+      dom.summary.replaceChildren();
+      const runtime = items.find((item) => item.kind === "FlashRLRuntime");
+      const serving = items.find((item) => item.kind === "ServingBackend");
+      const instances = items.filter((item) => item.kind === "VLLMInstance");
+      const healthyInstances = instances.filter((item) => item.status?.healthy).length;
+      const runtimeStatus = runtime?.status || {};
+      const servingSpec = serving?.spec || {};
+      const servingStatus = serving?.status || {};
+      const runtimePhase = runtimeStatus.phase || "Unknown";
+      const progress = [
+        `step ${runtimeStatus.currentStep ?? 0}`,
+        `epoch ${runtimeStatus.currentEpoch ?? 0}`,
+      ].join(" / ");
+      const activeReplicas = servingStatus.activeReplicaCount ?? instances.length;
+      const cards = [
+        buildSummaryCard("Runtime Phase", runtimePhase, runtime?.metadata?.name || "FlashRLRuntime", true),
+        buildSummaryCard("Progress", progress, runtimeStatus.startedAt || "startedAt unavailable", true),
+        buildSummaryCard(
+          "Serving Backend",
+          servingSpec.backend || "unknown",
+          servingSpec.modelName || "model unavailable",
+          true,
+        ),
+        buildSummaryCard(
+          "Active Replicas",
+          String(activeReplicas ?? 0),
+          servingSpec.numReplicas !== undefined ? `configured ${servingSpec.numReplicas}` : "",
+          true,
+        ),
+        buildSummaryCard(
+          "VLLM Health",
+          `${healthyInstances}/${instances.length}`,
+          instances.length ? "healthy / total" : "no managed VLLM instances",
+          true,
+        ),
+        buildSummaryCard("Object Count", String(items.length), "live objects in registry", true),
+      ];
+      for (const card of cards) {
+        dom.summary.appendChild(card);
+      }
+    }
+
+    function renderVllmInstances(items) {
+      const instances = items.filter((item) => item.kind === "VLLMInstance");
+      dom.instanceCount.textContent = `${instances.length} instance${instances.length === 1 ? "" : "s"}`;
+      dom.vllmBody.replaceChildren();
+      if (instances.length === 0) {
+        const row = document.createElement("tr");
+        row.innerHTML = '<td colspan="7" class="muted">No VLLMInstance objects loaded.</td>';
+        dom.vllmBody.appendChild(row);
+        return;
+      }
+
+      for (const item of instances) {
+        const row = document.createElement("tr");
+        const status = item.status || {};
+        const spec = item.spec || {};
+        row.innerHTML = `
+          <td>${item.metadata?.name || "unnamed"}</td>
+          <td></td>
+          <td>${status.pid ?? "-"}</td>
+          <td>${spec.port ?? "-"}</td>
+          <td>${status.healthy ? "healthy" : "not ready"}</td>
+          <td><code>${spec.modelSource || "-"}</code></td>
+          <td><code>${(status.stderrTail || "").slice(0, 160) || "-"}</code></td>
+        `;
+        row.children[1].appendChild(phasePill(status.phase, status.healthy));
+        dom.vllmBody.appendChild(row);
+      }
+    }
+
+    function renderObjectList(items) {
+      const nextSelectedKey = state.live.selectedObjectKey;
+      dom.objectList.replaceChildren();
+      dom.objectCount.textContent = `${items.length} objects`;
+
+      if (items.length === 0) {
+        dom.jsonOutput.textContent = "{}";
+        return;
+      }
+
+      const selectedExists = items.some((item) => {
+        const key = `${item.kind}/${item.metadata?.name || "unnamed"}`;
+        return key === nextSelectedKey;
+      });
+      if (!selectedExists) {
+        state.live.selectedObjectKey = `${items[0].kind}/${items[0].metadata?.name || "unnamed"}`;
+      }
+
+      for (const item of items) {
+        const key = `${item.kind}/${item.metadata?.name || "unnamed"}`;
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = `object-item${state.live.selectedObjectKey === key ? " active" : ""}`;
+        button.innerHTML = `
+          <div style="display:flex;justify-content:space-between;gap:10px;">
+            <strong>${key}</strong>
+            <span class="muted">${item.status?.phase || "Unknown"}</span>
+          </div>
+          <div class="muted" style="margin-top:6px;">uid=${item.metadata?.uid || "-"}</div>
+        `;
+        button.addEventListener("click", () => {
+          state.live.selectedObjectKey = key;
+          dom.jsonOutput.textContent = JSON.stringify(item, null, 2);
+          renderObjectList(items);
+        });
+        dom.objectList.appendChild(button);
+      }
+
+      const selected = items.find((item) => {
+        const key = `${item.kind}/${item.metadata?.name || "unnamed"}`;
+        return key === state.live.selectedObjectKey;
+      }) || items[0];
+      dom.jsonOutput.textContent = JSON.stringify(selected, null, 2);
+    }
+
+    async function refreshLive() {
+      const baseUrl = dom.baseUrl.value.trim();
+      if (!baseUrl) {
+        setStatus("Enter an admin base URL to inspect a running FlashRL runtime", "warn");
+        return;
+      }
+
+      window.localStorage.setItem(STORAGE_KEYS.adminBaseUrl, baseUrl);
+      setStatus(`Refreshing ${baseUrl}`, "warn");
+
+      try {
+        const response = await fetch(liveEndpoint("/admin/v1/objects"));
+        if (!response.ok) {
+          throw new Error(`HTTP ${response.status}`);
+        }
+        const payload = await response.json();
+        const items = Array.isArray(payload.items) ? payload.items : [];
+        state.live.items = items;
+        renderLiveSummary(items);
+        renderVllmInstances(items);
+        renderObjectList(items);
+        setStatus(`Loaded ${items.length} objects from ${baseUrl}`, "success");
+      } catch (error) {
+        state.live.items = [];
+        dom.summary.replaceChildren();
+        dom.vllmBody.innerHTML = '<tr><td colspan="7" class="muted">Unable to reach admin API.</td></tr>';
+        dom.objectList.replaceChildren();
+        dom.jsonOutput.textContent = JSON.stringify({ error: String(error) }, null, 2);
+        dom.objectCount.textContent = "0 objects";
+        dom.instanceCount.textContent = "0 instances";
+        setStatus(`Failed: ${error}`, "error");
+      }
+    }
+
+    function resetLive() {
+      state.live.selectedObjectKey = null;
+      window.localStorage.removeItem(STORAGE_KEYS.adminBaseUrl);
+      loadStoredBaseUrl();
+      void refreshLive();
+    }
+
+    function updateLivePolling() {
+      if (state.live.pollHandle !== null) {
+        window.clearInterval(state.live.pollHandle);
+        state.live.pollHandle = null;
+      }
+      if (state.workspace === "live" && dom.autoRefresh.checked) {
+        state.live.pollHandle = window.setInterval(() => void refreshLive(), POLL_INTERVAL_MS);
+      }
     }
 
     async function getOptionalFileHandle(directoryHandle, name) {
@@ -655,10 +1238,7 @@
         } catch (error) {
           records.push({
             event: "viewer_parse_error",
-            payload: {
-              line,
-              error: String(error),
-            },
+            payload: { line, error: String(error) },
           });
         }
       }
@@ -728,17 +1308,12 @@
     function visibleRuns() {
       const query = dom.runSearch.value.trim().toLowerCase();
       const mode = dom.runSort.value;
-      return [...state.runs]
+      return [...state.runs.runs]
         .filter((run) => {
           if (!query) {
             return true;
           }
-          return [
-            run.runId,
-            run.modelName,
-            run.status,
-            run.folderName,
-          ]
+          return [run.runId, run.modelName, run.status, run.folderName]
             .join(" ")
             .toLowerCase()
             .includes(query);
@@ -760,7 +1335,7 @@
         const button = document.createElement("button");
         button.type = "button";
         button.className = "run-button";
-        if (run.key === state.selectedKey) {
+        if (run.key === state.runs.selectedKey) {
           button.classList.add("is-selected");
         }
         button.addEventListener("click", () => void selectRun(run.key));
@@ -796,19 +1371,6 @@
       }
     }
 
-    function createSummaryCard(label, value) {
-      const card = document.createElement("div");
-      card.className = "summary-card";
-      const labelEl = document.createElement("div");
-      labelEl.className = "summary-label";
-      labelEl.textContent = label;
-      const valueEl = document.createElement("div");
-      valueEl.className = "summary-value";
-      valueEl.textContent = value;
-      card.append(labelEl, valueEl);
-      return card;
-    }
-
     function createDetailRow(label, value) {
       const row = document.createElement("div");
       row.className = "detail-row";
@@ -819,6 +1381,63 @@
       content.textContent = value;
       row.append(key, content);
       return row;
+    }
+
+    function createRunSummaryCard(label, value) {
+      return buildSummaryCard(label, value);
+    }
+
+    function summarizeEvent(event) {
+      const payload = event.payload || {};
+      switch (event.event) {
+        case "run_started":
+          return `dataset_prompts=${payload.dataset_prompt_count ?? payload.dataset_size} completions_per_step=${payload.planned_completions_per_step ?? payload.batch_size} epochs=${payload.max_epochs}`;
+        case "model_load":
+          return `${payload.component} ${payload.status}`;
+        case "epoch_start":
+          return `epoch ${payload.epoch}/${payload.total_epochs} batches=${payload.num_batches}`;
+        case "step_stage":
+          return `step ${payload.step} stage=${payload.stage} latency=${formatDuration(payload.latency_seconds)}`;
+        case "step_done":
+          return `step ${payload.step} loss=${formatNumber(payload.loss, 4)} reward=${formatNumber(payload.reward_mean, 4)}`;
+        case "checkpoint":
+          return `${payload.action} ${payload.path}`;
+        case "exception":
+          return `${payload.type}: ${payload.message}`;
+        case "run_finished":
+          return `${payload.status} total_steps=${payload.total_steps}`;
+        default:
+          return JSON.stringify(payload);
+      }
+    }
+
+    function renderEventCard(event) {
+      const card = document.createElement("article");
+      card.className = "event-card";
+      if (event.event === "exception") {
+        card.classList.add("error");
+      } else if (event.event === "checkpoint") {
+        card.classList.add("warn");
+      }
+
+      const meta = document.createElement("div");
+      meta.className = "event-meta";
+      meta.textContent = `${event.timestamp || "n/a"} | ${event.event}`;
+
+      const title = document.createElement("div");
+      title.className = "event-title";
+      title.textContent = summarizeEvent(event);
+
+      card.append(meta, title);
+
+      if (event.event === "exception" || event.event === "checkpoint") {
+        const body = document.createElement("div");
+        body.className = "event-body";
+        body.textContent = JSON.stringify(event.payload || {}, null, 2);
+        card.appendChild(body);
+      }
+
+      return card;
     }
 
     function renderOverview(run, details) {
@@ -913,64 +1532,13 @@
       dom.panelOverview.appendChild(lower);
     }
 
-    function summarizeEvent(event) {
-        const payload = event.payload || {};
-        switch (event.event) {
-        case "run_started":
-          return `dataset_prompts=${payload.dataset_prompt_count ?? payload.dataset_size} completions_per_step=${payload.planned_completions_per_step ?? payload.batch_size} epochs=${payload.max_epochs}`;
-        case "model_load":
-          return `${payload.component} ${payload.status}`;
-        case "epoch_start":
-          return `epoch ${payload.epoch}/${payload.total_epochs} batches=${payload.num_batches}`;
-        case "step_stage":
-          return `step ${payload.step} stage=${payload.stage} latency=${formatDuration(payload.latency_seconds)}`;
-        case "step_done":
-          return `step ${payload.step} loss=${formatNumber(payload.loss, 4)} reward=${formatNumber(payload.reward_mean, 4)}`;
-        case "checkpoint":
-          return `${payload.action} ${payload.path}`;
-        case "exception":
-          return `${payload.type}: ${payload.message}`;
-        case "run_finished":
-          return `${payload.status} total_steps=${payload.total_steps}`;
-        default:
-          return JSON.stringify(payload);
-      }
-    }
-
-    function renderEventCard(event) {
-      const card = document.createElement("article");
-      card.className = "event-card";
-      if (event.event === "exception") {
-        card.classList.add("error");
-      } else if (event.event === "checkpoint") {
-        card.classList.add("warn");
-      }
-
-      const meta = document.createElement("div");
-      meta.className = "event-meta";
-      meta.textContent = `${event.timestamp || "n/a"} | ${event.event}`;
-
-      const title = document.createElement("div");
-      title.className = "event-title";
-      title.textContent = summarizeEvent(event);
-
-      card.append(meta, title);
-
-      if (event.event === "exception" || event.event === "checkpoint") {
-        const body = document.createElement("div");
-        body.className = "event-body";
-        body.textContent = JSON.stringify(event.payload || {}, null, 2);
-        card.appendChild(body);
-      }
-
-      return card;
-    }
-
     function renderTimeline(details) {
       dom.panelTimeline.innerHTML = "";
       const stack = document.createElement("div");
       stack.className = "stack";
-      const events = details.events.slice().sort((left, right) => String(left.timestamp || "").localeCompare(String(right.timestamp || "")));
+      const events = details.events
+        .slice()
+        .sort((left, right) => String(left.timestamp || "").localeCompare(String(right.timestamp || "")));
       for (const event of events) {
         stack.appendChild(renderEventCard(event));
       }
@@ -1001,9 +1569,9 @@
       copyButton.addEventListener("click", async () => {
         try {
           await navigator.clipboard.writeText(details.consoleText || "");
-          setStatus(`Copied console log for ${run.runId}`);
+          setStatus(`Copied console log for ${run.runId}`, "success");
         } catch (error) {
-          setStatus(`Copy failed: ${error}`);
+          setStatus(`Copy failed: ${error}`, "error");
         }
       });
 
@@ -1167,14 +1735,14 @@
               ["Rollout Metadata", candidate.rollout?.metadata],
               ["Reward Metadata", candidate.reward?.metadata],
             ]) {
-              const details = document.createElement("details");
+              const detailsEl = document.createElement("details");
               const summary = document.createElement("summary");
               summary.textContent = label;
               const pre = document.createElement("pre");
               pre.className = "json-block";
               pre.textContent = JSON.stringify(value ?? {}, null, 2);
-              details.append(summary, pre);
-              card.appendChild(details);
+              detailsEl.append(summary, pre);
+              card.appendChild(detailsEl);
             }
 
             grid.appendChild(card);
@@ -1192,15 +1760,25 @@
       dom.panelRollouts.append(controls, list);
     }
 
+    function applyActiveTab() {
+      for (const button of dom.runTabButtons) {
+        const isActive = button.dataset.tab === state.runs.activeTab;
+        button.classList.toggle("is-active", isActive);
+      }
+      for (const panel of [dom.panelOverview, dom.panelTimeline, dom.panelConsole, dom.panelRollouts]) {
+        panel.classList.toggle("is-active", panel.id === `panel-${state.runs.activeTab}`);
+      }
+    }
+
     function renderSelectedRun() {
-      const run = state.runs.find((item) => item.key === state.selectedKey);
+      const run = state.runs.runs.find((item) => item.key === state.runs.selectedKey);
       if (!run) {
         dom.emptyState.hidden = false;
         dom.runContent.hidden = true;
         return;
       }
 
-      const details = state.details.get(run.key);
+      const details = state.runs.details.get(run.key);
       dom.emptyState.hidden = true;
       dom.runContent.hidden = false;
 
@@ -1237,7 +1815,7 @@
         ["Exceptions", String(run.exceptionCount)],
         ["Checkpoints", String(run.checkpointCount)],
       ]) {
-        dom.summaryGrid.appendChild(createSummaryCard(label, value));
+        dom.summaryGrid.appendChild(createRunSummaryCard(label, value));
       }
 
       renderOverview(run, details);
@@ -1248,24 +1826,9 @@
       renderRunList();
     }
 
-    function applyActiveTab() {
-      for (const button of dom.tabButtons) {
-        const isActive = button.dataset.tab === state.activeTab;
-        button.classList.toggle("is-active", isActive);
-      }
-      for (const panel of [
-        dom.panelOverview,
-        dom.panelTimeline,
-        dom.panelConsole,
-        dom.panelRollouts,
-      ]) {
-        panel.classList.toggle("is-active", panel.id === `panel-${state.activeTab}`);
-      }
-    }
-
     async function loadRunDetails(run) {
-      if (state.details.has(run.key)) {
-        return state.details.get(run.key);
+      if (state.runs.details.has(run.key)) {
+        return state.runs.details.get(run.key);
       }
 
       const eventsHandle = await getOptionalFileHandle(run.dirHandle, "events.jsonl");
@@ -1276,24 +1839,25 @@
         consoleText: await readText(consoleHandle),
         rollouts: parseJsonl(await readText(rolloutsHandle)),
       };
-      state.details.set(run.key, details);
+      state.runs.details.set(run.key, details);
       return details;
     }
 
     async function selectRun(key) {
-      const run = state.runs.find((item) => item.key === key);
+      const run = state.runs.runs.find((item) => item.key === key);
       if (!run) {
         return;
       }
-      setStatus(`Loading ${run.runId}`);
-      state.selectedKey = key;
+      setStatus(`Loading ${run.runId}`, "warn");
+      state.runs.selectedKey = key;
+      window.localStorage.setItem(STORAGE_KEYS.selectedRunKey, key);
       await loadRunDetails(run);
       renderSelectedRun();
-      setStatus(`Loaded ${run.runId}`);
+      setStatus(`Loaded ${run.runId}`, "success");
     }
 
     async function scanRuns(rootHandle) {
-      setStatus(`Scanning ${rootHandle.name}`);
+      setStatus(`Scanning ${rootHandle.name}`, "warn");
       const runs = [];
       for await (const [name, handle] of rootHandle.entries()) {
         if (handle.kind !== "directory") {
@@ -1314,46 +1878,60 @@
         });
       }
 
-      state.runs = runs.sort((left, right) => compareRuns(left, right, "newest"));
+      state.runs.runs = runs.sort((left, right) => compareRuns(left, right, "newest"));
+      state.runs.details.clear();
       renderRunList();
-      if (state.runs.length) {
-        await selectRun(state.runs[0].key);
+
+      const preferredKey = window.localStorage.getItem(STORAGE_KEYS.selectedRunKey);
+      const initialRun = state.runs.runs.find((run) => run.key === preferredKey) || state.runs.runs[0];
+      if (initialRun) {
+        await selectRun(initialRun.key);
       } else {
         dom.emptyState.hidden = false;
         dom.runContent.hidden = true;
-        setStatus(`No run folders found under ${rootHandle.name}`);
+        setStatus(`No run folders found under ${rootHandle.name}`, "warn");
       }
     }
 
     async function openRootDirectory() {
       if (!("showDirectoryPicker" in window)) {
         dom.unsupportedMessage.hidden = false;
-        setStatus("showDirectoryPicker is unavailable in this browser");
+        setStatus("showDirectoryPicker is unavailable in this browser", "error");
         return;
       }
 
       try {
         const rootHandle = await window.showDirectoryPicker({ mode: "read" });
-        state.rootHandle = rootHandle;
+        state.runs.rootHandle = rootHandle;
+        window.localStorage.setItem(STORAGE_KEYS.runRootName, rootHandle.name);
         await scanRuns(rootHandle);
       } catch (error) {
         if (error?.name === "AbortError") {
-          setStatus("Directory selection cancelled");
+          setStatus("Directory selection cancelled", "warn");
           return;
         }
-        setStatus(`Failed to open directory: ${error}`);
+        setStatus(`Failed to open directory: ${error}`, "error");
       }
     }
 
+    dom.workspaceButtons.forEach((button) => {
+      button.addEventListener("click", () => setWorkspace(button.dataset.workspace));
+    });
+    dom.refreshButton.addEventListener("click", () => void refreshLive());
+    dom.resetButton.addEventListener("click", resetLive);
+    dom.autoRefresh.addEventListener("change", updateLivePolling);
     dom.openRootButton.addEventListener("click", () => void openRootDirectory());
     dom.runSearch.addEventListener("input", renderRunList);
     dom.runSort.addEventListener("change", renderRunList);
-    dom.tabButtons.forEach((button) => {
+    dom.runTabButtons.forEach((button) => {
       button.addEventListener("click", () => {
-        state.activeTab = button.dataset.tab;
+        state.runs.activeTab = button.dataset.tab;
         applyActiveTab();
       });
     });
+
+    loadStoredBaseUrl();
+    setWorkspace(initialWorkspace());
   </script>
 </body>
 </html>

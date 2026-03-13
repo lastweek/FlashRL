@@ -1,9 +1,35 @@
 """Configuration models for FlashRL components and YAML-driven runs."""
 
+import os
 from pathlib import Path
+import re
 from typing import Any, Literal
 import yaml
 from pydantic import BaseModel, ConfigDict, Field
+
+
+_ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+def _expand_env_vars(value: Any) -> Any:
+    """Recursively expand `${VAR}` placeholders in config values."""
+    if isinstance(value, dict):
+        return {key: _expand_env_vars(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_expand_env_vars(item) for item in value]
+    if not isinstance(value, str):
+        return value
+
+    def replace(match: re.Match[str]) -> str:
+        variable = match.group(1)
+        resolved = os.environ.get(variable)
+        if resolved is None:
+            raise ValueError(
+                f"Missing required environment variable '{variable}' while loading config."
+            )
+        return resolved
+
+    return _ENV_VAR_PATTERN.sub(replace, value)
 
 
 class BaseConfig(BaseModel):
@@ -14,6 +40,7 @@ class BaseConfig(BaseModel):
         """Load config from YAML file."""
         with open(path) as f:
             data = yaml.safe_load(f)
+        data = _expand_env_vars(data)
         return cls(**data)
 
     @classmethod
@@ -117,6 +144,9 @@ class RuntimeConfig(BaseConfig):
 
     reference_enabled: bool = False
     reference_device: str | None = None
+    admin_enabled: bool = True
+    admin_host: str = "127.0.0.1"
+    admin_port: int = Field(default=0, ge=0, le=65535)
 
 
 class HookConfig(BaseConfig):

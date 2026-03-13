@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import argparse
+import os
 from pathlib import Path
 import re
+import shutil
 import sys
 
 if __package__ in {None, ""}:
@@ -228,10 +230,45 @@ def build_argument_parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _default_vllm_python() -> str | None:
+    """Return a prepared default vLLM runtime when one is available."""
+    candidates: list[Path] = []
+    if sys.platform == "darwin" and os.uname().machine == "arm64":
+        candidates.append(Path.home() / ".venv-vllm-metal" / "bin" / "python")
+    candidates.append(Path.home() / ".venv-vllm" / "bin" / "python")
+
+    for candidate in candidates:
+        if candidate.exists() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    current_python = Path(sys.executable)
+    sibling_vllm = shutil.which("vllm", path=str(current_python.parent))
+    if sibling_vllm is None:
+        return None
+    try:
+        __import__("vllm")
+    except Exception:
+        return None
+    return str(current_python)
+
+
+def _prepare_example_environment(config_path: str) -> None:
+    """Populate example-only env defaults before YAML config loading."""
+    if os.environ.get("FLASHRL_VLLM_PYTHON"):
+        return
+    if Path(config_path).name != "config_vllm.yaml":
+        return
+
+    runtime_python = _default_vllm_python()
+    if runtime_python is not None:
+        os.environ["FLASHRL_VLLM_PYTHON"] = runtime_python
+
+
 def main(argv: list[str] | None = None) -> int:
     """Run the reasoning example from YAML."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
+    _prepare_example_environment(args.config)
 
     try:
         flashrl = FlashRL.from_yaml(args.config)
@@ -245,6 +282,12 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             "If you're offline or have network issues, use a local model in the YAML config.",
+            file=sys.stderr,
+        )
+        print(
+            "If you're using `serving.backend: vllm`, either set FLASHRL_VLLM_PYTHON to a "
+            "prepared vLLM runtime or install FlashRL with the optional `vllm` extra in the "
+            "current environment.",
             file=sys.stderr,
         )
         return 1

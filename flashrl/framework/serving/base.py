@@ -49,6 +49,10 @@ class ServingBackend(ABC):
         """Clear any serving-side live-rollout debug hooks."""
         return None
 
+    def list_admin_objects(self) -> list[dict[str, Any]]:
+        """Return backend-owned admin objects when available."""
+        return []
+
     @abstractmethod
     def sync_from_training_actor(self, training_actor: ActorModel) -> None:
         """Refresh the serving copy from the training actor."""

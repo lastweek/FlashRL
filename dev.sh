@@ -6,6 +6,8 @@ COMPOSE_FILE="$ROOT_DIR/metric/docker-compose.yml"
 GRAFANA_URL="http://localhost:3000"
 PROMETHEUS_URL="http://localhost:9090"
 PUSHGATEWAY_URL="http://localhost:9091"
+DEFAULT_VLLM_VENV="$HOME/.venv-vllm"
+DEFAULT_VLLM_METAL_VENV="$HOME/.venv-vllm-metal"
 METRICS_READY_TIMEOUT_SECONDS="${FLASHRL_METRICS_READY_TIMEOUT_SECONDS:-60}"
 METRICS_READY_INTERVAL_SECONDS="${FLASHRL_METRICS_READY_INTERVAL_SECONDS:-1}"
 
@@ -14,24 +16,32 @@ is_sourced() {
 }
 
 finish() {
-  local status="$1"
+  local exit_status="$1"
   if is_sourced; then
-    return "$status"
+    return "$exit_status"
   fi
-  exit "$status"
+  exit "$exit_status"
 }
 
 activate_env() {
   export PYTHONPYCACHEPREFIX="$ROOT_DIR/.cache/pycache"
   export PYTHONPATH="$ROOT_DIR:${PYTHONPATH:-}"
+  auto_export_vllm_python
 
   echo "✓ FlashRL dev environment activated"
   echo "  - Bytecode cache: .cache/pycache/"
   echo "  - PYTHONPATH set"
+  if [[ -n "${FLASHRL_VLLM_PYTHON:-}" ]]; then
+    echo "  - FLASHRL_VLLM_PYTHON: $FLASHRL_VLLM_PYTHON"
+  fi
 }
 
 metrics_usage() {
   echo "Usage: ./dev.sh metrics <up|down|reset|status>"
+}
+
+vllm_usage() {
+  echo "Usage: ./dev.sh vllm <setup|status>"
 }
 
 require_command() {
@@ -41,6 +51,150 @@ require_command() {
   fi
 
   echo "Error: required command '$command_name' was not found in PATH." >&2
+  return 1
+}
+
+is_macos_arm64() {
+  [[ "$(uname -s)" == "Darwin" && "$(uname -m)" == "arm64" ]]
+}
+
+default_vllm_python() {
+  if is_macos_arm64 && [[ -x "$DEFAULT_VLLM_METAL_VENV/bin/python" ]]; then
+    printf '%s\n' "$DEFAULT_VLLM_METAL_VENV/bin/python"
+    return 0
+  fi
+  if [[ -x "$DEFAULT_VLLM_VENV/bin/python" ]]; then
+    printf '%s\n' "$DEFAULT_VLLM_VENV/bin/python"
+    return 0
+  fi
+  return 1
+}
+
+auto_export_vllm_python() {
+  if [[ -n "${FLASHRL_VLLM_PYTHON:-}" ]]; then
+    return 0
+  fi
+
+  local runtime_python=""
+  if runtime_python="$(default_vllm_python)"; then
+    export FLASHRL_VLLM_PYTHON="$runtime_python"
+  fi
+}
+
+print_vllm_export_hint() {
+  local python_path="$1"
+  echo "export FLASHRL_VLLM_PYTHON=\"$python_path\""
+}
+
+python_has_module() {
+  local python_path="$1"
+  local module_name="$2"
+  "$python_path" -c "import $module_name" >/dev/null 2>&1
+}
+
+linux_vllm_python_command() {
+  local candidate=""
+  for candidate in python3.13 python3.12 python3; do
+    if ! command -v "$candidate" >/dev/null 2>&1; then
+      continue
+    fi
+    if "$candidate" -c 'import sys; raise SystemExit(0 if (3, 12) <= sys.version_info[:2] < (3, 14) else 1)'; then
+      printf '%s\n' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+vllm_status() {
+  local runtime_python=""
+  local source_label="prepared runtime"
+
+  if [[ -n "${FLASHRL_VLLM_PYTHON:-}" ]]; then
+    runtime_python="$FLASHRL_VLLM_PYTHON"
+    source_label="FLASHRL_VLLM_PYTHON"
+  elif runtime_python="$(default_vllm_python)"; then
+    source_label="default prepared runtime"
+  else
+    echo "Prepared vLLM runtime: not found"
+    if is_macos_arm64; then
+      echo "Run: ./dev.sh vllm setup"
+    else
+      echo "Run: ./dev.sh vllm setup"
+      echo "Or install FlashRL with the optional vllm extra in your current environment."
+    fi
+    return 0
+  fi
+
+  echo "Prepared vLLM runtime: $runtime_python"
+  echo "Source: $source_label"
+  print_vllm_export_hint "$runtime_python"
+}
+
+vllm_setup_macos() {
+  require_command curl || return 1
+  require_command uv || return 1
+
+  if [[ -x "$DEFAULT_VLLM_METAL_VENV/bin/python" ]] && python_has_module "$DEFAULT_VLLM_METAL_VENV/bin/python" vllm_metal; then
+    echo "✓ Existing vllm-metal runtime found at $DEFAULT_VLLM_METAL_VENV"
+  else
+    echo "Installing vllm-metal into $DEFAULT_VLLM_METAL_VENV ..."
+    if ! curl -fsSL https://raw.githubusercontent.com/vllm-project/vllm-metal/main/install.sh | bash; then
+      echo "Installer did not complete cleanly; falling back to source install for vllm-metal ..."
+    fi
+  fi
+
+  if [[ ! -x "$DEFAULT_VLLM_METAL_VENV/bin/python" ]]; then
+    echo "Error: vllm-metal setup did not create $DEFAULT_VLLM_METAL_VENV/bin/python" >&2
+    return 1
+  fi
+
+  if ! python_has_module "$DEFAULT_VLLM_METAL_VENV/bin/python" vllm_metal; then
+    require_command git || return 1
+    echo "Installing vllm-metal from source fallback ..."
+    uv pip install --python "$DEFAULT_VLLM_METAL_VENV/bin/python" \
+      git+https://github.com/vllm-project/vllm-metal.git || return 1
+  fi
+
+  if ! python_has_module "$DEFAULT_VLLM_METAL_VENV/bin/python" vllm_metal; then
+    echo "Error: vllm-metal setup completed but the runtime still cannot import vllm_metal." >&2
+    return 1
+  fi
+
+  echo
+  echo "Prepared vLLM runtime:"
+  print_vllm_export_hint "$DEFAULT_VLLM_METAL_VENV/bin/python"
+}
+
+vllm_setup_linux() {
+  require_command uv || return 1
+
+  local python_cmd=""
+  if ! python_cmd="$(linux_vllm_python_command)"; then
+    echo "Error: Linux vLLM setup requires python3.12 or python3.13 in PATH." >&2
+    return 1
+  fi
+
+  echo "Preparing vLLM runtime with $python_cmd ..."
+  uv venv --python "$python_cmd" "$DEFAULT_VLLM_VENV" || return 1
+  uv pip install --python "$DEFAULT_VLLM_VENV/bin/python" "vllm>=0.16.0" || return 1
+
+  echo
+  echo "Prepared vLLM runtime:"
+  print_vllm_export_hint "$DEFAULT_VLLM_VENV/bin/python"
+}
+
+vllm_setup() {
+  if is_macos_arm64; then
+    vllm_setup_macos
+    return $?
+  fi
+  if [[ "$(uname -s)" == "Linux" ]]; then
+    vllm_setup_linux
+    return $?
+  fi
+
+  echo "Error: unsupported platform for automatic vLLM setup: $(uname -s) $(uname -m)" >&2
   return 1
 }
 
@@ -106,16 +260,16 @@ unready_services() {
 
 print_readiness_summary() {
   local service
-  local status
+  local readiness
   local url
   for service in grafana prometheus pushgateway; do
     url="$(service_health_url "$service")" || continue
     if service_ready "$service"; then
-      status="ready"
+      readiness="ready"
     else
-      status="not_ready"
+      readiness="not_ready"
     fi
-    echo "  - $(service_label "$service"): $status ($url)"
+    echo "  - $(service_label "$service"): $readiness ($url)"
   done
 }
 
@@ -208,10 +362,26 @@ main() {
           ;;
       esac
       ;;
+    vllm)
+      local action="${2:-}"
+      case "$action" in
+        setup)
+          vllm_setup
+          ;;
+        status)
+          vllm_status
+          ;;
+        *)
+          vllm_usage
+          return 1
+          ;;
+      esac
+      ;;
     help|-h|--help)
       echo "Usage:"
       echo "  source ./dev.sh"
       echo "  ./dev.sh metrics <up|down|reset|status>"
+      echo "  ./dev.sh vllm <setup|status>"
       ;;
     *)
       echo "Unknown command: $1" >&2
@@ -219,10 +389,16 @@ main() {
       echo "Usage:"
       echo "  source ./dev.sh"
       echo "  ./dev.sh metrics <up|down|reset|status>"
+      echo "  ./dev.sh vllm <setup|status>"
       return 1
       ;;
   esac
 }
 
-main "$@"
-finish $?
+if is_sourced; then
+  main
+  finish $?
+else
+  main "$@"
+  finish $?
+fi

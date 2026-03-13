@@ -9,16 +9,10 @@ training:
 
 serving:
   backend: vllm
-  runtime_python: ~/.venv-vllm/bin/python
-  num_replicas: 2
+  runtime_python: ${FLASHRL_VLLM_PYTHON}
+  num_replicas: 1
   num_threads: 1
   debug_live_rollout: false
-  vllm_args:
-    - --dtype=float16
-    - --max-model-len=4096
-    - --gpu-memory-utilization=0.85
-    - --max-num-seqs=32
-    - --enable-prefix-caching
 
 grpo:
   group_size: 2

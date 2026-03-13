@@ -120,7 +120,9 @@ class UserDefinedRollout:
         """Validate that rollout outputs contain the token data required by GRPO."""
         if not rollout.prompt_token_ids:
             raise ValueError("RolloutOutput.prompt_token_ids must be populated for GRPO training.")
-        if len(rollout.response_token_logprobs) != len(rollout.response_token_ids):
+        if rollout.response_token_logprobs and (
+            len(rollout.response_token_logprobs) != len(rollout.response_token_ids)
+        ):
             raise ValueError(
                 "RolloutOutput.response_token_logprobs must match RolloutOutput.response_token_ids."
             )

@@ -9,7 +9,9 @@ from pathlib import Path
 import sys
 import time
 from typing import Any, Callable, Sequence
+from uuid import uuid4
 
+from .admin import AdminRegistry, AdminServer, build_admin_object, utc_now_iso
 from .backends.training import TrainingBackend
 from .config import (
     CommonConfig,
@@ -139,6 +141,9 @@ class FlashRL:
         metrics_config: MetricsConfig | None = None,
         reference_enabled: bool = False,
         reference_device: str | None = None,
+        admin_enabled: bool = True,
+        admin_host: str = "127.0.0.1",
+        admin_port: int = 0,
     ) -> None:
         """Initialize FlashRL trainer.
 
@@ -150,6 +155,10 @@ class FlashRL:
         self.reward_fn = reward_fn
         self.reference_enabled = reference_enabled
         self.reference_device = reference_device
+        self.admin_enabled = admin_enabled
+        self.admin_host = admin_host
+        self.admin_port = admin_port
+        self.admin_base_url: str | None = None
 
         self.training_model_config = ModelConfig(
             model_name=model,
@@ -199,6 +208,13 @@ class FlashRL:
         self._runtime_bootstrap_totals: dict[str, float] = {}
         self._resume_from_checkpoint = False
         self._dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None
+        self._admin_registry: AdminRegistry | None = None
+        self._admin_server: AdminServer | None = None
+        self._runtime_uid = uuid4().hex
+        self._runtime_created_at = utc_now_iso()
+        self._runtime_phase = "Pending"
+        self._last_runtime_error: str | None = None
+        self._closed = False
 
         if self.metrics_config.enabled:
             self._metrics_sink = PrometheusMetricsSink(
@@ -207,6 +223,43 @@ class FlashRL:
             )
 
         self._initialize_runtime()
+
+    def _bootstrap_console_enabled(self) -> bool:
+        """Return whether live bootstrap console output should be emitted."""
+        return bool(self.logging_config.console)
+
+    def _emit_bootstrap_console(self, line: str) -> None:
+        """Write one live bootstrap line to stdout immediately."""
+        if not self._bootstrap_console_enabled():
+            return
+        print(line, flush=True)
+
+    def _format_bootstrap_duration(self, duration_seconds: float) -> str:
+        """Format one startup duration for the console."""
+        if duration_seconds < 1.0:
+            return f"{duration_seconds * 1000.0:.1f}ms"
+        return f"{duration_seconds:.3f}s"
+
+    def _serving_replica_summary(self) -> str:
+        """Return the serving replica suffix for replicated backends."""
+        if self.serving_config.backend != "vllm":
+            return ""
+        return f" replicas={self.serving_config.num_replicas}"
+
+    def _emit_bootstrap_banner(self) -> None:
+        """Print the immediate startup banner before any long-running work."""
+        reference_state = "enabled" if self.reference_enabled else "disabled"
+        self._emit_bootstrap_console(
+            "FlashRL startup  "
+            f"model={self.training_model_config.model_name}  "
+            f"serving={self.serving_config.backend}"
+            f"{self._serving_replica_summary()}  "
+            f"reference={reference_state}"
+        )
+
+    def _emit_bootstrap_stage(self, component: str, message: str) -> None:
+        """Print one concise bootstrap stage line."""
+        self._emit_bootstrap_console(f"startup {component:<17} {message}")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "FlashRL":
@@ -253,16 +306,22 @@ class FlashRL:
             metrics_config=run_config.metrics,
             reference_enabled=run_config.runtime.reference_enabled,
             reference_device=run_config.runtime.reference_device,
+            admin_enabled=run_config.runtime.admin_enabled,
+            admin_host=run_config.runtime.admin_host,
+            admin_port=run_config.runtime.admin_port,
         )
         instance._dataset_loader = dataset_fn
         return instance
 
     def _initialize_runtime(self) -> None:
         """Initialize training and serving backends, and reference model if needed."""
+        self._runtime_phase = "Starting"
         self._runtime_bootstrap_events = []
         self._runtime_bootstrap_totals = {}
         startup_total_seconds = 0.0
+        self._emit_bootstrap_banner()
 
+        self._emit_bootstrap_stage("training_backend", "starting")
         started_at = time.perf_counter()
         self._training_backend = TrainingBackend(
             self.training_model_config,
@@ -270,6 +329,13 @@ class FlashRL:
         )
         duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
+        self._emit_bootstrap_stage(
+            "training_backend",
+            "ready "
+            f"device={self._training_backend.actor.device} "
+            f"cpu={self.training_model_config.num_threads} "
+            f"{self._format_bootstrap_duration(duration_seconds)}",
+        )
         self._runtime_bootstrap_totals["startup_training_backend_seconds"] = duration_seconds
         self._runtime_bootstrap_events.append(
             self._make_model_load_event(
@@ -280,10 +346,30 @@ class FlashRL:
             )
         )
 
+        self._emit_bootstrap_stage(
+            "serving_backend",
+            "starting "
+            f"backend={self.serving_config.backend}"
+            f"{self._serving_replica_summary()}",
+        )
         started_at = time.perf_counter()
-        self._serving_backend = create_serving_backend(self.serving_config)
+        self._serving_backend = create_serving_backend(
+            self.serving_config,
+            startup_logger=(
+                self._emit_bootstrap_console if self._bootstrap_console_enabled() else None
+            ),
+        )
         duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
+        serving_ready_line = (
+            "ready "
+            f"backend={self.serving_config.backend} "
+            f"device={self._serving_backend.device}"
+        )
+        if self.serving_config.backend == "vllm":
+            serving_ready_line += f" replicas={self.serving_config.num_replicas}"
+        serving_ready_line += f" {self._format_bootstrap_duration(duration_seconds)}"
+        self._emit_bootstrap_stage("serving_backend", serving_ready_line)
         self._runtime_bootstrap_totals["startup_serving_backend_seconds"] = duration_seconds
         self._runtime_bootstrap_events.append(
             self._make_model_load_event(
@@ -295,6 +381,7 @@ class FlashRL:
         )
 
         if self.reference_enabled:
+            self._emit_bootstrap_stage("reference_model", "starting")
             started_at = time.perf_counter()
             reference_config = self.training_model_config.model_copy(
                 update={
@@ -304,6 +391,13 @@ class FlashRL:
             self._reference = ReferenceModel(reference_config)
             duration_seconds = time.perf_counter() - started_at
             startup_total_seconds += duration_seconds
+            self._emit_bootstrap_stage(
+                "reference_model",
+                "ready "
+                f"device={self._reference.device} "
+                f"cpu={reference_config.num_threads} "
+                f"{self._format_bootstrap_duration(duration_seconds)}",
+            )
             self._runtime_bootstrap_totals["startup_reference_model_seconds"] = duration_seconds
             self._runtime_bootstrap_events.append(
                 self._make_model_load_event(
@@ -337,7 +431,9 @@ class FlashRL:
             run_logger=None,
             metrics_sink=self._metrics_sink,
         )
+        self._initialize_admin()
         self._runtime_bootstrap_totals["startup_total_seconds"] = startup_total_seconds
+        self._runtime_phase = "Ready"
 
     def _make_model_load_event(
         self,
@@ -357,14 +453,200 @@ class FlashRL:
             },
         }
 
+    def _initialize_admin(self) -> None:
+        """Start the runtime-owned admin registry and HTTP server when enabled."""
+        self._admin_registry = AdminRegistry()
+        self._admin_registry.register(self._runtime_admin_objects)
+        self._admin_registry.register(self._training_backend_admin_objects)
+        self._admin_registry.register(self._serving_backend_admin_objects)
+        self._admin_registry.register(self._reference_admin_objects)
+        self._admin_registry.register(self._serving_child_admin_objects)
+
+        if not self.admin_enabled:
+            return
+
+        self._admin_server = AdminServer(
+            self._admin_registry,
+            host=self.admin_host,
+            port=self.admin_port,
+        )
+        self.admin_base_url = self._admin_server.start()
+        self._emit_bootstrap_stage("admin", f"ready url={self.admin_base_url}")
+
+    def _runtime_labels(self) -> dict[str, str]:
+        """Build shared labels for all runtime-owned admin objects."""
+        return {
+            "flashrl.dev/runtime": "flashrl",
+            "flashrl.dev/model-name": self.training_model_config.model_name,
+            "flashrl.dev/serving-backend": self.serving_config.backend,
+        }
+
+    def _runtime_object_uid(self, suffix: str) -> str:
+        """Build one stable UID string for a runtime-owned object."""
+        return f"{self._runtime_uid}:{suffix}"
+
+    def _runtime_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the parent runtime admin object."""
+        return [
+            build_admin_object(
+                "FlashRLRuntime",
+                "flashrl-runtime",
+                uid=self._runtime_object_uid("runtime"),
+                created_at=self._runtime_created_at,
+                labels=self._runtime_labels(),
+                spec={
+                    "modelName": self.training_model_config.model_name,
+                    "referenceEnabled": self.reference_enabled,
+                    "adminBaseUrl": self.admin_base_url,
+                },
+                status={
+                    "phase": self._runtime_phase,
+                    "startedAt": self._runtime_created_at,
+                    "currentEpoch": self._admin_current_epoch(),
+                    "currentStep": self._admin_current_step(),
+                    "lastError": self._last_runtime_error,
+                },
+            )
+        ]
+
+    def _training_backend_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the training backend admin object."""
+        if self._training_backend is None:
+            return []
+        return [
+            build_admin_object(
+                "TrainingBackend",
+                "training-backend",
+                uid=self._runtime_object_uid("training-backend"),
+                created_at=self._runtime_created_at,
+                labels=self._runtime_labels(),
+                spec={
+                    "modelName": self.training_model_config.model_name,
+                    "device": self.training_model_config.device or "auto",
+                    "dtype": self.training_model_config.dtype,
+                    "numThreads": self.training_model_config.num_threads,
+                },
+                status={
+                    "phase": self._component_phase(),
+                    "device": str(self._training_backend.actor.device),
+                    "optimizer": type(self._training_backend.optimizer).__name__,
+                    "loaded": True,
+                },
+            )
+        ]
+
+    def _serving_backend_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the serving backend admin object."""
+        if self._serving_backend is None:
+            return []
+
+        child_objects = self._serving_child_admin_objects()
+        active_replica_count = sum(
+            1
+            for item in child_objects
+            if item.get("kind") == "VLLMInstance"
+            and item.get("status", {}).get("healthy") is True
+        )
+        backend_phase = self._component_phase()
+        if self.serving_config.backend == "vllm" and child_objects:
+            expected = self.serving_config.num_replicas
+            if active_replica_count == expected:
+                backend_phase = "Ready"
+            elif active_replica_count > 0:
+                backend_phase = "Degraded"
+            elif self._runtime_phase not in {"Closing", "Closed", "Failed"}:
+                backend_phase = "Starting"
+
+        return [
+            build_admin_object(
+                "ServingBackend",
+                "serving-backend",
+                uid=self._runtime_object_uid("serving-backend"),
+                created_at=self._runtime_created_at,
+                labels=self._runtime_labels(),
+                spec={
+                    "backend": self.serving_config.backend,
+                    "modelName": self.serving_config.model_name,
+                    "device": self.serving_config.device or "auto",
+                    "numReplicas": self.serving_config.num_replicas,
+                },
+                status={
+                    "phase": backend_phase,
+                    "device": str(self._serving_backend.device),
+                    "activeReplicaCount": active_replica_count,
+                },
+            )
+        ]
+
+    def _reference_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the optional reference model admin object."""
+        if self._reference is None:
+            return []
+        return [
+            build_admin_object(
+                "ReferenceModel",
+                "reference-model",
+                uid=self._runtime_object_uid("reference-model"),
+                created_at=self._runtime_created_at,
+                labels=self._runtime_labels(),
+                spec={
+                    "modelName": self.training_model_config.model_name,
+                    "device": self.reference_device or self.training_model_config.device or "auto",
+                },
+                status={
+                    "phase": self._component_phase(),
+                    "loaded": True,
+                },
+            )
+        ]
+
+    def _serving_child_admin_objects(self) -> list[dict[str, Any]]:
+        """Return backend-owned child admin objects."""
+        if self._serving_backend is None:
+            return []
+        list_objects = getattr(self._serving_backend, "list_admin_objects", None)
+        if list_objects is None:
+            return []
+        return list_objects()
+
+    def _component_phase(self) -> str:
+        """Map the runtime phase to a generic component phase."""
+        if self._runtime_phase == "Training":
+            return "Ready"
+        return self._runtime_phase
+
+    def _admin_current_epoch(self) -> int:
+        """Return the user-facing epoch number for the runtime object."""
+        if self._trainer is None:
+            return 0
+        if self._trainer.total_steps == 0 and self._runtime_phase == "Ready":
+            return 0
+        return self._trainer.current_epoch + 1
+
+    def _admin_current_step(self) -> int:
+        """Return the current training step for the runtime object."""
+        if self._trainer is None:
+            return 0
+        return self._trainer.total_steps
+
     def close(self) -> None:
         """Release runtime-owned resources."""
+        if self._closed:
+            return
+        self._closed = True
         if self._run_logger is not None:
             self._run_logger.close()
             self._run_logger = None
-        if self._serving_backend is not None:
-            self._serving_backend.close()
-            self._serving_backend = None
+        self._runtime_phase = "Closing"
+        try:
+            if self._serving_backend is not None:
+                self._serving_backend.close()
+        finally:
+            self._runtime_phase = "Closed"
+            if self._admin_server is not None:
+                self._admin_server.close()
+                self._admin_server = None
+        self._serving_backend = None
 
     def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
         """Train on dataset or use the configured dataset loader."""
@@ -417,6 +699,10 @@ class FlashRL:
             prompts_per_step=prompts_per_step,
             steps_per_epoch=(math.ceil(len(dataset) / prompts_per_step) if dataset else 0),
             total_planned_steps=total_batches,
+            serving_backend=self.serving_config.backend,
+            serving_device=str(self._serving_backend.device),
+            serving_num_replicas=self.serving_config.num_replicas,
+            admin_base_url=self.admin_base_url,
         )
         for event in self._runtime_bootstrap_events:
             self._run_logger.log_model_load(
@@ -431,11 +717,15 @@ class FlashRL:
             self._trainer.reset_state()
         self._trainer.attach_run_logger(self._run_logger)
         training_loop_started_at = time.perf_counter()
+        self._last_runtime_error = None
+        self._runtime_phase = "Training"
         try:
             training_loop_started_at = time.perf_counter()
             self._trainer.train(dataset)
         except Exception as exc:
             status = "failed"
+            self._runtime_phase = "Failed"
+            self._last_runtime_error = f"{type(exc).__name__}: {exc}"
             if self._run_logger is not None:
                 epoch = self._trainer.current_epoch + 1
                 step = self._trainer.total_steps
@@ -454,6 +744,8 @@ class FlashRL:
             )
             self._trainer.attach_run_logger(None)
             self._resume_from_checkpoint = False
+            if status == "completed":
+                self._runtime_phase = "Ready"
             if self._run_logger is not None:
                 self._run_logger.finish_run(
                     status=status,

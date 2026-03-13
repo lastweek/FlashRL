@@ -323,7 +323,7 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, training_actor=None: FakeServingBackend(config),
+        lambda config, startup_logger=None: FakeServingBackend(config),
     )
     monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
@@ -445,6 +445,71 @@ def test_run_logger_sanitizes_model_name_in_run_dir(tmp_path: Path) -> None:
     assert "org-model-name-v1" in logger.run_dir.name
 
 
+def test_flashrl_constructor_emits_bootstrap_stage_lines(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Constructor startup should emit immediate stage lines before training begins."""
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(),
+        reward_fn=reward_fn,
+        batch_size=4,
+        max_epochs=1,
+        serving_config=flashrl_module.ServingConfig(
+            model_name="fake/model",
+            backend="vllm",
+            num_replicas=2,
+        ),
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=True,
+            file=False,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+
+    output = capsys.readouterr().out
+    assert "FlashRL startup  model=fake/model  serving=vllm replicas=2  reference=disabled" in output
+    assert "startup training_backend  starting" in output
+    assert "startup training_backend  ready device=cpu cpu=1" in output
+    assert "startup serving_backend   starting backend=vllm replicas=2" in output
+    assert "startup serving_backend   ready backend=vllm device=cpu replicas=2" in output
+    assert re.search(r"startup admin\s+ready url=http://127\.0\.0\.1:\d+", output)
+    assert "FlashRL training run" not in output
+
+    trainer.close()
+
+
+def test_flashrl_constructor_keeps_console_silent_when_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Constructor startup should stay silent when console logging is disabled."""
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(),
+        reward_fn=reward_fn,
+        batch_size=4,
+        max_epochs=1,
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=False,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+
+    assert capsys.readouterr().out == ""
+    trainer.close()
+
+
 def test_run_logger_compact_console_groups_step_output(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -479,6 +544,10 @@ def test_run_logger_compact_console_groups_step_output(
         prompts_per_step=2,
         steps_per_epoch=2,
         total_planned_steps=2,
+        serving_backend="vllm",
+        serving_device="auto",
+        serving_num_replicas=2,
+        admin_base_url="http://127.0.0.1:44123/admin",
     )
     logger.log_model_load(
         "training_backend",
@@ -661,6 +730,8 @@ def test_run_logger_compact_console_groups_step_output(
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "\x1b[" in captured
     assert "FlashRL training run\n  run      " in plain_captured
+    assert "  serving  backend=vllm  device=auto  replicas=2" in plain_captured
+    assert "  admin    http://127.0.0.1:44123/admin" in plain_captured
     assert "mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in plain_captured
     assert "progress steps_per_epoch=2  total_steps=2" in plain_captured
     assert (
@@ -669,6 +740,8 @@ def test_run_logger_compact_console_groups_step_output(
         in plain_captured
     )
     assert "FlashRL training run\n  run      " in transcript
+    assert "  serving  backend=vllm  device=auto  replicas=2" in transcript
+    assert "  admin    http://127.0.0.1:44123/admin" in transcript
     assert "  grpo     completions_per_prompt=2  clip=0.2000" in transcript
     assert "  mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in transcript
     assert "  progress steps_per_epoch=2  total_steps=2" in transcript
@@ -970,9 +1043,9 @@ def test_run_logger_serving_debug_streams_terminal_only_fragments(
     assert serving_events[0]["payload"]["response_preview"] == "partial text"
 
 
-def test_static_run_viewer_exists_and_contains_expected_sections() -> None:
-    """The shared run viewer should be a committed static HTML app."""
-    viewer_path = Path("docs/run_viewer.html")
+def test_static_viewer_exists_and_contains_run_history_sections() -> None:
+    """The unified viewer should preserve the run history workspace."""
+    viewer_path = Path("docs/viewer.html")
 
     assert viewer_path.exists()
     html = viewer_path.read_text(encoding="utf-8")
@@ -985,6 +1058,8 @@ def test_static_run_viewer_exists_and_contains_expected_sections() -> None:
     assert "Timeline" in html
     assert "Console" in html
     assert "Rollouts" in html
+    assert "Live Runtime" in html
+    assert "Run History" in html
     assert "step-filter" in html
     assert "epoch-filter" in html
     assert "events.jsonl" in html
@@ -1152,6 +1227,9 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         prompts_per_step=2,
         steps_per_epoch=3,
         total_planned_steps=3,
+        serving_backend="huggingface",
+        serving_device="cpu",
+        admin_base_url="http://127.0.0.1:43123/admin",
     )
     trainer.train(dataset)
     logger.finish_run(status="completed", total_steps=trainer.total_steps)
@@ -1222,6 +1300,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "runtime=single-device-per-backend reference=disabled" in transcript
+    assert "serving backend=huggingface device=cpu" in transcript
+    assert "admin=http://127.0.0.1:43123/admin" in transcript
     assert "cpu_threads=1" in transcript
     assert (
         "step=1 epoch=1/1 batch=1/3 prompt_window=1-2/6 completions_this_step=4 "
@@ -1485,10 +1565,16 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     trainer.load_checkpoint(str(checkpoint_path))
 
     output = capsys.readouterr().out
+    assert "FlashRL startup  model=fake/model  serving=huggingface  reference=disabled" in output
+    assert "startup training_backend  starting" in output
+    assert "startup serving_backend   starting backend=huggingface" in output
+    assert re.search(r"startup admin\s+ready url=http://127\.0\.0\.1:\d+", output)
     assert "FlashRL training run" in output
     assert "  run      " in output
     assert "cpu=1" in output
     assert "reference=disabled" in output
+    assert "  serving  backend=huggingface  device=cpu" in output
+    assert re.search(r"  admin    http://127\.0\.0\.1:\d+", output)
     assert "completions_per_prompt=2  clip=0.2000" in output
     assert "load training_backend" in output
     assert "load serving_backend" in output

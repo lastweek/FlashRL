@@ -2,11 +2,14 @@
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from examples.reasoning.train import (
     REASONING_PROMPTS,
     _extract_predicted_answer,
+    _prepare_example_environment,
     _parse_expected_answer,
     reasoning_reward_fn,
 )
@@ -112,3 +115,33 @@ def test_reasoning_reward_metadata_explains_structure_and_correctness() -> None:
     assert reward.metadata["answer_parseable"] is True
     assert reward.metadata["is_correct"] is True
     assert reward.metadata["structure_score"] > reward.metadata["correctness_score"]
+
+
+def test_prepare_example_environment_sets_default_vllm_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The direct example entrypoint should auto-fill the default vLLM runtime."""
+    monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
+    monkeypatch.setattr(
+        "examples.reasoning.train._default_vllm_python",
+        lambda: "/tmp/fake-vllm-python",
+    )
+
+    _prepare_example_environment("examples/reasoning/config_vllm.yaml")
+
+    assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
+
+
+def test_prepare_example_environment_leaves_non_vllm_configs_alone(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Only the vLLM example config should trigger env auto-discovery."""
+    monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
+    monkeypatch.setattr(
+        "examples.reasoning.train._default_vllm_python",
+        lambda: "/tmp/fake-vllm-python",
+    )
+
+    _prepare_example_environment("examples/reasoning/config.yaml")
+
+    assert "FLASHRL_VLLM_PYTHON" not in os.environ

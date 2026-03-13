@@ -2,18 +2,23 @@
 
 from __future__ import annotations
 
+from typing import Callable
+
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.serving.base import ServingBackend
 from flashrl.framework.serving.huggingface import HuggingFaceServingBackend
 from flashrl.framework.serving.vllm import VLLMServingBackend
 
 
-def create_serving_backend(config: ServingConfig) -> ServingBackend:
+def create_serving_backend(
+    config: ServingConfig,
+    startup_logger: Callable[[str], None] | None = None,
+) -> ServingBackend:
     """Construct the requested serving backend implementation."""
     if config.backend == "huggingface":
-        return HuggingFaceServingBackend(config)
+        return HuggingFaceServingBackend(config, startup_logger=startup_logger)
     if config.backend == "vllm":
-        return VLLMServingBackend(config)
+        return VLLMServingBackend(config, startup_logger=startup_logger)
     raise ValueError(f"Unsupported serving backend: {config.backend}")
 
 

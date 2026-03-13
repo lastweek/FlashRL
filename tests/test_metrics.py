@@ -346,7 +346,7 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, training_actor=None: FakeServingBackend(config),
+        lambda config, startup_logger=None: FakeServingBackend(config),
     )
     monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
@@ -1301,12 +1301,14 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
     assert "serving.backend: vllm" in docs
-    assert "runtime_python: ~/.venv-vllm/bin/python" in docs
+    assert "FLASHRL_VLLM_PYTHON" in docs
+    assert "optional `vllm` extra" in docs
 
     example_yaml = Path("examples/reasoning/config.yaml").read_text(encoding="utf-8")
     vllm_example_yaml = Path("examples/reasoning/config_vllm.yaml").read_text(
         encoding="utf-8"
     )
+    pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert "model:" not in example_yaml
     assert "trainer:" not in example_yaml
     assert "common:" in example_yaml
@@ -1318,18 +1320,30 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "serving:\n  num_threads: 1\n  debug_live_rollout:" in example_yaml
     assert "debug_live_rollout:" in docs
     assert "backend: vllm" in vllm_example_yaml
-    assert "runtime_python: ~/.venv-vllm/bin/python" in vllm_example_yaml
-    assert "vllm_args:" in vllm_example_yaml
+    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
+    assert "~/.venv-vllm" not in vllm_example_yaml
+    assert "~/.venv-vllm-metal" not in vllm_example_yaml
+    assert "vllm_args:" not in vllm_example_yaml
+    assert 'requires-python = ">=3.10"' in pyproject
+    assert '[project.optional-dependencies]' in pyproject
+    assert 'vllm = [' in pyproject
+    assert '"vllm>=0.16.0"' in pyproject
+    dependencies_block = pyproject.split("[project.optional-dependencies]", maxsplit=1)[0]
+    assert '"vllm>=0.16.0"' not in dependencies_block
 
 
 def test_dev_sh_metrics_commands_and_compose_validation() -> None:
     """The dev helper should expose metrics commands and the compose file should validate."""
     script = Path("dev.sh").read_text(encoding="utf-8")
     assert "metrics <up|down|reset|status>" in script
+    assert "vllm <setup|status>" in script
     assert "metrics_up()" in script
     assert "metrics_down()" in script
     assert "metrics_reset()" in script
     assert "metrics_status()" in script
+    assert "vllm_setup()" in script
+    assert "vllm_status()" in script
+    assert "FLASHRL_VLLM_PYTHON" in script
     assert 'GRAFANA_URL="http://localhost:3000"' in script
     assert 'PROMETHEUS_URL="http://localhost:9090"' in script
     assert 'PUSHGATEWAY_URL="http://localhost:9091"' in script
@@ -1352,6 +1366,55 @@ def test_dev_sh_metrics_commands_and_compose_validation() -> None:
             stderr=subprocess.PIPE,
             text=True,
         )
+
+
+def test_dev_sh_vllm_status_reports_prepared_runtime(tmp_path: Path) -> None:
+    """`./dev.sh vllm status` should report a prepared runtime deterministically."""
+    fake_home = tmp_path / "home"
+    runtime_dir = fake_home / ".venv-vllm-metal" / "bin"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    python_path = runtime_dir / "python"
+    python_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python_path.chmod(0o755)
+
+    result = subprocess.run(
+        ["bash", "-lc", "HOME=\"$1\" ./dev.sh vllm status", "_", str(fake_home)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=Path.cwd(),
+    )
+
+    assert f"Prepared vLLM runtime: {python_path}" in result.stdout
+    assert f'export FLASHRL_VLLM_PYTHON="{python_path}"' in result.stdout
+
+
+def test_source_dev_sh_auto_exports_flashrl_vllm_python(tmp_path: Path) -> None:
+    """`source ./dev.sh` should auto-export the default prepared vLLM runtime."""
+    fake_home = tmp_path / "home"
+    runtime_dir = fake_home / ".venv-vllm-metal" / "bin"
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+    python_path = runtime_dir / "python"
+    python_path.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    python_path.chmod(0o755)
+
+    result = subprocess.run(
+        [
+            "bash",
+            "-lc",
+            "HOME=\"$1\"; source ./dev.sh >/dev/null; printf '%s' \"$FLASHRL_VLLM_PYTHON\"",
+            "_",
+            str(fake_home),
+        ],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=Path.cwd(),
+    )
+
+    assert result.stdout == str(python_path)
 
 
 def test_dev_sh_metrics_up_waits_for_endpoint_readiness(tmp_path: Path) -> None:
