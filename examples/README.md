@@ -26,9 +26,9 @@ python3 -m examples.reasoning.train
 python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```
 
-**Run with the experimental `vllm_metal` serving backend on Apple silicon:**
+**Run with the managed `vllm` serving backend:**
 ```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm_metal.yaml
+python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm.yaml
 ```
 
 **Inspect runs after training:**
@@ -51,7 +51,7 @@ have them.
 - keeps the public rollout hook sample-oriented: one rollout per input prompt
 - treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
 - supports `serving.debug_live_rollout: true` for slower token-level live serving debug with TTFT/TPOT capture
-- supports `serving.backend: vllm_metal` for an experimental separate-runtime Metal path on macOS arm64
+- supports `serving.backend: vllm` for managed local `vllm serve` replicas in a separate Python runtime
 
 **Shared defaults with training/serving overrides:**
 ```yaml
@@ -90,22 +90,29 @@ hooks:
   dataset_fn: examples.reasoning.train:build_dataset
 ```
 
-## Experimental vLLM Metal Backend
+## Managed vLLM Backend
 
-Use `serving.backend: vllm_metal` when you want FlashRL to launch a separate
-local worker backed by a `vllm-metal` install in its own Python runtime.
+Use `serving.backend: vllm` when you want FlashRL to launch managed local
+`vllm serve` processes in a separate Python runtime.
 
 ```yaml
 serving:
-  backend: vllm_metal
-  runtime_python: ~/.venv-vllm-metal/bin/python
+  backend: vllm
+  runtime_python: ~/.venv-vllm/bin/python
+  num_replicas: 2
   debug_live_rollout: false
+  vllm_args:
+    - --dtype=float16
+    - --max-model-len=4096
+    - --gpu-memory-utilization=0.85
+    - --max-num-seqs=32
+    - --enable-prefix-caching
 ```
 
 Notes:
-- macOS arm64 only
-- experimental and slower to sync than the default in-process `huggingface` backend
-- `serving.debug_live_rollout: true` is not supported with `vllm_metal`
+- FlashRL uses `/v1/completions` against the managed local vLLM servers
+- the backend keeps restart-based weight sync after optimizer steps
+- `serving.debug_live_rollout: true` is not supported with `vllm`
 
 ## Local Observability
 

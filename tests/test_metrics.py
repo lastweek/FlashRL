@@ -1281,14 +1281,14 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("examples/reasoning/__init__.py").exists()
     assert Path("examples/reasoning/train.py").exists()
     assert Path("examples/reasoning/config.yaml").exists()
-    assert Path("examples/reasoning/config_vllm_metal.yaml").exists()
+    assert Path("examples/reasoning/config_vllm.yaml").exists()
 
     docs = Path("examples/README.md").read_text(encoding="utf-8")
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
     assert "python3 -m examples.reasoning.train" in docs
     assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in docs
-    assert "config_vllm_metal.yaml" in docs
+    assert "config_vllm.yaml" in docs
     assert "model:" not in docs
     assert "trainer:" not in docs
     assert "common:" in docs
@@ -1300,11 +1300,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
-    assert "serving.backend: vllm_metal" in docs
-    assert "runtime_python: ~/.venv-vllm-metal/bin/python" in docs
+    assert "serving.backend: vllm" in docs
+    assert "runtime_python: ~/.venv-vllm/bin/python" in docs
 
     example_yaml = Path("examples/reasoning/config.yaml").read_text(encoding="utf-8")
-    vllm_example_yaml = Path("examples/reasoning/config_vllm_metal.yaml").read_text(
+    vllm_example_yaml = Path("examples/reasoning/config_vllm.yaml").read_text(
         encoding="utf-8"
     )
     assert "model:" not in example_yaml
@@ -1317,8 +1317,9 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "training:\n  num_threads: 1" in example_yaml
     assert "serving:\n  num_threads: 1\n  debug_live_rollout:" in example_yaml
     assert "debug_live_rollout:" in docs
-    assert "backend: vllm_metal" in vllm_example_yaml
-    assert "runtime_python: ~/.venv-vllm-metal/bin/python" in vllm_example_yaml
+    assert "backend: vllm" in vllm_example_yaml
+    assert "runtime_python: ~/.venv-vllm/bin/python" in vllm_example_yaml
+    assert "vllm_args:" in vllm_example_yaml
 
 
 def test_dev_sh_metrics_commands_and_compose_validation() -> None:

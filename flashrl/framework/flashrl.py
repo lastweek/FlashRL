@@ -73,6 +73,8 @@ COMMON_MODEL_SECTION_FIELDS = {
 SERVING_ONLY_SECTION_FIELDS = {
     "backend",
     "runtime_python",
+    "num_replicas",
+    "vllm_args",
     "debug_live_rollout",
 }
 
@@ -279,10 +281,7 @@ class FlashRL:
         )
 
         started_at = time.perf_counter()
-        self._serving_backend = create_serving_backend(
-            self.serving_config,
-            training_actor=self._training_backend.actor,
-        )
+        self._serving_backend = create_serving_backend(self.serving_config)
         duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
         self._runtime_bootstrap_totals["startup_serving_backend_seconds"] = duration_seconds

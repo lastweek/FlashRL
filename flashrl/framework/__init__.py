@@ -31,7 +31,7 @@ from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.serving import (
     HuggingFaceServingBackend,
     ServingBackend,
-    VLLMMetalServingBackend,
+    VLLMServingBackend,
     create_serving_backend,
 )
 
@@ -64,7 +64,7 @@ __all__ = [
     # Backends
     "ServingBackend",
     "HuggingFaceServingBackend",
-    "VLLMMetalServingBackend",
+    "VLLMServingBackend",
     "create_serving_backend",
     "TrainingBackend",
 ]
