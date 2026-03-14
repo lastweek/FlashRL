@@ -1687,7 +1687,6 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("examples/reasoning/train.py").exists()
     assert Path("examples/reasoning/config.yaml").exists()
     assert Path("examples/reasoning/config_vllm.yaml").exists()
-    assert Path("examples/reasoning/math.yaml").exists()
 
     docs = Path("examples/README.md").read_text(encoding="utf-8")
     reasoning_docs = Path("examples/reasoning/README.md").read_text(encoding="utf-8")
@@ -1703,8 +1702,10 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "python3 -m examples.reasoning.train" in reasoning_docs
     assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in reasoning_docs
     assert "config_vllm.yaml" in reasoning_docs
-    assert "math.yaml" in reasoning_docs
-    assert "--task-config examples/reasoning/math.yaml" in reasoning_docs
+    assert "--train-limit" in reasoning_docs
+    assert "--eval-limit" in reasoning_docs
+    assert "--checkpoint-out" in reasoning_docs
+    assert "math.yaml" not in reasoning_docs
     assert "model:" not in reasoning_docs
     assert "trainer:" not in reasoning_docs
     assert "common.model_name" in reasoning_docs

@@ -761,12 +761,14 @@ def test_run_logger_compact_console_groups_step_output(
     assert "  done" in transcript
     assert "dominant rollout" in transcript
     assert (
-        "\n\nstep 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
+        "\n  ------------------------------------------------------------------------\n"
+        "step 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
         "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
         in transcript
     )
     assert (
-        "\n\nstep 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
+        "\n  ------------------------------------------------------------------------\n"
+        "step 2/2  epoch 1/1  batch 2/2  prompt_window=3-4/4  "
         "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
         in plain_captured
     )
@@ -890,19 +892,22 @@ def test_run_logger_verbose_console_separates_step_blocks(tmp_path: Path) -> Non
     transcript = logger.console_path.read_text(encoding="utf-8")
 
     assert (
-        "\n\nstep=2 epoch=1/1 batch=2/2 prompt_window=3-3/3 completions_this_step=2 "
+        "\n  ------------------------------------------------------------------------\n"
+        "step 2/?  epoch 1/1  batch 2/2  prompt_window=3-3/3  "
+        "prompts_this_step=1/2  completions_per_prompt=2  completions_this_step=2/4\n"
+        "step=2 epoch=1/1 batch=2/2 prompt_window=3-3/3 completions_this_step=2 "
         "prompts_this_step=1 planned_prompts_per_step=2 completions_per_prompt=2 "
         "planned_completions_per_step=4 stage=rollout"
     ) in transcript
     assert "\n\nepoch 1 summary" not in transcript
 
 
-def test_run_logger_serving_debug_streams_terminal_only_fragments(
+def test_run_logger_serving_debug_uses_compact_terminal_status_and_keeps_file_transcript(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
 ) -> None:
-    """Serving debug chunks should stream to terminal but not be persisted as fragments."""
+    """Serving debug should stay step-first in both terminal and console transcripts."""
     monkeypatch.setenv("TERM", "xterm-256color")
     monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     logger = RunLogger(
@@ -1017,27 +1022,42 @@ def test_run_logger_serving_debug_streams_terminal_only_fragments(
     events = read_events(logger.run_dir)
 
     assert "\x1b[" in captured
-    assert "serve step=1 epoch=1/1 batch=1/1 prompt=1/1 completions_per_prompt=4" in plain_captured
-    assert "  prompt: Please solve this step by step." in plain_captured
-    assert "          Question: What is 15 + 27?" in plain_captured
-    assert "  candidate 1/4" in plain_captured
-    assert "  candidate 2/4" in plain_captured
-    assert "\n\n  candidate 2/4" in transcript
-    assert "  ========================================================================" in transcript
-    assert "serve step=1 epoch=1/1 batch=1/1 prompt=2/2 completions_per_prompt=4" in transcript
-    assert "  prompt: This is a deliberately long prompt that should wrap across multiple lines and" in transcript
-    assert "[truncated]" in transcript
-    assert "partial" in captured
-    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in plain_captured
     assert (
-        "\n\nstep 2/?  epoch 1/1  batch 1/1  prompt_window=1-2/2  "
+        "step 1/?  epoch 1/1  batch 1/1  prompt_window=?-?/?  "
+        "prompts_this_step=1/?  completions_per_prompt=4  completions_this_step=?/?"
+        in plain_captured
+    )
+    assert plain_captured.index("step 1/?  epoch 1/1") < plain_captured.index("  prompt 1/1")
+    assert "  prompt 1/1  Please solve this step by step. Question: What is 15 + 27?" in plain_captured
+    assert "    rollout 1/4 running..." in plain_captured
+    assert "    rollout 1/4 done  ttft=200.0ms  tpot=50.0ms  tokens=6  total=350.0ms" in plain_captured
+    assert "    rollout 2/4 running..." in plain_captured
+    assert "    rollout 2/4 done  ttft=200.0ms  tpot=50.0ms  tokens=6  total=350.0ms" in plain_captured
+    assert "  prompt 2/2  This is a deliberately long prompt that should wrap across multiple lines" in plain_captured
+    assert "\r" in captured
+    assert "partial" not in plain_captured
+    assert "serve step=1 epoch=1/1 batch=1/1 prompt=1/1 completions_per_prompt=4" not in plain_captured
+    assert (
+        "step 1/?  epoch 1/1  batch 1/1  prompt_window=?-?/?  "
+        "prompts_this_step=1/?  completions_per_prompt=4  completions_this_step=?/?"
+        in transcript
+    )
+    assert transcript.index("step 1/?  epoch 1/1") < transcript.index("  prompt 1/1")
+    assert "\n    rollout 2/4 running...\n    rollout 2/4 done  ttft=200.0ms  tpot=50.0ms  tokens=6  total=350.0ms" in transcript
+    assert "\n\n  prompt 2/2  This is a deliberately long prompt that should wrap across multiple lines" in transcript
+    assert "[truncated]" not in transcript
+    assert "serve step=" not in transcript
+    assert "  candidate " not in transcript
+    assert "serve_done" not in transcript
+    assert (
+        "\n  ------------------------------------------------------------------------\n"
+        "step 2/?  epoch 1/1  batch 1/1  prompt_window=1-2/2  "
         "prompts_this_step=2/2  completions_per_prompt=4  completions_this_step=4/8"
         in transcript
     )
-    assert "\n\n\nstep 2/?" not in transcript
+    assert "\n  ------------------------------------------------------------------------\n  ------------------------------------------------------------------------\nstep 2/?" not in transcript
     assert "part" not in transcript
     assert "ial" not in transcript
-    assert "serve_done ttft=200.0ms tpot=50.0ms tokens=6 total=350.0ms" in transcript
     assert "\x1b[" not in transcript
     serving_events = [event for event in events if event["event"] == "serving_debug"]
     assert len(serving_events) == 3

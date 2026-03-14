@@ -59,8 +59,11 @@ def test_actor_model_generate_returns_completion_only_and_restores_padding(
     assert tiny_tokenizer.calls[0]["padding_side"] == "left"
     assert actor.tokenizer.padding_side == "right"
     assert actor.tokenizer.pad_token == actor.tokenizer.eos_token
+    assert actor.tokenizer.pad_token_id == actor.tokenizer.eos_token_id
     assert tiny_model.last_generate_kwargs is not None
     assert tiny_model.last_generate_kwargs["input_ids"].shape[0] == 2
+    assert tiny_model.last_generate_kwargs["pad_token_id"] == actor.tokenizer.eos_token_id
+    assert tiny_model.last_generate_kwargs["eos_token_id"] == actor.tokenizer.eos_token_id
 
 
 def test_actor_model_generation_defaults_merge_with_call_overrides(
@@ -198,6 +201,8 @@ def test_actor_model_debug_live_rollout_uses_sequential_path_and_emits_timings(
     assert sample.metadata["tpot_seconds"] == pytest.approx(0.6)
     assert sample.metadata["generation_seconds"] == pytest.approx(0.8)
     assert sample.metadata["response_token_count"] == len(sample.response_token_ids)
+    assert tiny_model.last_generate_kwargs is not None
+    assert tiny_model.last_generate_kwargs["pad_token_id"] == actor.tokenizer.pad_token_id
     assert [kind for kind, _ in events] == ["start", "chunk", "chunk", "done"]
 
 

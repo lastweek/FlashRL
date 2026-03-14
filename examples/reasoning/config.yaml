@@ -1,4 +1,4 @@
-# FlashRL runtime/training profile only. Math-example knobs live in math.yaml.
+# FlashRL runtime/training profile for the reasoning example.
 common:
   model_name: Qwen/Qwen2.5-0.5B
 

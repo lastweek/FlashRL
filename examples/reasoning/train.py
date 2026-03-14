@@ -25,10 +25,15 @@ from flashrl.framework.data_models import (
 )
 
 
-GSM8K_DATASET_CANDIDATES = (
+DEFAULT_GSM8K_DATASET_CANDIDATES = (
     ("openai/gsm8k", "main"),
     ("gsm8k", "main"),
 )
+DEFAULT_GSM8K_SOURCE = "gsm8k"
+DEFAULT_GSM8K_TRAIN_SPLIT = "train"
+DEFAULT_GSM8K_EVAL_SPLIT = "test"
+DEFAULT_REASONING_CHECKPOINT_PATH = "/tmp/flashrl_reasoning_checkpoint.pt"
+DEFAULT_REASONING_EVAL_BATCH_SIZE = 8
 FINAL_ANSWER_PATTERN = re.compile(r"####\s*(.+)$", re.MULTILINE)
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_BLOCK_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -38,7 +43,10 @@ STRICT_RESPONSE_PATTERN = re.compile(
 )
 
 
-def render_reasoning_prompt(problem: str) -> str:
+# Prompt contract
+
+
+def render_math_prompt(problem: str) -> str:
     """Render one strict user prompt with no system role."""
     return (
         "Solve the following math problem.\n"
@@ -50,7 +58,134 @@ def render_reasoning_prompt(problem: str) -> str:
     )
 
 
-def _normalize_answer_text(text: str) -> str:
+# Dataset loading
+
+
+def _coerce_positive_int(value: Any, *, field_name: str) -> int:
+    """Validate one positive integer value."""
+    parsed = int(value)
+    if parsed < 1:
+        raise ValueError(f"{field_name} must be >= 1 (got {parsed}).")
+    return parsed
+
+
+def _resolve_math_limit(*, split_kind: str, explicit_limit: int | None) -> int | None:
+    """Validate explicit CLI limits for the current dataset split."""
+    if explicit_limit is not None:
+        return _coerce_positive_int(explicit_limit, field_name=f"{split_kind}_limit")
+    return None
+
+
+def _load_gsm8k_split(
+    split: str,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    """Load and normalize one GSM8K split."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:  # pragma: no cover - exercised in live example usage
+        raise RuntimeError(
+            "examples.reasoning requires the `datasets` package to load GSM8K. "
+            "Install project dependencies or `pip install datasets`."
+        ) from exc
+
+    dataset_error: Exception | None = None
+    raw_dataset = None
+    for dataset_name, config_name in DEFAULT_GSM8K_DATASET_CANDIDATES:
+        try:
+            raw_dataset = load_dataset(dataset_name, config_name, split=split)
+            break
+        except Exception as exc:  # pragma: no cover - depends on external dataset availability
+            dataset_error = exc
+    if raw_dataset is None:
+        raise RuntimeError("Unable to load GSM8K from Hugging Face.") from dataset_error
+
+    if limit is not None and hasattr(raw_dataset, "select"):
+        raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
+
+    rows: list[dict[str, str]] = []
+    for index, row in enumerate(raw_dataset):
+        task_id = str(row.get("id") or f"gsm8k-{split}-{index:06d}")
+        problem = str(row["question"]).strip()
+        final_answer = _extract_math_target_answer(str(row["answer"]))
+        rows.append(
+            {
+                "task_id": task_id,
+                "source": DEFAULT_GSM8K_SOURCE,
+                "split": split,
+                "problem": problem,
+                "final_answer": final_answer,
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
+
+
+def build_math_train_dataset(
+    limit: int | None = None,
+) -> list[Prompt]:
+    """Build the math training dataset for both YAML hooks and the example CLI."""
+    resolved_limit = _resolve_math_limit(
+        split_kind="train",
+        explicit_limit=limit,
+    )
+    rows = _load_gsm8k_split(
+        DEFAULT_GSM8K_TRAIN_SPLIT,
+        limit=resolved_limit,
+    )
+    return [
+        Prompt(
+            text=render_math_prompt(row["problem"]),
+            metadata={
+                "task_id": row["task_id"],
+                "source": row["source"],
+                "split": row["split"],
+                "problem": row["problem"],
+                "final_answer": row["final_answer"],
+                "verifier": "numeric_exact",
+            },
+        )
+        for row in rows
+    ]
+
+
+def build_math_eval_dataset(
+    limit: int | None = None,
+) -> list[Prompt]:
+    """Build the held-out math evaluation dataset."""
+    resolved_limit = _resolve_math_limit(
+        split_kind="eval",
+        explicit_limit=limit,
+    )
+    rows = _load_gsm8k_split(
+        DEFAULT_GSM8K_EVAL_SPLIT,
+        limit=resolved_limit,
+    )
+    return [
+        Prompt(
+            text=render_math_prompt(row["problem"]),
+            metadata={
+                "task_id": row["task_id"],
+                "source": row["source"],
+                "split": row["split"],
+                "problem": row["problem"],
+                "final_answer": row["final_answer"],
+                "verifier": "numeric_exact",
+            },
+        )
+        for row in rows
+    ]
+
+
+# Answer parsing and normalization
+
+
+# GSM8K mixes commas, currency markers, fractions, and decimal spellings in the
+# final `####` target. Normalizing them here keeps the reward exact-match based
+# without making the reward function itself hard to read.
+def _normalize_math_answer(text: str) -> str:
     """Normalize one answer string for exact-match comparison."""
     value = str(text).strip()
     value = value.replace("\u2212", "-")
@@ -80,144 +215,15 @@ def _normalize_answer_text(text: str) -> str:
     return normalized
 
 
-def _extract_ground_truth_answer(raw_answer: str) -> str:
+def _extract_math_target_answer(raw_answer: str) -> str:
     """Extract and normalize the final GSM8K answer after the `####` marker."""
     match = FINAL_ANSWER_PATTERN.search(raw_answer)
     if match is None:
         raise ValueError(f"GSM8K answer is missing a final '####' marker: {raw_answer[:80]!r}")
-    normalized = _normalize_answer_text(match.group(1))
+    normalized = _normalize_math_answer(match.group(1))
     if not normalized:
         raise ValueError(f"GSM8K answer normalized to empty text: {raw_answer[:80]!r}")
     return normalized
-
-
-def _dataset_limit_from_env(split: str) -> int | None:
-    """Read an optional dataset limit from environment variables."""
-    specific_key = f"FLASHRL_REASONING_{split.upper()}_LIMIT"
-    raw_value = os.environ.get(specific_key) or os.environ.get("FLASHRL_REASONING_DATASET_LIMIT")
-    if raw_value is None:
-        return None
-    limit = int(raw_value)
-    if limit < 1:
-        raise ValueError(f"{specific_key} must be >= 1 when set (got {limit}).")
-    return limit
-
-
-def _load_gsm8k_split(
-    split: str,
-    *,
-    limit: int | None = None,
-) -> list[dict[str, str]]:
-    """Load and normalize one GSM8K split."""
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - exercised in live example usage
-        raise RuntimeError(
-            "examples.reasoning requires the `datasets` package to load GSM8K. "
-            "Install project dependencies or `pip install datasets`."
-        ) from exc
-
-    dataset_error: Exception | None = None
-    raw_dataset = None
-    for dataset_name, config_name in GSM8K_DATASET_CANDIDATES:
-        try:
-            raw_dataset = load_dataset(dataset_name, config_name, split=split)
-            break
-        except Exception as exc:  # pragma: no cover - depends on external dataset availability
-            dataset_error = exc
-    if raw_dataset is None:
-        raise RuntimeError("Unable to load GSM8K from Hugging Face.") from dataset_error
-
-    if limit is not None and hasattr(raw_dataset, "select"):
-        raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
-
-    rows: list[dict[str, str]] = []
-    for index, row in enumerate(raw_dataset):
-        task_id = str(row.get("id") or f"gsm8k-{split}-{index:06d}")
-        problem = str(row["question"]).strip()
-        final_answer = _extract_ground_truth_answer(str(row["answer"]))
-        rows.append(
-            {
-                "task_id": task_id,
-                "source": "gsm8k",
-                "split": split,
-                "problem": problem,
-                "final_answer": final_answer,
-            }
-        )
-        if limit is not None and len(rows) >= limit:
-            break
-    return rows
-
-
-def _build_prompt_dataset(split: str, limit: int | None = None) -> list[Prompt]:
-    """Build one prompt dataset split with stable metadata."""
-    resolved_limit = _dataset_limit_from_env(split) if limit is None else limit
-    rows = _load_gsm8k_split(split, limit=resolved_limit)
-    prompts: list[Prompt] = []
-    for row in rows:
-        prompts.append(
-            Prompt(
-                text=render_reasoning_prompt(row["problem"]),
-                metadata={
-                    "task_id": row["task_id"],
-                    "source": row["source"],
-                    "split": row["split"],
-                    "problem": row["problem"],
-                    "final_answer": row["final_answer"],
-                    "verifier": "numeric_exact",
-                },
-            )
-        )
-    return prompts
-
-
-def build_dataset() -> list[Prompt]:
-    """Build the training split used by the YAML example."""
-    return _build_prompt_dataset("train")
-
-
-def build_eval_dataset(limit: int | None = None) -> list[Prompt]:
-    """Build the held-out evaluation split."""
-    return _build_prompt_dataset("test", limit=limit)
-
-
-def reasoning_rollout_fn(
-    prompts: list[Prompt],
-    serving_backend,
-) -> list[RolloutOutput]:
-    """Generate one reasoning rollout per prompt with the serving backend."""
-    samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
-    rollouts: list[RolloutOutput] = []
-    for prompt, sample in zip(prompts, samples, strict=True):
-        rollouts.append(
-            RolloutOutput(
-                text=sample.text,
-                log_prob=sample.log_prob,
-                prompt_token_ids=sample.prompt_token_ids,
-                response_token_ids=sample.response_token_ids,
-                response_token_logprobs=sample.response_token_logprobs,
-                metadata={
-                    **dict(sample.metadata),
-                    "prompt_metadata": dict(prompt.metadata),
-                },
-                conversation=Conversation(
-                    messages=[
-                        Message(role="user", content=prompt.text),
-                        Message(role="assistant", content=sample.text),
-                    ]
-                ),
-            )
-        )
-    return rollouts
-
-
-def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
-    """Recover the original prompt metadata attached by the rollout hook."""
-    prompt_metadata = rollout.metadata.get("prompt_metadata")
-    if isinstance(prompt_metadata, dict):
-        return prompt_metadata
-    return {}
 
 
 def _extract_answer_block(response_text: str) -> str | None:
@@ -231,11 +237,22 @@ def _extract_answer_block(response_text: str) -> str | None:
     return answer_text
 
 
-def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
+# Reward logic
+
+
+def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
+    """Recover the original prompt metadata attached by the rollout hook."""
+    prompt_metadata = rollout.metadata.get("prompt_metadata")
+    if isinstance(prompt_metadata, dict):
+        return prompt_metadata
+    return {}
+
+
+def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     """Compute strict format and exact-answer rewards from rollout metadata."""
     text = rollout.text
     prompt_metadata = _prompt_metadata_from_rollout(rollout)
-    expected_answer = _normalize_answer_text(str(prompt_metadata.get("final_answer", "")))
+    expected_answer = _normalize_math_answer(str(prompt_metadata.get("final_answer", "")))
     finish_reason = rollout.metadata.get("finish_reason")
     truncated = finish_reason == "length"
 
@@ -243,12 +260,15 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     answer_blocks = ANSWER_BLOCK_PATTERN.findall(text)
     strict_match = STRICT_RESPONSE_PATTERN.fullmatch(text)
     parsed_answer = _extract_answer_block(text)
-    normalized_answer = _normalize_answer_text(parsed_answer or "")
+    normalized_answer = _normalize_math_answer(parsed_answer or "")
 
     has_single_think_block = len(think_blocks) == 1
     has_single_answer_block = len(answer_blocks) == 1
     think_content = strict_match.group("think").strip() if strict_match is not None else ""
     answer_content = strict_match.group("answer").strip() if strict_match is not None else ""
+
+    # The format bonus is intentionally strict: any duplicate tag, missing close
+    # tag, or trailing text after `</answer>` should fail the structure check.
     format_pass = bool(
         strict_match is not None
         and has_single_think_block
@@ -285,18 +305,49 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     )
 
 
-def build_argument_parser() -> argparse.ArgumentParser:
-    """Build the example CLI parser."""
-    parser = argparse.ArgumentParser(description="Run the FlashRL reasoning example.")
-    parser.add_argument(
-        "--config",
-        default=str(Path(__file__).with_name("config_vllm.yaml")),
-        help="Path to the example YAML config file.",
-    )
-    return parser
+# Future code reasoning can live below as explicit `code_*` helpers later.
+# Keep this example concrete until we have real code-task data and verifiers.
 
 
-def _default_vllm_python() -> str | None:
+# Rollout hook
+
+
+def reasoning_rollout_fn(
+    prompts: list[Prompt],
+    serving_backend,
+) -> list[RolloutOutput]:
+    """Generate one rollout per prompt with prompt metadata attached."""
+    samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
+    rollouts: list[RolloutOutput] = []
+    for prompt, sample in zip(prompts, samples, strict=True):
+        # The reward only sees RolloutOutput, so we copy the prompt metadata here
+        # instead of reparsing the original prompt text later.
+        rollouts.append(
+            RolloutOutput(
+                text=sample.text,
+                log_prob=sample.log_prob,
+                prompt_token_ids=sample.prompt_token_ids,
+                response_token_ids=sample.response_token_ids,
+                response_token_logprobs=sample.response_token_logprobs,
+                metadata={
+                    **dict(sample.metadata),
+                    "prompt_metadata": dict(prompt.metadata),
+                },
+                conversation=Conversation(
+                    messages=[
+                        Message(role="user", content=prompt.text),
+                        Message(role="assistant", content=sample.text),
+                    ]
+                ),
+            )
+        )
+    return rollouts
+
+
+# Runtime and CLI helpers
+
+
+def find_default_vllm_python() -> str | None:
     """Return a prepared default vLLM runtime when one is available."""
     candidates: list[Path] = []
     if sys.platform == "darwin" and os.uname().machine == "arm64":
@@ -318,29 +369,62 @@ def _default_vllm_python() -> str | None:
     return str(current_python)
 
 
-def _prepare_example_environment(config_path: str) -> None:
+def prepare_reasoning_environment(config_path: str) -> None:
     """Populate example-only env defaults before YAML config loading."""
     if os.environ.get("FLASHRL_VLLM_PYTHON"):
         return
     if Path(config_path).name != "config_vllm.yaml":
         return
 
-    runtime_python = _default_vllm_python()
+    # This keeps the example one-command friendly when the repo's dedicated vLLM
+    # runtime exists, without forcing users to hardcode runtime_python by hand.
+    runtime_python = find_default_vllm_python()
     if runtime_python is not None:
         os.environ["FLASHRL_VLLM_PYTHON"] = runtime_python
 
 
+def build_argument_parser() -> argparse.ArgumentParser:
+    """Build the math example CLI parser."""
+    parser = argparse.ArgumentParser(description="Run the FlashRL math reasoning example.")
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).with_name("config_vllm.yaml")),
+        help="Path to the FlashRL runtime/training profile.",
+    )
+    parser.add_argument(
+        "--train-limit",
+        type=int,
+        default=None,
+        help="Optional number of training questions to load.",
+    )
+    parser.add_argument(
+        "--checkpoint",
+        default=None,
+        help="Optional checkpoint path to load before training.",
+    )
+    parser.add_argument(
+        "--checkpoint-out",
+        default=None,
+        help="Optional checkpoint path to save after training.",
+    )
+    return parser
+
+
 def main(argv: list[str] | None = None) -> int:
-    """Run the reasoning example from YAML."""
+    """Run the math reasoning example from the selected FlashRL profile."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    _prepare_example_environment(args.config)
+    prepare_reasoning_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
+        dataset = build_math_train_dataset(limit=args.train_limit)
         flashrl = FlashRL.from_yaml(args.config)
-        flashrl.train()
-        flashrl.save_checkpoint("/tmp/flashrl_reasoning_checkpoint.pt")
+        if args.checkpoint:
+            flashrl.load_checkpoint(args.checkpoint)
+        flashrl.train(dataset)
+        checkpoint_out = args.checkpoint_out or DEFAULT_REASONING_CHECKPOINT_PATH
+        flashrl.save_checkpoint(checkpoint_out)
     except Exception as exc:
         print(f"\nFlashRL reasoning example failed: {exc}", file=sys.stderr)
         print(
@@ -348,8 +432,13 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(
-            "If you're offline or have network issues, use a local model in the YAML config "
+            "If you're offline or have network issues, use a local model in the YAML profile "
             "and make sure Hugging Face dataset access is available.",
+            file=sys.stderr,
+        )
+        print(
+            "Use --train-limit to cap the GSM8K training set and --checkpoint-out to control "
+            "where the final checkpoint is written.",
             file=sys.stderr,
         )
         print(

@@ -1,4 +1,4 @@
-"""Held-out evaluation for the strict reasoning example."""
+"""Held-out evaluation for the strict math reasoning example."""
 
 from __future__ import annotations
 
@@ -11,11 +11,14 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flashrl.framework import FlashRL
+from flashrl.framework.data_models import Prompt
 
 from examples.reasoning.train import (
-    _prepare_example_environment,
-    build_eval_dataset,
-    reasoning_reward_fn,
+    DEFAULT_REASONING_CHECKPOINT_PATH,
+    DEFAULT_REASONING_EVAL_BATCH_SIZE,
+    build_math_eval_dataset,
+    math_reward_fn,
+    prepare_reasoning_environment,
     reasoning_rollout_fn,
 )
 
@@ -23,11 +26,10 @@ from examples.reasoning.train import (
 def evaluate_model(
     flashrl: FlashRL,
     *,
-    limit: int | None = None,
-    batch_size: int = 8,
+    dataset: list[Prompt],
+    batch_size: int,
 ) -> dict[str, float | int]:
     """Run held-out evaluation against the current serving backend."""
-    dataset = build_eval_dataset(limit=limit)
     if batch_size < 1:
         raise ValueError(f"batch_size must be >= 1, got {batch_size}")
 
@@ -51,7 +53,7 @@ def evaluate_model(
     for start in range(0, len(dataset), batch_size):
         prompts = dataset[start:start + batch_size]
         rollouts = reasoning_rollout_fn(prompts, flashrl._serving_backend)
-        rewards = [reasoning_reward_fn(rollout) for rollout in rollouts]
+        rewards = [math_reward_fn(rollout) for rollout in rollouts]
         for reward in rewards:
             sample_count += 1
             total_reward += float(reward.reward)
@@ -79,11 +81,11 @@ def evaluate_model(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for held-out evaluation."""
-    parser = argparse.ArgumentParser(description="Evaluate the FlashRL reasoning example.")
+    parser = argparse.ArgumentParser(description="Evaluate the FlashRL math reasoning example.")
     parser.add_argument(
         "--config",
         default=str(Path(__file__).with_name("config_vllm.yaml")),
-        help="Path to the example YAML config file.",
+        help="Path to the FlashRL runtime/training profile.",
     )
     parser.add_argument(
         "--checkpoint",
@@ -91,16 +93,16 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Optional checkpoint path to load before evaluation.",
     )
     parser.add_argument(
-        "--limit",
+        "--eval-limit",
         type=int,
         default=None,
-        help="Optional number of held-out samples to evaluate.",
+        help="Optional number of held-out questions to evaluate.",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=8,
-        help="Number of held-out prompts to evaluate per generate_batch call.",
+        default=DEFAULT_REASONING_EVAL_BATCH_SIZE,
+        help="Optional number of prompts to evaluate per generate_batch call.",
     )
     return parser
 
@@ -109,17 +111,25 @@ def main(argv: list[str] | None = None) -> int:
     """Run held-out evaluation and print compact JSON metrics."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    _prepare_example_environment(args.config)
+    prepare_reasoning_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
+        dataset = build_math_eval_dataset(limit=args.eval_limit)
+        batch_size = args.batch_size
+        checkpoint = args.checkpoint
+        if checkpoint is None:
+            default_checkpoint = Path(DEFAULT_REASONING_CHECKPOINT_PATH)
+            if default_checkpoint.exists():
+                checkpoint = str(default_checkpoint)
+
         flashrl = FlashRL.from_yaml(args.config)
-        if args.checkpoint:
-            flashrl.load_checkpoint(args.checkpoint)
+        if checkpoint:
+            flashrl.load_checkpoint(checkpoint)
         metrics = evaluate_model(
             flashrl,
-            limit=args.limit,
-            batch_size=args.batch_size,
+            dataset=dataset,
+            batch_size=batch_size,
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:

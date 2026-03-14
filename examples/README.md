@@ -12,7 +12,7 @@ trains a base Qwen model with rule-based rewards, no system prompt, and a strict
 See [examples/reasoning/README.md](reasoning/README.md) for:
 
 - supported run modes
-- the split between `config*.yaml` and `math.yaml`
+- the CLI-first example workflow
 - config differences
 - evaluation commands
 - environment variables

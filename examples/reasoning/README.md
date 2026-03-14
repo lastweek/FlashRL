@@ -5,13 +5,12 @@ base Qwen model with rule-based rewards only, uses no system prompt, and
 requires exactly one `<think>...</think>` block followed by one
 `<answer>...</answer>` block.
 
-The example stays concrete on purpose:
+The example keeps one simple split of responsibility:
 
 - `config.yaml` and `config_vllm.yaml` control FlashRL runtime and training
   behavior.
-- `math.yaml` controls math-example specifics such as dataset source, split
-  names, default limits, checkpoint path, and eval batch size.
-- `train.py` and `eval.py` are the primary entrypoints.
+- `train.py` and `eval.py` control the math-example behavior through explicit
+  CLI flags.
 
 It is a math-only prototype for local experimentation. It is not a full
 DeepSeek-R1 reproduction, does not include cold-start SFT, and does not include
@@ -25,7 +24,6 @@ Run the commands below from the repository root.
 - `eval.py`: held-out evaluation entrypoint for GSM8K test.
 - `config.yaml`: cheap local Hugging Face profile.
 - `config_vllm.yaml`: canonical managed local vLLM profile.
-- `math.yaml`: math-example sidecar config.
 
 ## Config Responsibility
 
@@ -36,13 +34,12 @@ Use the files for different jobs:
   `common.model_name`, `training.batch_size`, `training.max_epochs`,
   `serving.backend`, `runtime.reference_enabled`, and `grpo.group_size`.
 
-- `math.yaml`
-  This is the example-side config. It owns things like:
-  dataset candidates, `train_split`, `eval_split`, default dataset limits,
-  default checkpoint path, and default eval batch size.
+- `train.py` / `eval.py` CLI flags
+  These own math-example details such as dataset limits, checkpoint paths, and
+  eval batch size.
 
-That separation keeps the example-specific knobs out of the main FlashRL run
-schema without inventing a new top-level YAML section.
+That keeps the example-specific knobs visible in `--help` instead of hidden in a
+second YAML file.
 
 ## Prerequisites
 
@@ -96,9 +93,7 @@ python3 -m examples.reasoning.train
 Equivalent explicit form:
 
 ```bash
-python3 -m examples.reasoning.train \
-  --config examples/reasoning/config_vllm.yaml \
-  --task-config examples/reasoning/math.yaml
+python3 -m examples.reasoning.train --config examples/reasoning/config_vllm.yaml
 ```
 
 ### Local Hugging Face debug training
@@ -116,23 +111,22 @@ support for rollout debugging.
 python3 -m examples.reasoning.eval
 ```
 
-By default, `eval.py` will try to load the checkpoint path from `math.yaml` if
-that file exists locally. If no checkpoint is found there, it evaluates the
-base model from the selected FlashRL profile.
+By default, `eval.py` will try to load
+`/tmp/flashrl_reasoning_checkpoint.pt` if that file exists. If not, it evaluates
+the base model from the selected FlashRL profile.
 
 Explicit checkpoint form:
 
 ```bash
 python3 -m examples.reasoning.eval \
   --config examples/reasoning/config_vllm.yaml \
-  --task-config examples/reasoning/math.yaml \
   --checkpoint /tmp/flashrl_reasoning_checkpoint.pt
 ```
 
 ### Advanced direct YAML entrypoint
 
-The framework entrypoint still works, but it uses the default `math.yaml`
-because only the FlashRL profile is passed directly:
+The framework entrypoint still works, but it only sees the FlashRL profile and
+therefore uses the built-in example defaults:
 
 ```bash
 python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
@@ -141,6 +135,8 @@ python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
 ```bash
 python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm.yaml
 ```
+
+Use `train.py` and `eval.py` when you want the more ergonomic example workflow.
 
 ## Run-Time Knobs
 
@@ -151,7 +147,6 @@ Useful flags:
 ```bash
 python3 -m examples.reasoning.train \
   --config examples/reasoning/config.yaml \
-  --task-config examples/reasoning/math.yaml \
   --train-limit 64 \
   --checkpoint-out /tmp/flashrl_reasoning_checkpoint.pt
 ```
@@ -159,7 +154,6 @@ python3 -m examples.reasoning.train \
 Available flags:
 
 - `--config`: FlashRL runtime/training profile.
-- `--task-config`: math-example sidecar config.
 - `--train-limit`: cap the number of GSM8K training questions.
 - `--checkpoint`: load a checkpoint before training.
 - `--checkpoint-out`: save the final checkpoint to a specific path.
@@ -171,7 +165,6 @@ Useful flags:
 ```bash
 python3 -m examples.reasoning.eval \
   --config examples/reasoning/config.yaml \
-  --task-config examples/reasoning/math.yaml \
   --eval-limit 50 \
   --batch-size 4
 ```
@@ -179,10 +172,9 @@ python3 -m examples.reasoning.eval \
 Available flags:
 
 - `--config`: FlashRL runtime/training profile.
-- `--task-config`: math-example sidecar config.
 - `--checkpoint`: load a checkpoint before evaluation.
 - `--eval-limit`: cap the number of held-out GSM8K questions.
-- `--batch-size`: override the eval batch size from `math.yaml`.
+- `--batch-size`: override the default eval batch size.
 
 ## Controlling How Many Questions Are Used
 
@@ -192,18 +184,7 @@ Three knobs matter, and they do different things:
 - Batch shape: how many prompts/completions are sampled per optimizer step.
 - Epoch count: how many passes training makes over the loaded questions.
 
-Use them in this order:
-
-1. CLI flags
-   `--train-limit` and `--eval-limit` are the clearest way to cap dataset size.
-2. `math.yaml`
-   `default_train_limit` and `default_eval_limit` become the example defaults.
-3. Environment fallback
-   `FLASHRL_REASONING_TRAIN_LIMIT`, `FLASHRL_REASONING_TEST_LIMIT`, and
-   `FLASHRL_REASONING_DATASET_LIMIT` still work if no CLI flag or `math.yaml`
-   default is set.
-
-Examples:
+Use these flags to control dataset size directly:
 
 ```bash
 python3 -m examples.reasoning.train --train-limit 100
@@ -213,17 +194,6 @@ python3 -m examples.reasoning.train --train-limit 100
 python3 -m examples.reasoning.eval --eval-limit 50
 ```
 
-Environment fallback example:
-
-```bash
-FLASHRL_REASONING_DATASET_LIMIT=32 python3 -m examples.reasoning.train --config examples/reasoning/config.yaml
-```
-
-`FLASHRL_REASONING_DATASET_LIMIT` means "use at most this many GSM8K questions
-when no split-specific override is set." `FLASHRL_REASONING_TRAIN_LIMIT` is the
-train override, and `FLASHRL_REASONING_TEST_LIMIT` is the held-out eval
-override.
-
 Related FlashRL profile knobs:
 
 - `training.batch_size` changes total sampled completions per optimizer step.
@@ -231,8 +201,9 @@ Related FlashRL profile knobs:
 - `training.max_epochs` changes how many times the loaded training questions are
   reused.
 
-So the number of distinct questions comes from the limit settings above, while
-total training exposure depends on both that limit and `training.max_epochs`.
+So the number of distinct questions comes from `--train-limit` or
+`--eval-limit`, while total training exposure depends on both that limit and
+`training.max_epochs`.
 
 ## Config Guide
 
@@ -276,8 +247,6 @@ The example does not fall back to parsing answers from free-form text.
 - `serving.runtime_python`: point vLLM mode at a prepared Python runtime.
 - `runtime.reference_enabled`: turn on the frozen reference model.
 - `grpo.kl_coefficient`: add KL regularization.
-- `math.yaml`: change dataset source, split names, default limits, checkpoint
-  path, or eval batch size.
 
 ## What To Expect
 
@@ -287,8 +256,8 @@ The example does not fall back to parsing answers from free-form text.
   `debug_live_rollout`.
 - Default configs are prototype-scale and meant for local experimentation, not
   benchmark reproduction.
-- Training saves a checkpoint to the configured `checkpoint_path` from
-  `math.yaml` unless `--checkpoint-out` overrides it.
+- Training saves a checkpoint to `/tmp/flashrl_reasoning_checkpoint.pt` unless
+  `--checkpoint-out` overrides it.
 - Run artifacts are written under `logs/` as `console.log`, `events.jsonl`, and
   `rollouts.jsonl`.
 

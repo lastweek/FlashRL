@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.reasoning.train import reasoning_reward_fn, render_reasoning_prompt
+from examples.reasoning.train import math_reward_fn, render_math_prompt
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
@@ -335,7 +335,7 @@ def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
     """The example reward should separate GRPO candidates within one prompt group."""
     trainer = build_trainer(batch_size=4, group_size=4)
     prompt = Prompt(
-        text=render_reasoning_prompt("What is 15 + 27?"),
+        text=render_math_prompt("What is 15 + 27?"),
         metadata={
             "task_id": "gsm8k-train-000000",
             "source": "gsm8k",
@@ -352,7 +352,7 @@ def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
         "<think>Add 15 and 27 to get 42.",
     ]
     rewards = [
-        reasoning_reward_fn(
+        math_reward_fn(
             RolloutOutput(
                 text=response,
                 log_prob=-0.1,

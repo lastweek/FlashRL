@@ -33,7 +33,9 @@ RUN_INDEX_WIDTH = 6
 PROMPT_WRAP_WIDTH = 88
 PROMPT_MAX_LINES = 6
 PROMPT_MAX_CHARS = 320
+PROMPT_GIST_MAX_CHARS = 96
 PROMPT_SEPARATOR = "  " + ("=" * 72)
+STEP_SEPARATOR = "  " + ("-" * 72)
 
 ANSI_RESET = "\033[0m"
 ANSI_STYLES = {
@@ -112,9 +114,10 @@ class RunLogger:
         self._stage_totals: dict[str, float] = {}
         self._total_batches = 0
         self._current_step_header: int | None = None
-        self._serving_stream_open = False
         self._current_serving_prompt_key: tuple[int, int] | None = None
         self._step_block_complete = False
+        self._terminal_serving_status_open = False
+        self._terminal_serving_status_length = 0
 
     def start_run(
         self,
@@ -283,21 +286,23 @@ class RunLogger:
             return
         self._emit_console(f"epoch {epoch}/{total_epochs} (batches={num_batches})")
 
+    def log_step_start(self, payload: dict[str, Any]) -> None:
+        """Log the start of a training step before rollout begins."""
+        if not self._should_log_step(int(payload["step"])):
+            return
+
+        self._emit_event("step_start", payload)
+        self._begin_step_block(payload)
+
     def log_step_stage(self, payload: dict[str, Any]) -> None:
         """Log one completed training stage."""
         if not self._should_log_step(int(payload["step"])):
             return
 
         self._emit_event("step_stage", payload)
-
-        if self._current_step_header != int(payload["step"]) and self._step_block_complete:
-            self._emit_console("")
-            self._step_block_complete = False
+        self._ensure_step_header(payload)
 
         if self.config.console_mode == "compact":
-            if self._current_step_header != int(payload["step"]):
-                self._emit_console(self._format_compact_step_header(payload))
-                self._current_step_header = int(payload["step"])
             self._emit_console(self._format_compact_stage_row(payload))
             return
 
@@ -310,6 +315,7 @@ class RunLogger:
 
     def log_step_done(self, payload: dict[str, Any]) -> None:
         """Log the completion of a training step."""
+        step = int(payload["step"])
         stage_timings = {
             key: float(value) for key, value in payload.get("stage_timings", {}).items()
         }
@@ -322,15 +328,15 @@ class RunLogger:
             self._slowest_step_seconds = step_duration_seconds
             self._dominant_stage = str(payload.get("dominant_stage", self._dominant_stage))
 
-        if not self._should_log_step(int(payload["step"])):
+        if not self._should_log_step(step):
+            if self._current_step_header == step:
+                self._step_block_complete = True
             return
 
         self._emit_event("step_done", payload)
+        self._ensure_step_header(payload)
 
         if self.config.console_mode == "compact":
-            if self._current_step_header != int(payload["step"]):
-                self._emit_console(self._format_compact_step_header(payload))
-                self._current_step_header = int(payload["step"])
             self._emit_console(self._format_compact_done_row(payload))
             self._step_block_complete = True
             return
@@ -440,48 +446,42 @@ class RunLogger:
 
     def log_serving_debug_start(self, payload: dict[str, Any]) -> None:
         """Log the start of one live serving candidate stream."""
+        self._begin_step_block(payload)
         prompt_key = (int(payload["step"]), int(payload["prompt_index"]))
         candidate_index = int(payload["candidate_index"])
         prompt_text = str(payload.get("prompt_text") or payload.get("prompt_preview", ""))
+        prompt_count = int(payload["prompt_count"])
+        group_size = int(payload["group_size"])
+        is_new_prompt = self._current_serving_prompt_key != prompt_key
 
-        if self._current_serving_prompt_key is None:
-            pass
-        elif self._current_serving_prompt_key != prompt_key:
-            self._emit_console(PROMPT_SEPARATOR)
-        else:
-            self._emit_console("")
-
-        if self._current_serving_prompt_key != prompt_key:
-            header = (
-                f"serve step={payload['step']} epoch={payload['epoch']}/{payload['total_epochs']} "
-                f"batch={payload['batch_index']}/{payload['batches_in_epoch']} "
-                f"prompt={int(payload['prompt_index']) + 1}/{payload['prompt_count']} "
-                f"completions_per_prompt={payload['group_size']}"
+        if is_new_prompt:
+            if self._current_serving_prompt_key is not None and self._current_serving_prompt_key[0] == prompt_key[0]:
+                self._emit_console("")
+            self._emit_console(
+                f"  prompt {int(payload['prompt_index']) + 1}/{prompt_count}  "
+                f"{self._format_serving_prompt_gist(prompt_text)}"
             )
-            self._emit_console(header)
-            for line in self._format_serving_prompt_lines(prompt_text):
-                self._emit_console(line)
             self._current_serving_prompt_key = prompt_key
 
-        self._emit_console(f"  candidate {candidate_index + 1}/{payload['group_size']}")
-        if self.config.console:
-            sys.stdout.write("    ")
-            sys.stdout.flush()
-        self._serving_stream_open = True
+        self._emit_file_line(f"    rollout {candidate_index + 1}/{group_size} running...")
+        self._start_terminal_serving_status(
+            f"    rollout {candidate_index + 1}/{group_size} running..."
+        )
 
     def log_serving_debug_chunk(self, payload: dict[str, Any]) -> None:
-        """Write one terminal-only streamed text fragment."""
-        if not self.config.console:
-            return
-        sys.stdout.write(str(payload.get("text", "")))
-        sys.stdout.flush()
+        """Ignore streamed fragments in the terminal and keep only structured events."""
+        del payload
 
     def log_serving_debug_done(self, payload: dict[str, Any]) -> None:
         """Log the completion of one live serving candidate stream."""
-        if self._serving_stream_open and self.config.console:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-        self._serving_stream_open = False
+        done_line = (
+            f"    rollout {int(payload['candidate_index']) + 1}/{int(payload['group_size'])} done  "
+            f"ttft={self._format_duration(float(payload['ttft_seconds']))}  "
+            f"tpot={self._format_duration(float(payload['tpot_seconds']))}  "
+            f"tokens={self._format_compact_scalar(payload['response_token_count'])}  "
+            f"total={self._format_duration(float(payload['generation_seconds']))}"
+        )
+        self._finish_terminal_serving_status(done_line)
 
         event_payload = {
             key: payload[key]
@@ -505,13 +505,7 @@ class RunLogger:
         event_payload["response_preview"] = self._truncate(str(payload.get("response_preview", "")))
         self._emit_event("serving_debug", event_payload)
 
-        self._emit_console(
-            "  serve_done "
-            f"ttft={self._format_duration(float(payload['ttft_seconds']))} "
-            f"tpot={self._format_duration(float(payload['tpot_seconds']))} "
-            f"tokens={self._format_compact_scalar(payload['response_token_count'])} "
-            f"total={self._format_duration(float(payload['generation_seconds']))}"
-        )
+        self._emit_file_line(done_line)
 
     def log_epoch_summary(self, payload: dict[str, Any]) -> None:
         """Log a summarized view of one epoch."""
@@ -773,9 +767,13 @@ class RunLogger:
             f"{payload.get('dataset_prompt_count', '?')}  "
             f"prompts_this_step={payload.get('prompt_count', '?')}/{payload.get('planned_prompts_per_step', '?')}  "
             f"completions_per_prompt={payload.get('completions_per_prompt', payload.get('group_size', '?'))}  "
-            f"completions_this_step={payload.get('completions_this_step', payload.get('samples_this_step', payload['batch_size']))}/"
+            f"completions_this_step={payload.get('completions_this_step', payload.get('samples_this_step', payload.get('batch_size', '?')))}/"
             f"{payload.get('planned_completions_per_step', payload.get('planned_samples_per_step', '?'))}"
         )
+
+    def _format_step_header(self, payload: dict[str, Any]) -> str:
+        """Render the stable step header that starts each visible step block."""
+        return self._format_compact_step_header(payload)
 
     def _format_compact_stage_row(self, payload: dict[str, Any]) -> str:
         stage = str(payload["stage"])
@@ -1015,19 +1013,26 @@ class RunLogger:
         return step == 1 or step % interval == 0
 
     def _emit_console(self, line: str) -> None:
-        if self._serving_stream_open and self.config.console:
-            sys.stdout.write("\n")
-            sys.stdout.flush()
-            self._serving_stream_open = False
-        if self.config.console:
-            print(self._style_terminal_line(line))
-        if self.config.file:
-            with self.console_path.open("a", encoding="utf-8") as handle:
-                handle.write(f"{line}\n")
+        self._emit_terminal_line(line)
+        self._emit_file_line(line)
 
     def _emit_console_lines(self, lines: list[str]) -> None:
         for line in lines:
             self._emit_console(line)
+
+    def _emit_terminal_line(self, line: str) -> None:
+        """Write one styled line to the terminal only."""
+        self._close_terminal_serving_status()
+        if not self.config.console:
+            return
+        print(self._style_terminal_line(line))
+
+    def _emit_file_line(self, line: str) -> None:
+        """Write one plain line to console.log only."""
+        if not self.config.file:
+            return
+        with self.console_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{line}\n")
 
     def _emit_event(self, event: str, payload: dict[str, Any]) -> None:
         if not self.config.file:
@@ -1150,6 +1155,74 @@ class RunLogger:
             lines.append(f"{prefix}{segment}")
         return lines
 
+    def _format_serving_prompt_gist(self, prompt_text: str) -> str:
+        """Render one compact single-line gist for terminal serving status."""
+        return self._truncate(prompt_text, limit=PROMPT_GIST_MAX_CHARS)
+
+    def _start_terminal_serving_status(self, line: str) -> None:
+        """Start one terminal-only live rollout status line."""
+        if not self.config.console:
+            return
+        if self._should_interactively_update_terminal():
+            sys.stdout.write(line)
+            sys.stdout.flush()
+            self._terminal_serving_status_open = True
+            self._terminal_serving_status_length = len(line)
+            return
+        self._emit_terminal_line(line)
+
+    def _finish_terminal_serving_status(self, line: str) -> None:
+        """Finish one terminal-only live rollout status line."""
+        if not self.config.console:
+            return
+        if self._terminal_serving_status_open:
+            padding = " " * max(self._terminal_serving_status_length - len(line), 0)
+            sys.stdout.write("\r")
+            sys.stdout.write(line)
+            if padding:
+                sys.stdout.write(padding)
+            sys.stdout.write("\n")
+            sys.stdout.flush()
+            self._terminal_serving_status_open = False
+            self._terminal_serving_status_length = 0
+            return
+        self._emit_terminal_line(line)
+
+    def _close_terminal_serving_status(self) -> None:
+        """Close any in-place terminal serving status before normal line output."""
+        if not self._terminal_serving_status_open or not self.config.console:
+            return
+        sys.stdout.write("\n")
+        sys.stdout.flush()
+        self._terminal_serving_status_open = False
+        self._terminal_serving_status_length = 0
+
+    def _maybe_emit_step_separator(self, step: int) -> None:
+        """Insert one visible divider between completed step blocks."""
+        if self._current_step_header is None:
+            return
+        if self._current_step_header == step:
+            return
+        if not self._step_block_complete:
+            return
+        self._emit_console(STEP_SEPARATOR)
+        self._step_block_complete = False
+
+    def _begin_step_block(self, payload: dict[str, Any]) -> None:
+        """Emit the step header once before any rollout or stage detail."""
+        step = int(payload["step"])
+        self._maybe_emit_step_separator(step)
+        if self._current_step_header == step:
+            return
+        self._emit_console(self._format_step_header(payload))
+        self._current_step_header = step
+        self._current_serving_prompt_key = None
+        self._step_block_complete = False
+
+    def _ensure_step_header(self, payload: dict[str, Any]) -> None:
+        """Guarantee the current step header is already visible."""
+        self._begin_step_block(payload)
+
     def _style_terminal_line(self, line: str) -> str:
         """Colorize terminal metadata while keeping file logs plain."""
         if not self._should_color_terminal():
@@ -1158,17 +1231,16 @@ class RunLogger:
         if line == "FlashRL training run":
             return self._color(line, "run_header")
 
-        if line.startswith("serve step="):
-            return self._color(line, "serving_header")
-        if line.startswith("  candidate "):
-            return self._color(line, "serving_candidate")
-        if line.startswith("  serve_done "):
-            return self._style_key_value_line(line, "serving_timing")
-        if line == PROMPT_SEPARATOR:
+        prompt_gist_match = re.match(r"^(  prompt \d+/\d+)(\s+)(.*)$", line)
+        if prompt_gist_match:
+            label, spacing, value = prompt_gist_match.groups()
+            return f"{self._color(label, 'meta_label')}{spacing}{value}"
+        rollout_status_match = re.match(r"^(    rollout \d+/\d+)(\s+)(.*)$", line)
+        if rollout_status_match:
+            label, spacing, value = rollout_status_match.groups()
+            return f"{self._color(label, 'serving_candidate')}{spacing}{value}"
+        if line == STEP_SEPARATOR:
             return self._color(line, "divider")
-        if line.startswith("  prompt: "):
-            label, value = line.split(": ", 1)
-            return f"{self._color(label + ':', 'meta_label')} {value}"
 
         compact_label_match = re.match(
             r"^(  )(run|model|data|runtime|serving|admin|grpo|mapping|progress|logs)(\s+)(.*)$",
@@ -1222,6 +1294,10 @@ class RunLogger:
             return False
         stream = sys.stdout
         return bool(hasattr(stream, "isatty") and stream.isatty())
+
+    def _should_interactively_update_terminal(self) -> bool:
+        """Use in-place serving status updates only for interactive terminals."""
+        return self._should_color_terminal()
 
     def _color(self, text: str, style: str) -> str:
         """Apply one ANSI style when terminal coloring is enabled."""

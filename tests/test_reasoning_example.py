@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -21,7 +23,7 @@ def make_prompt(
 ) -> Prompt:
     """Build one strict reasoning prompt with GSM8K-style metadata."""
     return Prompt(
-        text=reasoning_example.render_reasoning_prompt(problem),
+        text=reasoning_example.render_math_prompt(problem),
         metadata={
             "task_id": "gsm8k-train-000000",
             "source": "gsm8k",
@@ -59,9 +61,9 @@ def make_rollout(
     )
 
 
-def test_render_reasoning_prompt_has_no_system_prompt_and_enforces_contract() -> None:
+def test_render_math_prompt_has_no_system_prompt_and_enforces_contract() -> None:
     """The example prompt should be a user-only format contract."""
-    prompt = reasoning_example.render_reasoning_prompt("What is 15 + 27?")
+    prompt = reasoning_example.render_math_prompt("What is 15 + 27?")
 
     assert "system" not in prompt.lower()
     assert "<think>...</think>" in prompt
@@ -70,14 +72,15 @@ def test_render_reasoning_prompt_has_no_system_prompt_and_enforces_contract() ->
     assert "Problem: What is 15 + 27?" in prompt
 
 
-def test_build_dataset_loads_gsm8k_rows_into_prompt_metadata(
+def test_build_math_train_dataset_loads_gsm8k_rows_into_prompt_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Dataset building should render prompts and preserve verifier metadata."""
-    monkeypatch.setattr(
-        reasoning_example,
-        "_load_gsm8k_split",
-        lambda split, limit=None: [
+
+    def fake_load(split: str, *, limit=None):
+        assert split == reasoning_example.DEFAULT_GSM8K_TRAIN_SPLIT
+        assert limit == 3
+        return [
             {
                 "task_id": "gsm8k-train-000001",
                 "source": "gsm8k",
@@ -85,10 +88,11 @@ def test_build_dataset_loads_gsm8k_rows_into_prompt_metadata(
                 "problem": "What is 15 + 27?",
                 "final_answer": "42",
             }
-        ],
-    )
+        ]
 
-    dataset = reasoning_example.build_dataset()
+    monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
+
+    dataset = reasoning_example.build_math_train_dataset(limit=3)
 
     assert len(dataset) == 1
     assert "Problem: What is 15 + 27?" in dataset[0].text
@@ -102,29 +106,70 @@ def test_build_dataset_loads_gsm8k_rows_into_prompt_metadata(
     }
 
 
-def test_extract_ground_truth_answer_normalizes_gsm8k_final_answers() -> None:
+def test_build_math_train_dataset_uses_only_explicit_limit_not_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Dataset size should come only from the function argument, not env vars."""
+    monkeypatch.setenv("FLASHRL_REASONING_TRAIN_LIMIT", "11")
+    monkeypatch.setenv("FLASHRL_REASONING_DATASET_LIMIT", "17")
+    seen_limits: list[int | None] = []
+
+    def fake_load(split: str, *, limit=None):
+        del split
+        seen_limits.append(limit)
+        return []
+
+    monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
+
+    reasoning_example.build_math_train_dataset()
+    reasoning_example.build_math_train_dataset(limit=5)
+
+    assert seen_limits == [None, 5]
+
+
+def test_build_math_eval_dataset_uses_only_explicit_limit_not_env(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Held-out dataset size should also ignore the old env-var path."""
+    monkeypatch.setenv("FLASHRL_REASONING_TEST_LIMIT", "13")
+    seen_limits: list[int | None] = []
+
+    def fake_load(split: str, *, limit=None):
+        assert split == reasoning_example.DEFAULT_GSM8K_EVAL_SPLIT
+        seen_limits.append(limit)
+        return []
+
+    monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
+
+    reasoning_example.build_math_eval_dataset()
+    reasoning_example.build_math_eval_dataset(limit=7)
+
+    assert seen_limits == [None, 7]
+
+
+def test_extract_math_target_answer_normalizes_gsm8k_final_answers() -> None:
     """Ground-truth parsing should read the `####` target and normalize commas."""
-    assert reasoning_example._extract_ground_truth_answer("work\n#### 1,234") == "1234"
-    assert reasoning_example._extract_ground_truth_answer("work\n#### 42.0") == "42"
+    assert reasoning_example._extract_math_target_answer("work\n#### 1,234") == "1234"
+    assert reasoning_example._extract_math_target_answer("work\n#### 42.0") == "42"
 
 
-def test_reasoning_reward_requires_single_well_formed_blocks() -> None:
+def test_math_reward_requires_single_well_formed_blocks() -> None:
     """Only strict single-block formatting should receive the format bonus."""
     prompt = make_prompt()
 
-    perfect = reasoning_example.reasoning_reward_fn(
+    perfect = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
             "<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
         )
     )
-    trailing = reasoning_example.reasoning_reward_fn(
+    trailing = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
             "<think>Add 15 and 27 to get 42.</think><answer>42</answer>\nextra",
         )
     )
-    duplicate_answer = reasoning_example.reasoning_reward_fn(
+    duplicate_answer = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
             "<think>Add 15 and 27 to get 42.</think><answer>42</answer><answer>42</answer>",
@@ -142,10 +187,10 @@ def test_reasoning_reward_requires_single_well_formed_blocks() -> None:
     assert duplicate_answer.metadata["format_pass"] is False
 
 
-def test_reasoning_reward_marks_truncated_outputs_invalid_for_format() -> None:
+def test_math_reward_marks_truncated_outputs_invalid_for_format() -> None:
     """Length truncation should never receive the format reward."""
     prompt = make_prompt()
-    reward = reasoning_example.reasoning_reward_fn(
+    reward = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
             "<think>Add 15 and 27 to get 42.",
@@ -167,13 +212,11 @@ def test_extract_answer_block_requires_exactly_one_non_empty_block() -> None:
     assert reasoning_example._extract_answer_block("<answer>1</answer><answer>2</answer>") is None
 
 
-def test_evaluate_model_reports_exact_match_format_and_truncation(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+def test_evaluate_model_reports_exact_match_format_and_truncation() -> None:
     """Held-out evaluation should reuse the strict reward parser and aggregate metrics."""
     prompts = [
         Prompt(
-            text=reasoning_example.render_reasoning_prompt("What is 15 + 27?"),
+            text=reasoning_example.render_math_prompt("What is 15 + 27?"),
             metadata={
                 "task_id": "gsm8k-test-000001",
                 "source": "gsm8k",
@@ -184,7 +227,7 @@ def test_evaluate_model_reports_exact_match_format_and_truncation(
             },
         ),
         Prompt(
-            text=reasoning_example.render_reasoning_prompt("What is 12 + 15 + 8?"),
+            text=reasoning_example.render_math_prompt("What is 12 + 15 + 8?"),
             metadata={
                 "task_id": "gsm8k-test-000002",
                 "source": "gsm8k",
@@ -195,7 +238,6 @@ def test_evaluate_model_reports_exact_match_format_and_truncation(
             },
         ),
     ]
-    monkeypatch.setattr("examples.reasoning.eval.build_eval_dataset", lambda limit=None: prompts[:limit])
 
     class FakeServingBackend:
         def __init__(self) -> None:
@@ -207,7 +249,7 @@ def test_evaluate_model_reports_exact_match_format_and_truncation(
         def generate_batch(self, prompt_texts: list[str], **kwargs):
             del kwargs
             outputs = []
-            for index, prompt_text in enumerate(prompt_texts):
+            for prompt_text in prompt_texts:
                 if "15 + 27" in prompt_text:
                     outputs.append(
                         SimpleNamespace(
@@ -237,7 +279,7 @@ def test_evaluate_model_reports_exact_match_format_and_truncation(
         rollout_config=SimpleNamespace(max_new_tokens=64),
     )
 
-    metrics = evaluate_model(flashrl, limit=2, batch_size=2)
+    metrics = evaluate_model(flashrl, dataset=prompts, batch_size=2)
 
     assert flashrl._serving_backend.generation_defaults == {
         "max_new_tokens": 64,
@@ -255,31 +297,72 @@ def test_evaluate_model_reports_exact_match_format_and_truncation(
     }
 
 
-def test_prepare_example_environment_sets_default_vllm_runtime(
+def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
+    """The example CLIs should expose only the intended explicit operator knobs."""
+    train_help = reasoning_example.build_argument_parser().format_help()
+    assert "--config" in train_help
+    assert "--train-limit" in train_help
+    assert "--checkpoint" in train_help
+    assert "--checkpoint-out" in train_help
+    assert "--task-config" not in train_help
+
+    from examples.reasoning import eval as reasoning_eval
+
+    eval_help = reasoning_eval.build_argument_parser().format_help()
+    assert "--config" in eval_help
+    assert "--eval-limit" in eval_help
+    assert "--checkpoint" in eval_help
+    assert "--batch-size" in eval_help
+    assert "--task-config" not in eval_help
+
+
+def test_default_eval_batch_size_and_checkpoint_path_are_code_constants() -> None:
+    """Default example behavior should now come from code, not a sidecar file."""
+    assert reasoning_example.DEFAULT_REASONING_CHECKPOINT_PATH == "/tmp/flashrl_reasoning_checkpoint.pt"
+    assert reasoning_example.DEFAULT_REASONING_EVAL_BATCH_SIZE == 8
+
+
+def test_prepare_reasoning_environment_sets_default_vllm_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The direct example entrypoint should auto-fill the default vLLM runtime."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
     monkeypatch.setattr(
-        "examples.reasoning.train._default_vllm_python",
+        "examples.reasoning.train.find_default_vllm_python",
         lambda: "/tmp/fake-vllm-python",
     )
 
-    reasoning_example._prepare_example_environment("examples/reasoning/config_vllm.yaml")
+    reasoning_example.prepare_reasoning_environment("examples/reasoning/config_vllm.yaml")
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
+    os.environ.pop("FLASHRL_VLLM_PYTHON", None)
 
 
-def test_prepare_example_environment_leaves_non_vllm_configs_alone(
+def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Only the vLLM example config should trigger env auto-discovery."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
     monkeypatch.setattr(
-        "examples.reasoning.train._default_vllm_python",
+        "examples.reasoning.train.find_default_vllm_python",
         lambda: "/tmp/fake-vllm-python",
     )
 
-    reasoning_example._prepare_example_environment("examples/reasoning/config.yaml")
+    reasoning_example.prepare_reasoning_environment("examples/reasoning/config.yaml")
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ
+
+
+def test_eval_module_imports_only_public_helpers_from_train() -> None:
+    """eval.py should only depend on train.py helpers that are meant to be shared."""
+    source = Path("examples/reasoning/eval.py").read_text(encoding="utf-8")
+    tree = ast.parse(source)
+    imported_names = [
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == "examples.reasoning.train"
+        for alias in node.names
+    ]
+
+    assert imported_names
+    assert all(not name.startswith("_") for name in imported_names)

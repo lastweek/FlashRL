@@ -64,6 +64,10 @@ class ActorModel:
         )
         if self.tokenizer.pad_token is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
+            eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+            if eos_token_id is not None:
+                self.tokenizer.pad_token_id = int(eos_token_id)
+        self._configure_generation_special_tokens()
 
     def generate_batch(
         self,
@@ -104,6 +108,7 @@ class ActorModel:
             "return_dict_in_generate": True,
             "output_scores": True,
         }
+        self._apply_generation_special_token_kwargs(generation_kwargs)
 
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
@@ -238,6 +243,31 @@ class ActorModel:
         )
         return outputs.logits
 
+    def _configure_generation_special_tokens(self) -> None:
+        """Keep generation config aligned with tokenizer special-token ids."""
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_token_id is None and eos_token_id is not None:
+            pad_token_id = int(eos_token_id)
+            self.tokenizer.pad_token_id = pad_token_id
+
+        if pad_token_id is None:
+            return
+
+        if hasattr(self.model, "generation_config") and getattr(self.model.generation_config, "pad_token_id", None) is None:
+            self.model.generation_config.pad_token_id = int(pad_token_id)
+        if hasattr(self.model, "config") and getattr(self.model.config, "pad_token_id", None) is None:
+            self.model.config.pad_token_id = int(pad_token_id)
+
+    def _apply_generation_special_token_kwargs(self, generation_kwargs: dict[str, Any]) -> None:
+        """Pass explicit special-token ids to generate() to avoid runtime inference warnings."""
+        pad_token_id = getattr(self.tokenizer, "pad_token_id", None)
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if pad_token_id is not None:
+            generation_kwargs.setdefault("pad_token_id", int(pad_token_id))
+        if eos_token_id is not None:
+            generation_kwargs.setdefault("eos_token_id", int(eos_token_id))
+
     def _transition_scores(self, outputs: Any) -> torch.Tensor:
         """Compute log-prob scores for each generated token."""
         if hasattr(self.model, "compute_transition_scores"):
@@ -304,6 +334,7 @@ class ActorModel:
             "return_dict_in_generate": True,
             "output_scores": True,
         }
+        self._apply_generation_special_token_kwargs(generation_kwargs)
 
         original_padding_side = self.tokenizer.padding_side
         self.tokenizer.padding_side = "left"
