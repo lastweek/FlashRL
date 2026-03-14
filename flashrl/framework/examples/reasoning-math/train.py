@@ -9,7 +9,15 @@ import os
 from pathlib import Path
 import re
 import shutil
+import sys
 from typing import Any
+
+EXAMPLE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = EXAMPLE_DIR.parents[3]
+for candidate in (REPO_ROOT, EXAMPLE_DIR):
+    candidate_text = str(candidate)
+    if candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
 
 from flashrl.framework import FlashRL
 from flashrl.framework.data_models import (
@@ -92,7 +100,7 @@ def _load_dataset_module():
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - exercised in live example usage
         raise RuntimeError(
-            "flashrl.framework.examples.reasoning requires the `datasets` package to load math datasets. "
+            "flashrl/framework/examples/reasoning-math requires the `datasets` package to load math datasets. "
             "Install project dependencies or `pip install datasets`."
         ) from exc
     return load_dataset
@@ -532,7 +540,9 @@ def prepare_reasoning_environment(config_path: str) -> None:
 
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the math example CLI parser."""
-    parser = argparse.ArgumentParser(description="Run the FlashRL math reasoning example.")
+    parser = argparse.ArgumentParser(
+        description="Run the FlashRL reasoning-math example."
+    )
     parser.add_argument(
         "--config",
         default=str(Path(__file__).with_name("config_vllm.yaml")),
@@ -564,7 +574,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the math reasoning example from the selected FlashRL profile."""
+    """Run the reasoning-math example from the selected FlashRL profile."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
     prepare_reasoning_environment(args.config)
@@ -572,14 +582,18 @@ def main(argv: list[str] | None = None) -> int:
     flashrl: FlashRL | None = None
     try:
         dataset = build_math_train_dataset(dataset=args.dataset, limit=args.train_limit)
-        flashrl = FlashRL.from_yaml(args.config)
+        flashrl = FlashRL(
+            config_path=args.config,
+            rollout_fn=reasoning_rollout_fn,
+            reward_fn=math_reward_fn,
+        )
         if args.checkpoint:
             flashrl.load_checkpoint(args.checkpoint)
         flashrl.train(dataset)
         checkpoint_out = args.checkpoint_out or DEFAULT_REASONING_CHECKPOINT_PATH
         flashrl.save_checkpoint(checkpoint_out)
     except Exception as exc:
-        print(f"\nFlashRL reasoning example failed: {exc}", file=sys.stderr)
+        print(f"\nFlashRL reasoning-math example failed: {exc}", file=sys.stderr)
         print(
             "\nNote: This example loads a base Qwen checkpoint and a Hugging Face math dataset.",
             file=sys.stderr,

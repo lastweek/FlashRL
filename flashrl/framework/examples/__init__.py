@@ -1,1 +1,1 @@
-"""Importable example package for YAML-driven FlashRL runs."""
+"""Top-level namespace for FlashRL example folders."""

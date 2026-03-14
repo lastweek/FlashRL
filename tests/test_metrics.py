@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import importlib.util
 import json
 import os
 from pathlib import Path
 import shutil
 import subprocess
+import sys
 import textwrap
 from types import SimpleNamespace
 import warnings
@@ -19,7 +21,6 @@ import yaml
 
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.metrics as metrics_module
-from flashrl.framework.examples.reasoning import train as reasoning_example
 from flashrl.framework import (
     FlashRL,
     GrpoConfig,
@@ -36,6 +37,32 @@ from flashrl.framework.metrics import (
     TensorBoardMetricsSink,
 )
 from flashrl.framework.training import TrainingBackend
+
+
+def load_script_module(
+    module_name: str,
+    relative_path: str,
+    *,
+    aliases: tuple[str, ...] = (),
+):
+    """Load one hyphen-folder script as a normal Python module for tests."""
+    module_path = Path(relative_path)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    for alias in aliases:
+        sys.modules[alias] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+reasoning_example = load_script_module(
+    "flashrl_reasoning_math_train_for_metrics",
+    "flashrl/framework/examples/reasoning-math/train.py",
+    aliases=("train",),
+)
 
 
 class FakeTokenizer:
@@ -676,6 +703,89 @@ def write_yaml_run_config(
     return config_path
 
 
+def write_profile_run_config(
+    tmp_path: Path,
+    *,
+    log_dir: Path,
+    metrics_enabled: bool = False,
+    tensorboard_enabled: bool | None = None,
+    pushgateway_enabled: bool = False,
+    common_dtype: str | None = None,
+    serving_num_threads: int = 3,
+    serving_debug_live_rollout: bool = False,
+    training_num_threads: int | None = 1,
+    serving_backend: str = "huggingface",
+    runtime_python: str | None = None,
+) -> Path:
+    """Write a temporary hook-less profile config for constructor-based tests."""
+    config_path = tmp_path / "profile.yaml"
+    if tensorboard_enabled is None:
+        tensorboard_enabled = metrics_enabled
+
+    training_section = {
+        "learning_rate": 1.0e-5,
+        "batch_size": 2,
+        "max_epochs": 1,
+    }
+    if training_num_threads is not None:
+        training_section["num_threads"] = training_num_threads
+
+    serving_section: dict[str, object] = {
+        "backend": serving_backend,
+        "debug_live_rollout": serving_debug_live_rollout,
+    }
+    if serving_num_threads is not None:
+        serving_section["num_threads"] = serving_num_threads
+    if runtime_python is not None:
+        serving_section["runtime_python"] = runtime_python
+
+    common_section: dict[str, object] = {"model_name": "fake/model"}
+    if common_dtype is not None:
+        common_section["dtype"] = common_dtype
+
+    config_path.write_text(
+        yaml.safe_dump(
+            {
+                "common": common_section,
+                "training": training_section,
+                "serving": serving_section,
+                "grpo": {
+                    "group_size": 2,
+                    "clip_ratio": 0.2,
+                    "kl_coefficient": 0.0,
+                    "max_new_tokens": 32,
+                    "temperature": 1.0,
+                    "top_p": 0.9,
+                    "top_k": 0,
+                    "do_sample": True,
+                },
+                "logging": {
+                    "log_dir": str(log_dir),
+                    "console": False,
+                    "file": True,
+                },
+                "metrics": {
+                    "enabled": metrics_enabled,
+                    "tensorboard": {
+                        "enabled": tensorboard_enabled,
+                    },
+                    "pushgateway": {
+                        "enabled": pushgateway_enabled,
+                        "url": "http://localhost:9091",
+                        "job_name": "flashrl-test",
+                    },
+                },
+                "runtime": {
+                    "reference_enabled": False,
+                },
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    return config_path
+
+
 def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> None:
     """The Prometheus sink should own the expected gauges and push the registry."""
     pushes: list[tuple[str, str]] = []
@@ -1188,6 +1298,143 @@ def test_flashrl_from_yaml_loads_hooks_and_supports_dataset_loader(
     assert trainer._run_logger.run_dir.exists()
 
 
+def test_flashrl_profile_constructor_loads_hookless_config_path(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FlashRL(config_path=...) should load a hook-less profile and train on an explicit dataset."""
+    patch_backends(monkeypatch)
+    config_path = write_profile_run_config(
+        tmp_path,
+        log_dir=tmp_path / "profile-logs",
+        common_dtype="float16",
+        serving_num_threads=3,
+        training_num_threads=5,
+    )
+
+    trainer = FlashRL(
+        config_path=config_path,
+        rollout_fn=make_rollout_fn(response_suffix="profile", repeat=2),
+        reward_fn=reward_fn,
+    )
+    trainer.train(["prompt 0", "prompt 1"])
+
+    assert trainer._dataset_loader is None
+    assert trainer.training_model_config.model_name == "fake/model"
+    assert trainer.training_model_config.dtype == "float16"
+    assert trainer.training_model_config.num_threads == 5
+    assert trainer.serving_config.model_name == "fake/model"
+    assert trainer.serving_config.num_threads == 3
+    assert trainer.grpo_config.max_new_tokens == 32
+    assert trainer._run_logger.run_dir.exists()
+
+
+def test_flashrl_profile_constructor_accepts_run_config_dict_and_expands_env_vars(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The profile constructor should also accept a dict and expand env vars."""
+    patch_backends(monkeypatch)
+    monkeypatch.setenv("FLASHRL_TEST_RUNTIME_PYTHON", "/tmp/fake-vllm-python")
+    run_config = {
+        "common": {"model_name": "fake/model"},
+        "training": {
+            "batch_size": 2,
+            "max_epochs": 1,
+            "num_threads": 1,
+        },
+        "serving": {
+            "backend": "vllm",
+            "runtime_python": "${FLASHRL_TEST_RUNTIME_PYTHON}",
+            "num_replicas": 2,
+            "num_threads": 3,
+            "debug_live_rollout": False,
+        },
+        "grpo": {
+            "group_size": 2,
+            "clip_ratio": 0.2,
+            "kl_coefficient": 0.0,
+            "max_new_tokens": 32,
+            "temperature": 1.0,
+            "top_p": 0.9,
+            "top_k": 0,
+            "do_sample": True,
+        },
+        "logging": {
+            "log_dir": str(tmp_path / "dict-logs"),
+            "console": False,
+            "file": True,
+        },
+        "metrics": {"enabled": False},
+        "runtime": {"reference_enabled": False},
+    }
+
+    trainer = FlashRL(
+        run_config=run_config,
+        rollout_fn=make_rollout_fn(response_suffix="dict", repeat=2),
+        reward_fn=reward_fn,
+    )
+
+    assert trainer.serving_config.backend == "vllm"
+    assert trainer.serving_config.runtime_python == "/tmp/fake-vllm-python"
+    assert trainer.serving_config.num_replicas == 2
+
+
+def test_flashrl_profile_constructor_rejects_mixed_low_level_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Profile mode should fail fast when mixed with low-level model/config overrides."""
+    patch_backends(monkeypatch)
+    config_path = write_profile_run_config(
+        tmp_path,
+        log_dir=tmp_path / "mixed-logs",
+    )
+
+    with pytest.raises(ValueError, match="cannot be combined"):
+        FlashRL(
+            model="fake/model",
+            config_path=config_path,
+            rollout_fn=make_rollout_fn(response_suffix="mixed", repeat=2),
+            reward_fn=reward_fn,
+        )
+
+
+def test_flashrl_profile_constructor_rejects_scalar_training_overrides(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Profile mode should also reject low-level scalar overrides like batch_size."""
+    patch_backends(monkeypatch)
+    config_path = write_profile_run_config(
+        tmp_path,
+        log_dir=tmp_path / "mixed-scalars-logs",
+    )
+
+    with pytest.raises(ValueError, match="low-level training/runtime overrides"):
+        FlashRL(
+            config_path=config_path,
+            rollout_fn=make_rollout_fn(response_suffix="mixed-scalars", repeat=2),
+            reward_fn=reward_fn,
+            batch_size=8,
+        )
+
+
+def test_flashrl_from_yaml_requires_hooks_for_hook_driven_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FlashRL.from_yaml should reject hook-less profiles with a clear error."""
+    patch_backends(monkeypatch)
+    config_path = write_profile_run_config(
+        tmp_path,
+        log_dir=tmp_path / "hookless-logs",
+    )
+
+    with pytest.raises(ValueError, match="requires hooks\\.rollout_fn"):
+        FlashRL.from_yaml(config_path)
+
+
 def test_flashrl_from_yaml_common_defaults_flow_into_training_and_serving(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1666,7 +1913,12 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
 
     monkeypatch.setattr(FakeActor, "generate_batch", scripted_generate_batch)
 
-    trainer = FlashRL.from_yaml("flashrl/framework/examples/reasoning/config.yaml")
+    dataset = reasoning_example.build_math_train_dataset()
+    trainer = FlashRL(
+        config_path="flashrl/framework/examples/reasoning-math/config.yaml",
+        rollout_fn=reasoning_example.reasoning_rollout_fn,
+        reward_fn=reasoning_example.math_reward_fn,
+    )
     trainer.logging_config = LoggingConfig(
         log_dir=tmp_path,
         console=False,
@@ -1688,7 +1940,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     assert trainer._trainer is not None
     trainer._trainer.metrics_sink = trainer._metrics_sink
 
-    trainer.train()
+    trainer.train(dataset)
 
     assert trainer._run_logger.run_dir.exists()
     rollout_records = [
@@ -1737,29 +1989,42 @@ def test_observability_stack_files_and_docs_exist() -> None:
     )
     assert not Path("examples").exists()
     assert Path("flashrl/framework/examples/__init__.py").exists()
-    assert Path("flashrl/framework/examples/reasoning/__init__.py").exists()
-    assert Path("flashrl/framework/examples/reasoning/train.py").exists()
-    assert Path("flashrl/framework/examples/reasoning/config.yaml").exists()
-    assert Path("flashrl/framework/examples/reasoning/config_vllm.yaml").exists()
+    assert not Path("flashrl/framework/examples/reasoning").exists()
+    assert Path("flashrl/framework/examples/reasoning-math/train.py").exists()
+    assert Path("flashrl/framework/examples/reasoning-math/eval.py").exists()
+    assert Path("flashrl/framework/examples/reasoning-math/config.yaml").exists()
+    assert Path("flashrl/framework/examples/reasoning-math/config_vllm.yaml").exists()
+    assert Path("flashrl/framework/examples/reasoning-code/train.py").exists()
+    assert Path("flashrl/framework/examples/reasoning-code/eval.py").exists()
+    assert Path("flashrl/framework/examples/reasoning-code/executor.py").exists()
+    assert Path("flashrl/framework/examples/reasoning-code/config.yaml").exists()
+    assert Path("flashrl/framework/examples/reasoning-code/config_vllm.yaml").exists()
 
     docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
-    reasoning_docs = Path("flashrl/framework/examples/reasoning/README.md").read_text(
+    reasoning_docs = Path("flashrl/framework/examples/reasoning-math/README.md").read_text(
+        encoding="utf-8"
+    )
+    reasoning_code_docs = Path(
+        "flashrl/framework/examples/reasoning-code/README.md"
+    ).read_text(
         encoding="utf-8"
     )
     root_docs = Path("README.md").read_text(encoding="utf-8")
     assert "tensorboard --logdir logs" in root_docs
+    assert "python3 flashrl/framework/examples/reasoning-math/train.py" in root_docs
+    assert "python3 -m flashrl.framework.examples.reasoning.train" not in root_docs
     assert "TensorBoard is the default local metrics path." in docs
     assert "metrics.pushgateway.enabled: true" in docs
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
-    assert "reasoning/README.md" in docs
+    assert "reasoning-math/README.md" in docs
+    assert "reasoning-code/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
-    assert "python3 -m flashrl.framework.examples.reasoning.train" in reasoning_docs
-    assert (
-        "python3 -m flashrl.framework.flashrl --config "
-        "flashrl/framework/examples/reasoning/config.yaml"
-    ) in reasoning_docs
+    assert "python3 flashrl/framework/examples/reasoning-math/train.py" in reasoning_docs
+    assert "python3 flashrl/framework/examples/reasoning-math/eval.py" in reasoning_docs
+    assert "FlashRL.from_yaml(...)" in reasoning_docs
+    assert "python3 -m flashrl.framework.flashrl --config" not in reasoning_docs
     assert "config_vllm.yaml" in reasoning_docs
     assert "--dataset" in reasoning_docs
     assert "aime25" in reasoning_docs
@@ -1776,6 +2041,18 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "training.batch_size" in reasoning_docs
     assert "serving.backend" in reasoning_docs
     assert "grpo.group_size" in reasoning_docs
+    assert "python3 flashrl/framework/examples/reasoning-code/train.py" in reasoning_code_docs
+    assert "python3 flashrl/framework/examples/reasoning-code/eval.py" in reasoning_code_docs
+    assert "strict R1-style Codeforces prototype" in reasoning_code_docs
+    assert "does not support direct" in reasoning_code_docs
+    assert "official tests only in v1" in reasoning_code_docs
+    assert "`rating <= 1600`" in reasoning_code_docs
+    assert "--run-timeout-seconds" in reasoning_code_docs
+    assert "--memory-limit-mb" in reasoning_code_docs
+    assert "--max-tests-per-problem" in reasoning_code_docs
+    assert "not copied into `console.log`" in reasoning_code_docs
+    assert "execution_status" in reasoning_code_docs
+    assert "code_preview" in reasoning_code_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
@@ -1784,11 +2061,21 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "FLASHRL_VLLM_PYTHON" in docs
     assert "optional `vllm` extra" in docs
 
-    example_yaml = Path("flashrl/framework/examples/reasoning/config.yaml").read_text(
+    example_yaml = Path("flashrl/framework/examples/reasoning-math/config.yaml").read_text(
         encoding="utf-8"
     )
     vllm_example_yaml = Path(
-        "flashrl/framework/examples/reasoning/config_vllm.yaml"
+        "flashrl/framework/examples/reasoning-math/config_vllm.yaml"
+    ).read_text(
+        encoding="utf-8"
+    )
+    code_example_yaml = Path(
+        "flashrl/framework/examples/reasoning-code/config.yaml"
+    ).read_text(
+        encoding="utf-8"
+    )
+    code_vllm_example_yaml = Path(
+        "flashrl/framework/examples/reasoning-code/config_vllm.yaml"
     ).read_text(
         encoding="utf-8"
     )
@@ -1801,7 +2088,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "grpo:" in example_yaml
     assert "metrics:" in example_yaml
     assert "runtime:" in example_yaml
-    assert "hooks:" in example_yaml
+    assert "hooks:" not in example_yaml
     assert "tensorboard:" in example_yaml
     assert "pushgateway:" in example_yaml
     assert "pushgateway_url:" not in example_yaml
@@ -1811,6 +2098,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "debug_live_rollout:" in docs
     assert "backend: vllm" in vllm_example_yaml
     assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
+    assert "hooks:" not in vllm_example_yaml
+    assert "hooks:" not in code_example_yaml
+    assert "hooks:" not in code_vllm_example_yaml
+    assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
+    assert "Qwen/Qwen2.5-Coder-1.5B" in code_vllm_example_yaml
     assert "~/.venv-vllm" not in vllm_example_yaml
     assert "~/.venv-vllm-metal" not in vllm_example_yaml
     assert "vllm_args:" not in vllm_example_yaml

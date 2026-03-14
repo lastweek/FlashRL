@@ -1,6 +1,6 @@
-# FlashRL runtime/training profile for the reasoning example.
+# FlashRL runtime/training profile for the reasoning-code example.
 common:
-  model_name: Qwen/Qwen2.5-0.5B
+  model_name: Qwen/Qwen2.5-Coder-1.5B
 
 training:
   num_threads: 1
@@ -9,14 +9,17 @@ training:
   max_epochs: 1
 
 serving:
+  backend: vllm
+  runtime_python: ${FLASHRL_VLLM_PYTHON}
+  num_replicas: 1
   num_threads: 1
-  debug_live_rollout: true
+  debug_live_rollout: false
 
 grpo:
   group_size: 2
   clip_ratio: 0.2
   kl_coefficient: 0.0
-  max_new_tokens: 256
+  max_new_tokens: 768
   temperature: 1.0
   top_p: 0.9
   top_k: 0
@@ -38,8 +41,3 @@ metrics:
 
 runtime:
   reference_enabled: false
-
-hooks:
-  rollout_fn: flashrl.framework.examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: flashrl.framework.examples.reasoning.train:math_reward_fn
-  dataset_fn: flashrl.framework.examples.reasoning.train:build_math_train_dataset

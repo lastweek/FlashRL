@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import importlib.util
+from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from flashrl.framework.examples.reasoning.train import math_reward_fn, render_math_prompt
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
@@ -25,6 +27,26 @@ from tests.conftest import (
 )
 
 pytestmark = pytest.mark.unit
+
+
+def load_script_module(module_name: str, relative_path: str):
+    """Load one hyphen-folder script as a normal Python module for tests."""
+    module_path = Path(relative_path)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+reasoning_math = load_script_module(
+    "flashrl_reasoning_math_train_for_grpo",
+    "flashrl/framework/examples/reasoning-math/train.py",
+)
+math_reward_fn = reasoning_math.math_reward_fn
+render_math_prompt = reasoning_math.render_math_prompt
 
 
 def build_trainer(

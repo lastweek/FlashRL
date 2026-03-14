@@ -44,22 +44,25 @@ rm -rf .cache/
 
 ## Quick Start
 
-### Run the Reasoning Example
+### Run the Reasoning-Math Example
 
-The reasoning example now lives in its own folder with a thin training script
+The reasoning-math example now lives in its own folder with a thin training script
 and a YAML config:
 
 ```bash
-python3 -m flashrl.framework.examples.reasoning.train
-```
-
-Or run it directly from YAML:
-
-```bash
-python3 -m flashrl.framework.flashrl --config flashrl/framework/examples/reasoning/config.yaml
+python3 flashrl/framework/examples/reasoning-math/train.py
 ```
 
 See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.
+
+### Run the Code Example
+
+The first code example is a script-based Codeforces prototype with local
+execution reward:
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py
+```
 
 ### Inspect Run Artifacts
 
@@ -93,7 +96,7 @@ Older `.flashrl-runs/` directories remain viewable if you already have them.
 
 **What works:**
 - Data models and configuration system
-- YAML-driven example runs
+- Script-run example workflows and YAML-driven framework runs
 - Model wrappers (Actor, Reference, Critic)
 - GRPO trainer structure
 - Training pipeline examples

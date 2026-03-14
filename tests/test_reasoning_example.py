@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import importlib.util
 import os
 from pathlib import Path
 import sys
@@ -10,11 +11,40 @@ from types import SimpleNamespace
 
 import pytest
 
-from flashrl.framework.examples.reasoning import train as reasoning_example
-from flashrl.framework.examples.reasoning.eval import evaluate_model
 from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
 
 pytestmark = pytest.mark.unit
+
+
+def load_script_module(
+    module_name: str,
+    relative_path: str,
+    *,
+    aliases: tuple[str, ...] = (),
+):
+    """Load one hyphen-folder script as a normal Python module for tests."""
+    module_path = Path(relative_path)
+    spec = importlib.util.spec_from_file_location(module_name, module_path)
+    assert spec is not None
+    assert spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    for alias in aliases:
+        sys.modules[alias] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+reasoning_example = load_script_module(
+    "flashrl_reasoning_math_train",
+    "flashrl/framework/examples/reasoning-math/train.py",
+    aliases=("train",),
+)
+reasoning_eval = load_script_module(
+    "flashrl_reasoning_math_eval",
+    "flashrl/framework/examples/reasoning-math/eval.py",
+)
+evaluate_model = reasoning_eval.evaluate_model
 
 
 def make_prompt(
@@ -536,8 +566,6 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
     assert "--checkpoint-out" in train_help
     assert "--task-config" not in train_help
 
-    from flashrl.framework.examples.reasoning import eval as reasoning_eval
-
     eval_help = reasoning_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
     assert "--dataset" in eval_help
@@ -558,13 +586,10 @@ def test_prepare_reasoning_environment_sets_default_vllm_runtime(
 ) -> None:
     """The direct example entrypoint should auto-fill the default vLLM runtime."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
-    monkeypatch.setattr(
-        "flashrl.framework.examples.reasoning.train.find_default_vllm_python",
-        lambda: "/tmp/fake-vllm-python",
-    )
+    monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/reasoning/config_vllm.yaml"
+        "flashrl/framework/examples/reasoning-math/config_vllm.yaml"
     )
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
@@ -576,29 +601,21 @@ def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
 ) -> None:
     """Only the vLLM example config should trigger env auto-discovery."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
-    monkeypatch.setattr(
-        "flashrl.framework.examples.reasoning.train.find_default_vllm_python",
-        lambda: "/tmp/fake-vllm-python",
-    )
+    monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/reasoning/config.yaml"
+        "flashrl/framework/examples/reasoning-math/config.yaml"
     )
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ
 
 
 def test_eval_module_imports_only_public_helpers_from_train() -> None:
-    """eval.py should only depend on train.py helpers that are meant to be shared."""
-    source = Path("flashrl/framework/examples/reasoning/eval.py").read_text(encoding="utf-8")
+    """eval.py should import the local train script instead of the old package path."""
+    source = Path("flashrl/framework/examples/reasoning-math/eval.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
-    imported_names = [
-        alias.name
+    assert any(
+        isinstance(node, ast.Import) and any(alias.name == "train" for alias in node.names)
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom)
-        and node.module == "flashrl.framework.examples.reasoning.train"
-        for alias in node.names
-    ]
-
-    assert imported_names
-    assert all(not name.startswith("_") for name in imported_names)
+    )
+    assert "flashrl.framework.examples.reasoning" not in source

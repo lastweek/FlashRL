@@ -46,6 +46,7 @@ class BaseConfig(BaseModel):
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> "BaseConfig":
         """Load config from dictionary."""
+        data = _expand_env_vars(data)
         return cls(**data)
 
 
@@ -254,4 +255,4 @@ class RunConfig(BaseConfig):
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
-    hooks: HookConfig
+    hooks: HookConfig | None = None

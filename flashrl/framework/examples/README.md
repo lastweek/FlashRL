@@ -3,14 +3,14 @@
 Examples live in their own folders and can include a training entrypoint,
 evaluation helpers, one or more YAML configs, and an example-specific README.
 
-## Reasoning Example
+## Reasoning-Math Example
 
-The reasoning example is a strict R1-Zero-style math prototype with explicit
+The reasoning-math example is a strict R1-Zero-style math prototype with explicit
 dataset selection. It trains a base Qwen model with rule-based rewards, no
 system prompt, and a strict `<think>...</think><answer>...</answer>` output
 contract.
 
-See [flashrl/framework/examples/reasoning/README.md](reasoning/README.md) for:
+See [flashrl/framework/examples/reasoning-math/README.md](reasoning-math/README.md) for:
 
 - supported run modes
 - the CLI-first example workflow
@@ -20,16 +20,24 @@ See [flashrl/framework/examples/reasoning/README.md](reasoning/README.md) for:
 - expected outputs and logs
 - troubleshooting
 
-## YAML Hook Format
+## Reasoning-Code Example
 
-FlashRL YAML configs reference Python code with `module:attribute` strings:
+The reasoning-code example is a strict R1-style Codeforces prototype with local
+execution reward. It keeps the same visible `<think>...</think><answer>...</answer>`
+contract as the math example, but the final answer is a fenced Python code
+block that is executed against official tests.
 
-```yaml
-hooks:
-  rollout_fn: flashrl.framework.examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: flashrl.framework.examples.reasoning.train:math_reward_fn
-  dataset_fn: flashrl.framework.examples.reasoning.train:build_math_train_dataset
-```
+See [flashrl/framework/examples/reasoning-code/README.md](reasoning-code/README.md) for:
+
+- the script-based train and eval commands
+- dataset filtering and rating defaults
+- execution limits and sandbox notes
+- config differences
+- reward behavior
+
+Both example folders are intentionally hyphenated, so they are run as scripts.
+Their `train.py` / `eval.py` entrypoints load the YAML profiles directly and
+construct `FlashRL(...)` in code.
 
 ## Managed vLLM Backend
 

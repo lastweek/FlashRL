@@ -1,24 +1,23 @@
-"""Held-out evaluation for the strict math reasoning example."""
+"""Held-out evaluation for the strict reasoning-math example."""
 
 from __future__ import annotations
 
 import argparse
 import json
 from pathlib import Path
+import sys
+
+EXAMPLE_DIR = Path(__file__).resolve().parent
+REPO_ROOT = EXAMPLE_DIR.parents[3]
+for candidate in (REPO_ROOT, EXAMPLE_DIR):
+    candidate_text = str(candidate)
+    if candidate_text not in sys.path:
+        sys.path.insert(0, candidate_text)
+
+import train as reasoning_math_example
 
 from flashrl.framework import FlashRL
 from flashrl.framework.data_models import Prompt
-
-from flashrl.framework.examples.reasoning.train import (
-    DEFAULT_MATH_DATASET,
-    DEFAULT_REASONING_CHECKPOINT_PATH,
-    DEFAULT_REASONING_EVAL_BATCH_SIZE,
-    SUPPORTED_MATH_DATASETS,
-    build_math_eval_dataset,
-    math_reward_fn,
-    prepare_reasoning_environment,
-    reasoning_rollout_fn,
-)
 
 
 def evaluate_model(
@@ -50,8 +49,8 @@ def evaluate_model(
 
     for start in range(0, len(dataset), batch_size):
         prompts = dataset[start:start + batch_size]
-        rollouts = reasoning_rollout_fn(prompts, flashrl._serving_backend)
-        rewards = [math_reward_fn(rollout) for rollout in rollouts]
+        rollouts = reasoning_math_example.reasoning_rollout_fn(prompts, flashrl._serving_backend)
+        rewards = [reasoning_math_example.math_reward_fn(rollout) for rollout in rollouts]
         for reward in rewards:
             sample_count += 1
             total_reward += float(reward.reward)
@@ -79,7 +78,9 @@ def evaluate_model(
 
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for held-out evaluation."""
-    parser = argparse.ArgumentParser(description="Evaluate the FlashRL math reasoning example.")
+    parser = argparse.ArgumentParser(
+        description="Evaluate the FlashRL reasoning-math example."
+    )
     parser.add_argument(
         "--config",
         default=str(Path(__file__).with_name("config_vllm.yaml")),
@@ -87,8 +88,8 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--dataset",
-        choices=SUPPORTED_MATH_DATASETS,
-        default=DEFAULT_MATH_DATASET,
+        choices=reasoning_math_example.SUPPORTED_MATH_DATASETS,
+        default=reasoning_math_example.DEFAULT_MATH_DATASET,
         help="Math dataset to evaluate.",
     )
     parser.add_argument(
@@ -105,7 +106,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=DEFAULT_REASONING_EVAL_BATCH_SIZE,
+        default=reasoning_math_example.DEFAULT_REASONING_EVAL_BATCH_SIZE,
         help="Optional number of prompts to evaluate per generate_batch call.",
     )
     return parser
@@ -115,19 +116,26 @@ def main(argv: list[str] | None = None) -> int:
     """Run held-out evaluation and print compact JSON metrics."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    prepare_reasoning_environment(args.config)
+    reasoning_math_example.prepare_reasoning_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
-        dataset = build_math_eval_dataset(dataset=args.dataset, limit=args.eval_limit)
+        dataset = reasoning_math_example.build_math_eval_dataset(
+            dataset=args.dataset,
+            limit=args.eval_limit,
+        )
         batch_size = args.batch_size
         checkpoint = args.checkpoint
         if checkpoint is None:
-            default_checkpoint = Path(DEFAULT_REASONING_CHECKPOINT_PATH)
+            default_checkpoint = Path(reasoning_math_example.DEFAULT_REASONING_CHECKPOINT_PATH)
             if default_checkpoint.exists():
                 checkpoint = str(default_checkpoint)
 
-        flashrl = FlashRL.from_yaml(args.config)
+        flashrl = FlashRL(
+            config_path=args.config,
+            rollout_fn=reasoning_math_example.reasoning_rollout_fn,
+            reward_fn=reasoning_math_example.math_reward_fn,
+        )
         if checkpoint:
             flashrl.load_checkpoint(checkpoint)
         metrics = evaluate_model(
@@ -137,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:
-        print(f"FlashRL reasoning evaluation failed: {exc}", file=sys.stderr)
+        print(f"FlashRL reasoning-math evaluation failed: {exc}", file=sys.stderr)
         return 1
     finally:
         if flashrl is not None:

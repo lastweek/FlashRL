@@ -124,14 +124,64 @@ def _rollout_config_from_grpo(grpo_config: GrpoConfig) -> RolloutConfig:
     )
 
 
+def _coerce_run_config(
+    *,
+    config_path: str | Path | None,
+    run_config: RunConfig | dict[str, Any] | None,
+) -> RunConfig | None:
+    """Normalize the optional profile input into one RunConfig object."""
+    if config_path is not None and run_config is not None:
+        raise ValueError("Pass only one of config_path or run_config when constructing FlashRL.")
+    if config_path is not None:
+        return RunConfig.from_yaml(config_path)
+    if run_config is None:
+        return None
+    if isinstance(run_config, RunConfig):
+        return run_config
+    if isinstance(run_config, dict):
+        return RunConfig.from_dict(run_config)
+    raise TypeError("run_config must be a RunConfig, dict, or None.")
+
+
+def _trainer_config_from_run_config(run_config: RunConfig) -> TrainerConfig:
+    """Extract trainer loop settings from one top-level RunConfig."""
+    return TrainerConfig(
+        learning_rate=run_config.training.learning_rate,
+        batch_size=run_config.training.batch_size,
+        max_epochs=run_config.training.max_epochs,
+        seed=run_config.training.seed,
+        shuffle_each_epoch=run_config.training.shuffle_each_epoch,
+    )
+
+
+def _resolve_runtime_profile(
+    run_config: RunConfig,
+) -> tuple[TrainingConfig, ServingConfig, TrainerConfig]:
+    """Resolve the merged training/serving configs from one RunConfig."""
+    training_config = _resolve_model_config(
+        common=run_config.common,
+        section=run_config.training,
+        config_cls=TrainingConfig,
+        section_name="training",
+    )
+    serving_config = _resolve_model_config(
+        common=run_config.common,
+        section=run_config.serving,
+        config_cls=ServingConfig,
+        section_name="serving",
+    )
+    trainer_config = _trainer_config_from_run_config(run_config)
+    return training_config, serving_config, trainer_config
+
+
 class FlashRL:
     """Unified FlashRL trainer with a simple RL training API."""
 
     def __init__(
         self,
-        model: str,
-        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]],
-        reward_fn: Callable[[RolloutOutput], RewardOutput],
+        model: str | None = None,
+        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]] | None = None,
+        reward_fn: Callable[[RolloutOutput], RewardOutput] | None = None,
         learning_rate: float = 1e-5,
         batch_size: int = 32,
         max_epochs: int = 10,
@@ -156,6 +206,9 @@ class FlashRL:
         admin_enabled: bool = True,
         admin_host: str = "127.0.0.1",
         admin_port: int = 0,
+        config_path: str | Path | None = None,
+        run_config: RunConfig | dict[str, Any] | None = None,
+        dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None,
     ) -> None:
         """Initialize FlashRL trainer.
 
@@ -163,6 +216,75 @@ class FlashRL:
         exactly one device. A frozen reference model is optional and is only
         needed when the user wants KL-regularized GRPO.
         """
+        resolved_run_config = _coerce_run_config(
+            config_path=config_path,
+            run_config=run_config,
+        )
+        if resolved_run_config is not None:
+            if rollout_fn is None or reward_fn is None:
+                raise ValueError(
+                    "FlashRL profile construction requires explicit rollout_fn and reward_fn."
+                )
+            if (
+                learning_rate != 1e-5
+                or batch_size != 32
+                or max_epochs != 10
+                or seed != 42
+                or shuffle_each_epoch is not True
+                or clip_ratio != 0.2
+                or kl_coefficient != 0.0
+                or gamma != 1.0
+                or device is not None
+                or dtype != "float32"
+                or max_length != 2048
+                or load_in_8bit is not False
+                or trust_remote_code is not False
+                or num_threads != 1
+                or reference_enabled is not False
+                or reference_device is not None
+                or admin_enabled is not True
+                or admin_host != "127.0.0.1"
+                or admin_port != 0
+            ):
+                raise ValueError(
+                    "FlashRL profile construction cannot be combined with low-level "
+                    "training/runtime overrides."
+                )
+            if model is not None or training_config is not None or serving_config is not None:
+                raise ValueError(
+                    "FlashRL profile construction cannot be combined with model, "
+                    "training_config, or serving_config overrides."
+                )
+            if grpo_config is not None:
+                raise ValueError(
+                    "FlashRL profile construction cannot be combined with an explicit grpo_config."
+                )
+
+            training_config, serving_config, trainer_config = _resolve_runtime_profile(
+                resolved_run_config
+            )
+            model = training_config.model_name
+            learning_rate = trainer_config.learning_rate
+            batch_size = trainer_config.batch_size
+            max_epochs = trainer_config.max_epochs
+            seed = trainer_config.seed
+            shuffle_each_epoch = trainer_config.shuffle_each_epoch
+            grpo_config = resolved_run_config.grpo
+            logging_config = resolved_run_config.logging
+            metrics_config = resolved_run_config.metrics
+            reference_enabled = resolved_run_config.runtime.reference_enabled
+            reference_device = resolved_run_config.runtime.reference_device
+            admin_enabled = resolved_run_config.runtime.admin_enabled
+            admin_host = resolved_run_config.runtime.admin_host
+            admin_port = resolved_run_config.runtime.admin_port
+
+        if model is None:
+            raise ValueError(
+                "FlashRL(...) requires model unless config_path or run_config is provided."
+            )
+        if rollout_fn is None or reward_fn is None:
+            raise ValueError("FlashRL(...) requires explicit rollout_fn and reward_fn.")
+
         self.rollout_fn = rollout_fn
         self.reward_fn = reward_fn
         self.reference_enabled = reference_enabled
@@ -227,7 +349,7 @@ class FlashRL:
         self._runtime_bootstrap_events: list[dict[str, Any]] = []
         self._runtime_bootstrap_totals: dict[str, float] = {}
         self._resume_from_checkpoint = False
-        self._dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None
+        self._dataset_loader = dataset_loader
         self._admin_registry: AdminRegistry | None = None
         self._admin_server: AdminServer | None = None
         self._runtime_uid = uuid4().hex
@@ -301,51 +423,21 @@ class FlashRL:
         """Construct FlashRL from a YAML run config."""
         config_path = Path(path)
         run_config = RunConfig.from_yaml(config_path)
-        training_config = _resolve_model_config(
-            common=run_config.common,
-            section=run_config.training,
-            config_cls=TrainingConfig,
-            section_name="training",
-        )
-        serving_config = _resolve_model_config(
-            common=run_config.common,
-            section=run_config.serving,
-            config_cls=ServingConfig,
-            section_name="serving",
-        )
-        trainer_config = TrainerConfig(
-            learning_rate=run_config.training.learning_rate,
-            batch_size=run_config.training.batch_size,
-            max_epochs=run_config.training.max_epochs,
-            seed=run_config.training.seed,
-            shuffle_each_epoch=run_config.training.shuffle_each_epoch,
-        )
+        if run_config.hooks is None:
+            raise ValueError(
+                "FlashRL.from_yaml(...) requires hooks.rollout_fn, hooks.reward_fn, and "
+                "hooks.dataset_fn in the YAML config."
+            )
         rollout_fn = _resolve_import_string(run_config.hooks.rollout_fn)
         reward_fn = _resolve_import_string(run_config.hooks.reward_fn)
         dataset_fn = _resolve_import_string(run_config.hooks.dataset_fn)
 
-        instance = cls(
-            model=training_config.model_name,
+        return cls(
             rollout_fn=rollout_fn,
             reward_fn=reward_fn,
-            training_config=training_config,
-            learning_rate=trainer_config.learning_rate,
-            batch_size=trainer_config.batch_size,
-            max_epochs=trainer_config.max_epochs,
-            seed=trainer_config.seed,
-            shuffle_each_epoch=trainer_config.shuffle_each_epoch,
-            grpo_config=run_config.grpo,
-            serving_config=serving_config,
-            logging_config=run_config.logging,
-            metrics_config=run_config.metrics,
-            reference_enabled=run_config.runtime.reference_enabled,
-            reference_device=run_config.runtime.reference_device,
-            admin_enabled=run_config.runtime.admin_enabled,
-            admin_host=run_config.runtime.admin_host,
-            admin_port=run_config.runtime.admin_port,
+            run_config=run_config,
+            dataset_loader=dataset_fn,
         )
-        instance._dataset_loader = dataset_fn
-        return instance
 
     def _initialize_runtime(self) -> None:
         """Initialize training and serving backends."""
@@ -694,7 +786,7 @@ class FlashRL:
             if self._dataset_loader is None:
                 raise ValueError(
                     "FlashRL.train() requires a dataset unless the trainer was created with "
-                    "FlashRL.from_yaml(...) and hooks.dataset_fn is configured."
+                    "a configured dataset_loader."
                 )
             dataset = self._dataset_loader()
 
