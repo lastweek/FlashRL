@@ -15,7 +15,7 @@ import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.serving as serving_module
 import flashrl.framework.serving.huggingface as huggingface_module
 import flashrl.framework.serving.vllm as vllm_module
-from flashrl.framework.config import LoggingConfig, MetricsConfig, ServingConfig
+from flashrl.framework.config import GrpoConfig, LoggingConfig, MetricsConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.serving import (
@@ -24,6 +24,7 @@ from flashrl.framework.serving import (
     VLLMServingBackend,
     create_serving_backend,
 )
+from flashrl.framework.training import OptimizationResult, TrainingBackend
 from tests.conftest import TinyActor
 
 pytestmark = pytest.mark.unit
@@ -120,23 +121,88 @@ class FakeProcess:
         self._returncode = 0
 
 
-class StubTrainingBackend:
+class StubTrainingBackend(TrainingBackend):
     """Training backend stub for FlashRL lifecycle tests."""
 
-    def __init__(self, config, learning_rate: float = 1e-5) -> None:
-        del config
+    def __init__(
+        self,
+        config,
+        learning_rate: float = 1e-5,
+        grpo_config: GrpoConfig | None = None,
+        reference_enabled: bool = False,
+        reference_device: str | None = None,
+    ) -> None:
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
+        super().__init__(
+            resolved_config,
+            learning_rate=learning_rate,
+            grpo_config=grpo_config or GrpoConfig(group_size=2),
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+        )
         self.actor = TinyActor(bias_shift=0.25)
         self.actor.train()
+        self.device = self.actor.device
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.startup_events = [
+            {
+                "component": "training_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
 
-    def save_checkpoint(self, path: str) -> None:
-        torch.save(self.actor.model.state_dict(), path)
-
-    def load_checkpoint(self, path: str) -> None:
-        self.actor.model.load_state_dict(torch.load(path, weights_only=False))
-
-    def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.sync_from_training_actor(self.actor)
+    def optimize_batch(self, learner_batch) -> OptimizationResult:
+        response_tokens_total = sum(len(tokens) for tokens in learner_batch.response_token_ids)
+        full_lengths = [
+            len(prompt_tokens) + len(response_tokens)
+            for prompt_tokens, response_tokens in zip(
+                learner_batch.prompt_token_ids,
+                learner_batch.response_token_ids,
+                strict=True,
+            )
+        ]
+        return OptimizationResult(
+            loss=0.0,
+            policy_loss=0.0,
+            kl_divergence=0.0,
+            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+            stage_timings={
+                "prepare_inputs": 0.0,
+                "actor_forward": 0.0,
+                "reference_forward": 0.0,
+                "loss_assembly": 0.0,
+                "backward": 0.0,
+                "optimizer": 0.0,
+            },
+            response_tokens_total=response_tokens_total,
+            reference_active=False,
+            stage_metrics={
+                "prepare_inputs": {
+                    "full_tokens_mean": float(sum(full_lengths) / len(full_lengths)) if full_lengths else 0.0,
+                    "full_tokens_max": max(full_lengths, default=0),
+                    "response_tokens_total": response_tokens_total,
+                },
+                "actor_forward": {"full_tokens_total": sum(full_lengths)},
+                "loss_assembly": {
+                    "loss": 0.0,
+                    "policy_loss": 0.0,
+                    "kl_divergence": 0.0,
+                    "response_tokens_total": response_tokens_total,
+                    "importance_sampling_ratio_mean": 1.0,
+                    "importance_sampling_ratio_std": 0.0,
+                    "importance_sampling_ratio_min": 1.0,
+                    "importance_sampling_ratio_max": 1.0,
+                    "clip_fraction": 0.0,
+                },
+                "backward": {"loss": 0.0},
+                "optimizer": {"learning_rate": float(self.optimizer.param_groups[0]["lr"])},
+            },
+        )
 
 
 class ClosableServingBackend:
@@ -736,7 +802,19 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
         encoding="utf-8",
     )
 
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
@@ -794,7 +872,19 @@ def test_flashrl_train_failure_closes_serving_backend(
 ) -> None:
     """Training failures should close the serving backend worker."""
     serving_backend = ClosableServingBackend()
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
@@ -823,7 +913,19 @@ def test_flashrl_train_computes_missing_rollout_logprobs_from_training_actor(
 ) -> None:
     """GRPO training should fall back to the synced training actor when serving omits logprobs."""
     serving_backend = MissingLogprobServingBackend()
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",

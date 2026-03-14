@@ -14,32 +14,87 @@ from fastapi.testclient import TestClient
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework.admin import AdminRegistry, build_admin_object, create_admin_app
-from flashrl.framework.config import LoggingConfig, MetricsConfig, RuntimeConfig, ServingConfig
+from flashrl.framework.config import GrpoConfig, LoggingConfig, MetricsConfig, RuntimeConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.flashrl import FlashRL
 from tests.conftest import TinyActor
+from flashrl.framework.training import OptimizationResult, TrainingBackend
 
 
 pytestmark = pytest.mark.unit
 
 
-class StubTrainingBackend:
+class StubTrainingBackend(TrainingBackend):
     """Training backend stub for admin API tests."""
 
-    def __init__(self, config, learning_rate: float = 1e-5) -> None:
-        del config
+    def __init__(
+        self,
+        config,
+        learning_rate: float = 1e-5,
+        grpo_config: GrpoConfig | None = None,
+        reference_enabled: bool = False,
+        reference_device: str | None = None,
+    ) -> None:
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
+        super().__init__(
+            resolved_config,
+            learning_rate=learning_rate,
+            grpo_config=grpo_config or GrpoConfig(group_size=2),
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+        )
         self.actor = TinyActor(bias_shift=0.25)
         self.actor.train()
+        self.device = self.actor.device
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.startup_events = [
+            {
+                "component": "training_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
 
-    def save_checkpoint(self, path: str) -> None:
-        torch.save(self.actor.model.state_dict(), path)
-
-    def load_checkpoint(self, path: str) -> None:
-        self.actor.model.load_state_dict(torch.load(path, weights_only=False))
-
-    def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.sync_from_training_actor(self.actor)
+    def optimize_batch(self, learner_batch) -> OptimizationResult:
+        return OptimizationResult(
+            loss=0.0,
+            policy_loss=0.0,
+            kl_divergence=0.0,
+            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
+            stage_timings={
+                "prepare_inputs": 0.0,
+                "actor_forward": 0.0,
+                "reference_forward": 0.0,
+                "loss_assembly": 0.0,
+                "backward": 0.0,
+                "optimizer": 0.0,
+            },
+            response_tokens_total=sum(len(tokens) for tokens in learner_batch.response_token_ids),
+            reference_active=False,
+            stage_metrics={
+                "prepare_inputs": {},
+                "actor_forward": {},
+                "loss_assembly": {
+                    "loss": 0.0,
+                    "policy_loss": 0.0,
+                    "kl_divergence": 0.0,
+                    "response_tokens_total": sum(
+                        len(tokens) for tokens in learner_batch.response_token_ids
+                    ),
+                    "importance_sampling_ratio_mean": 1.0,
+                    "importance_sampling_ratio_std": 0.0,
+                    "importance_sampling_ratio_min": 1.0,
+                    "importance_sampling_ratio_max": 1.0,
+                    "clip_fraction": 0.0,
+                },
+                "backward": {"loss": 0.0},
+                "optimizer": {"learning_rate": float(self.optimizer.param_groups[0]["lr"])},
+            },
+        )
 
 
 class AdminServingBackend:
@@ -279,7 +334,19 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
     tmp_path: Path,
 ) -> None:
     """FlashRL should expose live runtime and VLLM admin objects over HTTP."""
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
@@ -325,7 +392,19 @@ def test_flashrl_admin_server_keeps_failed_state_visible_until_close(
     tmp_path: Path,
 ) -> None:
     """Training failures should remain visible through the admin API until close."""
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",

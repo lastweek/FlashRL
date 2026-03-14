@@ -1,16 +1,16 @@
 # FlashRL Reasoning Example
 
-This example is a strict R1-Zero-style math prototype over GSM8K. It trains a
-base Qwen model with rule-based rewards only, uses no system prompt, and
-requires exactly one `<think>...</think>` block followed by one
-`<answer>...</answer>` block.
+This example is a strict R1-Zero-style math prototype with explicit dataset
+selection. It trains a base Qwen model with rule-based rewards only, uses no
+system prompt, and requires exactly one `<think>...</think>` block followed by
+one `<answer>...</answer>` block.
 
 The example keeps one simple split of responsibility:
 
 - `config.yaml` and `config_vllm.yaml` control FlashRL runtime and training
   behavior.
-- `train.py` and `eval.py` control the math-example behavior through explicit
-  CLI flags.
+- `train.py` and `eval.py` control dataset choice and the other math-example
+  details through explicit CLI flags.
 
 It is a math-only prototype for local experimentation. It is not a full
 DeepSeek-R1 reproduction, does not include cold-start SFT, and does not include
@@ -21,7 +21,7 @@ Run the commands below from the repository root.
 ## Files In This Folder
 
 - `train.py`: main math training entrypoint and the example hook functions.
-- `eval.py`: held-out evaluation entrypoint for GSM8K test.
+- `eval.py`: held-out evaluation entrypoint for the selected math dataset.
 - `config.yaml`: cheap local Hugging Face profile.
 - `config_vllm.yaml`: canonical managed local vLLM profile.
 
@@ -49,7 +49,7 @@ Install the project dependencies first:
 pip install -e .
 ```
 
-That includes `datasets`, which this example uses to load GSM8K.
+That includes `datasets`, which this example uses to load GSM8K and AIME25.
 
 If you want the managed vLLM path, use one of these setups:
 
@@ -66,8 +66,8 @@ or prepare a dedicated runtime:
 Notes:
 
 - Training and evaluation need access to the configured model weights and the
-  GSM8K dataset from Hugging Face unless those assets are already cached
-  locally.
+  selected math dataset from Hugging Face unless those assets are already
+  cached locally.
 - TensorBoard metrics are on by default:
 
 ```bash
@@ -87,28 +87,62 @@ Training still runs if the optional Pushgateway stack is unavailable.
 ### Canonical managed vLLM training
 
 ```bash
-python3 -m examples.reasoning.train
+python3 -m flashrl.framework.examples.reasoning.train
 ```
 
 Equivalent explicit form:
 
 ```bash
-python3 -m examples.reasoning.train --config examples/reasoning/config_vllm.yaml
+python3 -m flashrl.framework.examples.reasoning.train --config flashrl/framework/examples/reasoning/config_vllm.yaml
 ```
 
 ### Local Hugging Face debug training
 
 ```bash
-python3 -m examples.reasoning.train --config examples/reasoning/config.yaml
+python3 -m flashrl.framework.examples.reasoning.train --config flashrl/framework/examples/reasoning/config.yaml
 ```
 
 Use this when you want a smaller local run and `serving.debug_live_rollout`
 support for rollout debugging.
 
+### Dataset selection
+
+Built-in datasets:
+
+- `gsm8k`: default dataset for both train and eval.
+- `aime25`: `math-ai/aime25`, supported for both train and eval on its `test`
+  split.
+
+Examples:
+
+```bash
+python3 -m flashrl.framework.examples.reasoning.train --dataset aime25
+```
+
+```bash
+python3 -m flashrl.framework.examples.reasoning.eval --dataset aime25
+```
+
+Before training or evaluation starts, the selected dataset is printed to the
+terminal in a compact summary such as:
+
+```text
+dataset  name=gsm8k  source=openai/gsm8k  split=train  available=7473  selected=256
+format   problem_field=question  answer_field=answer  target=parse #### + numeric normalize
+```
+
+For `aime25`, the format line becomes:
+
+```text
+format   problem_field=problem  answer_field=answer  target=direct numeric normalize
+```
+
+This summary is terminal-only. It is not copied into `console.log`.
+
 ### Held-out evaluation
 
 ```bash
-python3 -m examples.reasoning.eval
+python3 -m flashrl.framework.examples.reasoning.eval
 ```
 
 By default, `eval.py` will try to load
@@ -118,8 +152,8 @@ the base model from the selected FlashRL profile.
 Explicit checkpoint form:
 
 ```bash
-python3 -m examples.reasoning.eval \
-  --config examples/reasoning/config_vllm.yaml \
+python3 -m flashrl.framework.examples.reasoning.eval \
+  --config flashrl/framework/examples/reasoning/config_vllm.yaml \
   --checkpoint /tmp/flashrl_reasoning_checkpoint.pt
 ```
 
@@ -129,11 +163,11 @@ The framework entrypoint still works, but it only sees the FlashRL profile and
 therefore uses the built-in example defaults:
 
 ```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
+python3 -m flashrl.framework.flashrl --config flashrl/framework/examples/reasoning/config.yaml
 ```
 
 ```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm.yaml
+python3 -m flashrl.framework.flashrl --config flashrl/framework/examples/reasoning/config_vllm.yaml
 ```
 
 Use `train.py` and `eval.py` when you want the more ergonomic example workflow.
@@ -145,8 +179,9 @@ Use `train.py` and `eval.py` when you want the more ergonomic example workflow.
 Useful flags:
 
 ```bash
-python3 -m examples.reasoning.train \
-  --config examples/reasoning/config.yaml \
+python3 -m flashrl.framework.examples.reasoning.train \
+  --config flashrl/framework/examples/reasoning/config.yaml \
+  --dataset aime25 \
   --train-limit 64 \
   --checkpoint-out /tmp/flashrl_reasoning_checkpoint.pt
 ```
@@ -154,7 +189,8 @@ python3 -m examples.reasoning.train \
 Available flags:
 
 - `--config`: FlashRL runtime/training profile.
-- `--train-limit`: cap the number of GSM8K training questions.
+- `--dataset`: choose `gsm8k` or `aime25`.
+- `--train-limit`: cap the number of training questions from the selected dataset.
 - `--checkpoint`: load a checkpoint before training.
 - `--checkpoint-out`: save the final checkpoint to a specific path.
 
@@ -163,8 +199,9 @@ Available flags:
 Useful flags:
 
 ```bash
-python3 -m examples.reasoning.eval \
-  --config examples/reasoning/config.yaml \
+python3 -m flashrl.framework.examples.reasoning.eval \
+  --config flashrl/framework/examples/reasoning/config.yaml \
+  --dataset aime25 \
   --eval-limit 50 \
   --batch-size 4
 ```
@@ -172,26 +209,27 @@ python3 -m examples.reasoning.eval \
 Available flags:
 
 - `--config`: FlashRL runtime/training profile.
+- `--dataset`: choose `gsm8k` or `aime25`.
 - `--checkpoint`: load a checkpoint before evaluation.
-- `--eval-limit`: cap the number of held-out GSM8K questions.
+- `--eval-limit`: cap the number of held-out questions from the selected dataset.
 - `--batch-size`: override the default eval batch size.
 
 ## Controlling How Many Questions Are Used
 
 Three knobs matter, and they do different things:
 
-- Dataset size: how many distinct GSM8K questions are loaded.
+- Dataset size: how many distinct math questions are loaded.
 - Batch shape: how many prompts/completions are sampled per optimizer step.
 - Epoch count: how many passes training makes over the loaded questions.
 
 Use these flags to control dataset size directly:
 
 ```bash
-python3 -m examples.reasoning.train --train-limit 100
+python3 -m flashrl.framework.examples.reasoning.train --train-limit 100
 ```
 
 ```bash
-python3 -m examples.reasoning.eval --eval-limit 50
+python3 -m flashrl.framework.examples.reasoning.eval --eval-limit 50
 ```
 
 Related FlashRL profile knobs:
@@ -204,6 +242,17 @@ Related FlashRL profile knobs:
 So the number of distinct questions comes from `--train-limit` or
 `--eval-limit`, while total training exposure depends on both that limit and
 `training.max_epochs`.
+
+In the printed dataset summary:
+
+- `available` is the full size of the selected source split before any limit is applied.
+- `selected` is the number of rows actually used after `--train-limit` or `--eval-limit`.
+
+Dataset-specific defaults:
+
+- `gsm8k`: train on `train`, evaluate on `test`.
+- `aime25`: both `train.py` and `eval.py` use the `test` split of
+  `math-ai/aime25`.
 
 ## Config Guide
 
@@ -226,7 +275,7 @@ Important batch semantics:
 ## Reward And Output Contract
 
 - `accuracy_reward = 1.0` only when the parsed `<answer>` exactly matches the
-  normalized GSM8K final answer.
+  normalized dataset answer stored in prompt metadata.
 - `format_reward = 0.1` only when the response is exactly one non-empty
   `<think>...</think>` block followed by exactly one non-empty
   `<answer>...</answer>` block, with no extra text after `</answer>`.
@@ -264,8 +313,9 @@ The example does not fall back to parsing answers from free-form text.
 ## Troubleshooting
 
 - Missing `datasets`: install project dependencies with `pip install -e .`.
-- Model or dataset download failures: make sure the configured model and GSM8K
-  dataset are accessible from the current machine or already cached.
+- Model or dataset download failures: make sure the configured model and the
+  selected math dataset are accessible from the current machine or already
+  cached.
 - Missing `FLASHRL_VLLM_PYTHON`: run `./dev.sh vllm setup`, set the env var
   directly, or install the optional `vllm` extra in the current environment.
 - vLLM with `debug_live_rollout: true`: this is not supported; use

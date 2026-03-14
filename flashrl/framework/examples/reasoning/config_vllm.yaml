@@ -43,6 +43,6 @@ runtime:
   reference_enabled: false
 
 hooks:
-  rollout_fn: examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: examples.reasoning.train:math_reward_fn
-  dataset_fn: examples.reasoning.train:build_math_train_dataset
+  rollout_fn: flashrl.framework.examples.reasoning.train:reasoning_rollout_fn
+  reward_fn: flashrl.framework.examples.reasoning.train:math_reward_fn
+  dataset_fn: flashrl.framework.examples.reasoning.train:build_math_train_dataset

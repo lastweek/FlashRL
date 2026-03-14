@@ -13,7 +13,6 @@ from typing import Any, Callable, Sequence
 from uuid import uuid4
 
 from .admin import AdminRegistry, AdminServer, build_admin_object, utc_now_iso
-from .backends.training import TrainingBackend
 from .config import (
     CommonConfig,
     GrpoConfig,
@@ -24,15 +23,16 @@ from .config import (
     RunConfig,
     RolloutConfig,
     ServingConfig,
+    TrainingConfig,
     TrainerConfig,
 )
 from .data_models import Prompt, RewardOutput, RolloutOutput
-from .models.reference import ReferenceModel
 from .metrics import MetricsSink, build_metrics_sink
 from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
+from .training import TrainingBackend, create_training_backend
 from .trainer.grpo import GRPOTrainer
 
 
@@ -81,14 +81,20 @@ SERVING_ONLY_SECTION_FIELDS = {
     "debug_live_rollout",
 }
 
+TRAINING_ONLY_SECTION_FIELDS = {
+    "backend",
+    "dp_size",
+    "fsdp2",
+}
+
 
 def _resolve_model_config(
     *,
     common: CommonConfig | None,
     section: CommonConfig,
-    config_cls: type[ModelConfig] | type[ServingConfig],
+    config_cls: type[ModelConfig] | type[ServingConfig] | type[TrainingConfig],
     section_name: str,
-) -> ModelConfig | ServingConfig:
+) -> ModelConfig | ServingConfig | TrainingConfig:
     """Merge optional common defaults with one model-copy section."""
     merged = {}
     if common is not None:
@@ -96,6 +102,8 @@ def _resolve_model_config(
     include_fields = set(COMMON_MODEL_SECTION_FIELDS)
     if config_cls is ServingConfig:
         include_fields.update(SERVING_ONLY_SECTION_FIELDS)
+    if config_cls is TrainingConfig:
+        include_fields.update(TRAINING_ONLY_SECTION_FIELDS)
     merged.update(section.model_dump(include=include_fields, exclude_none=True))
 
     if not merged.get("model_name"):
@@ -138,6 +146,7 @@ class FlashRL:
         load_in_8bit: bool = False,
         trust_remote_code: bool = False,
         num_threads: int = 1,
+        training_config: TrainingConfig | None = None,
         grpo_config: GrpoConfig | None = None,
         serving_config: ServingConfig | None = None,
         logging_config: LoggingConfig | None = None,
@@ -163,19 +172,26 @@ class FlashRL:
         self.admin_port = admin_port
         self.admin_base_url: str | None = None
 
-        self.training_model_config = ModelConfig(
-            model_name=model,
-            device=device,
-            dtype=dtype,
-            max_length=max_length,
-            load_in_8bit=load_in_8bit,
-            trust_remote_code=trust_remote_code,
-            num_threads=num_threads,
+        self.training_config = (
+            training_config
+            if training_config is not None
+            else TrainingConfig(
+                model_name=model,
+                device=device,
+                dtype=dtype,
+                max_length=max_length,
+                load_in_8bit=load_in_8bit,
+                trust_remote_code=trust_remote_code,
+                num_threads=num_threads,
+            )
         )
+        self.training_model_config = self.training_config
         self.serving_config = (
             serving_config
             if serving_config is not None
-            else ServingConfig(**self.training_model_config.model_dump())
+            else ServingConfig(
+                **self.training_config.model_dump(include=COMMON_MODEL_SECTION_FIELDS)
+            )
         )
         self.trainer_config = TrainerConfig(
             learning_rate=learning_rate,
@@ -202,7 +218,6 @@ class FlashRL:
 
         self._training_backend: TrainingBackend | None = None
         self._serving_backend: ServingBackend | None = None
-        self._reference: ReferenceModel | None = None
         self._rollout_generator: UserDefinedRollout | None = None
         self._reward: UserDefinedReward | None = None
         self._trainer: GRPOTrainer | None = None
@@ -223,7 +238,7 @@ class FlashRL:
 
         self._metrics_sink = build_metrics_sink(
             self.metrics_config,
-            model_name=self.training_model_config.model_name,
+            model_name=self.training_config.model_name,
         )
 
         self._initialize_runtime()
@@ -246,6 +261,7 @@ class FlashRL:
 
     def _emit_bootstrap_console(self, line: str) -> None:
         """Write one live bootstrap line to stdout immediately."""
+        self._runtime_bootstrap_console_lines.append(line)
         if not self._bootstrap_console_enabled():
             return
         print(line, flush=True)
@@ -265,27 +281,30 @@ class FlashRL:
     def _emit_bootstrap_banner(self) -> None:
         """Print the immediate startup banner before any long-running work."""
         reference_state = "enabled" if self.reference_enabled else "disabled"
+        self._emit_bootstrap_console("FlashRL startup")
         self._emit_bootstrap_console(
-            "FlashRL startup  "
-            f"model={self.training_model_config.model_name}  "
+            "  startup  "
+            f"model={self.training_config.model_name}  "
+            f"training={self.training_config.backend}  "
+            f"dp_size={self.training_config.dp_size}  "
             f"serving={self.serving_config.backend}"
             f"{self._serving_replica_summary()}  "
             f"reference={reference_state}"
         )
 
-    def _emit_bootstrap_stage(self, component: str, message: str) -> None:
+    def _emit_bootstrap_stage(self, label: str, component: str, message: str) -> None:
         """Print one concise bootstrap stage line."""
-        self._emit_bootstrap_console(f"startup {component:<17} {message}")
+        self._emit_bootstrap_console(f"  {label:<8} {component:<17} {message}")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "FlashRL":
         """Construct FlashRL from a YAML run config."""
         config_path = Path(path)
         run_config = RunConfig.from_yaml(config_path)
-        training_model_config = _resolve_model_config(
+        training_config = _resolve_model_config(
             common=run_config.common,
             section=run_config.training,
-            config_cls=ModelConfig,
+            config_cls=TrainingConfig,
             section_name="training",
         )
         serving_config = _resolve_model_config(
@@ -306,20 +325,15 @@ class FlashRL:
         dataset_fn = _resolve_import_string(run_config.hooks.dataset_fn)
 
         instance = cls(
-            model=training_model_config.model_name,
+            model=training_config.model_name,
             rollout_fn=rollout_fn,
             reward_fn=reward_fn,
+            training_config=training_config,
             learning_rate=trainer_config.learning_rate,
             batch_size=trainer_config.batch_size,
             max_epochs=trainer_config.max_epochs,
             seed=trainer_config.seed,
             shuffle_each_epoch=trainer_config.shuffle_each_epoch,
-            device=training_model_config.device,
-            dtype=training_model_config.dtype,
-            max_length=training_model_config.max_length,
-            load_in_8bit=training_model_config.load_in_8bit,
-            trust_remote_code=training_model_config.trust_remote_code,
-            num_threads=training_model_config.num_threads,
             grpo_config=run_config.grpo,
             serving_config=serving_config,
             logging_config=run_config.logging,
@@ -334,43 +348,64 @@ class FlashRL:
         return instance
 
     def _initialize_runtime(self) -> None:
-        """Initialize training and serving backends, and reference model if needed."""
+        """Initialize training and serving backends."""
         self._runtime_phase = "Starting"
         self._runtime_bootstrap_events = []
+        self._runtime_bootstrap_console_lines = []
         self._runtime_bootstrap_totals = {}
         startup_total_seconds = 0.0
         self._apply_random_seed()
         self._emit_bootstrap_banner()
 
-        self._emit_bootstrap_stage("training_backend", "starting")
-        started_at = time.perf_counter()
-        self._training_backend = TrainingBackend(
-            self.training_model_config,
-            learning_rate=self.trainer_config.learning_rate,
-        )
-        duration_seconds = time.perf_counter() - started_at
-        startup_total_seconds += duration_seconds
         self._emit_bootstrap_stage(
+            "startup",
             "training_backend",
-            "ready "
-            f"device={self._training_backend.actor.device} "
-            f"cpu={self.training_model_config.num_threads} "
-            f"{self._format_bootstrap_duration(duration_seconds)}",
+            f"starting backend={self.training_config.backend} dp_size={self.training_config.dp_size}",
         )
-        self._runtime_bootstrap_totals["startup_training_backend_seconds"] = duration_seconds
-        self._runtime_bootstrap_events.append(
-            self._make_model_load_event(
-                component="training_backend",
-                duration_seconds=duration_seconds,
-                device=self._training_backend.actor.device,
-                cpu_threads=self.training_model_config.num_threads,
+        self._training_backend = create_training_backend(
+            self.training_config,
+            learning_rate=self.trainer_config.learning_rate,
+            grpo_config=self.grpo_config,
+            reference_enabled=self.reference_enabled,
+            reference_device=self.reference_device,
+        )
+        for event in self._training_backend.startup_events:
+            duration_seconds = float(event["metadata"]["duration_seconds"])
+            startup_total_seconds += duration_seconds
+            component = str(event["component"])
+            if component == "training_backend":
+                self._emit_bootstrap_stage(
+                    "ready",
+                    "training_backend",
+                    f"backend={self.training_config.backend} "
+                    f"device={self._training_backend.device} "
+                    f"dp_size={self.training_config.dp_size} "
+                    f"cpu={self.training_config.num_threads} "
+                    f"{self._format_bootstrap_duration(duration_seconds)}",
+                )
+                self._runtime_bootstrap_totals["startup_training_backend_seconds"] = duration_seconds
+            elif component == "reference_model":
+                self._emit_bootstrap_stage(
+                    "ready",
+                    "reference_model",
+                    f"device={self._training_backend.resolved_reference_device} "
+                    f"cpu={self.training_config.num_threads} "
+                    f"{self._format_bootstrap_duration(duration_seconds)}",
+                )
+                self._runtime_bootstrap_totals["startup_reference_model_seconds"] = duration_seconds
+            self._runtime_bootstrap_events.append(
+                self._make_model_load_event(
+                    component=component,
+                    duration_seconds=duration_seconds,
+                    device=event["metadata"]["device"],
+                    cpu_threads=event["metadata"]["cpu_threads"],
+                )
             )
-        )
 
         self._emit_bootstrap_stage(
+            "startup",
             "serving_backend",
-            "starting "
-            f"backend={self.serving_config.backend}"
+            f"starting backend={self.serving_config.backend}"
             f"{self._serving_replica_summary()}",
         )
         started_at = time.perf_counter()
@@ -383,14 +418,13 @@ class FlashRL:
         duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
         serving_ready_line = (
-            "ready "
             f"backend={self.serving_config.backend} "
             f"device={self._serving_backend.device}"
         )
         if self.serving_config.backend == "vllm":
             serving_ready_line += f" replicas={self.serving_config.num_replicas}"
         serving_ready_line += f" {self._format_bootstrap_duration(duration_seconds)}"
-        self._emit_bootstrap_stage("serving_backend", serving_ready_line)
+        self._emit_bootstrap_stage("ready", "serving_backend", serving_ready_line)
         self._runtime_bootstrap_totals["startup_serving_backend_seconds"] = duration_seconds
         self._runtime_bootstrap_events.append(
             self._make_model_load_event(
@@ -400,36 +434,6 @@ class FlashRL:
                 cpu_threads=self.serving_config.num_threads,
             )
         )
-
-        if self.reference_enabled:
-            self._emit_bootstrap_stage("reference_model", "starting")
-            started_at = time.perf_counter()
-            reference_config = self.training_model_config.model_copy(
-                update={
-                    "device": self.reference_device or self.training_model_config.device
-                }
-            )
-            self._reference = ReferenceModel(reference_config)
-            duration_seconds = time.perf_counter() - started_at
-            startup_total_seconds += duration_seconds
-            self._emit_bootstrap_stage(
-                "reference_model",
-                "ready "
-                f"device={self._reference.device} "
-                f"cpu={reference_config.num_threads} "
-                f"{self._format_bootstrap_duration(duration_seconds)}",
-            )
-            self._runtime_bootstrap_totals["startup_reference_model_seconds"] = duration_seconds
-            self._runtime_bootstrap_events.append(
-                self._make_model_load_event(
-                    component="reference_model",
-                    duration_seconds=duration_seconds,
-                    device=self._reference.device,
-                    cpu_threads=reference_config.num_threads,
-                )
-            )
-        else:
-            self._reference = None
 
         self._rollout_generator = UserDefinedRollout(
             rollout_fn=self.rollout_fn,
@@ -446,7 +450,6 @@ class FlashRL:
             grpo_config=self.grpo_config,
             training_backend=self._training_backend,
             serving_backend=self._serving_backend,
-            reference=self._reference,
             reward_fn=self._reward,
             rollout_generator=self._rollout_generator,
             run_logger=None,
@@ -479,6 +482,7 @@ class FlashRL:
         self._admin_registry = AdminRegistry()
         self._admin_registry.register(self._runtime_admin_objects)
         self._admin_registry.register(self._training_backend_admin_objects)
+        self._admin_registry.register(self._training_child_admin_objects)
         self._admin_registry.register(self._serving_backend_admin_objects)
         self._admin_registry.register(self._reference_admin_objects)
         self._admin_registry.register(self._serving_child_admin_objects)
@@ -492,13 +496,14 @@ class FlashRL:
             port=self.admin_port,
         )
         self.admin_base_url = self._admin_server.start()
-        self._emit_bootstrap_stage("admin", f"ready url={self.admin_base_url}")
+        self._emit_bootstrap_stage("ready", "admin", f"url={self.admin_base_url}")
 
     def _runtime_labels(self) -> dict[str, str]:
         """Build shared labels for all runtime-owned admin objects."""
         return {
             "flashrl.dev/runtime": "flashrl",
-            "flashrl.dev/model-name": self.training_model_config.model_name,
+            "flashrl.dev/model-name": self.training_config.model_name,
+            "flashrl.dev/training-backend": self.training_config.backend,
             "flashrl.dev/serving-backend": self.serving_config.backend,
         }
 
@@ -516,7 +521,7 @@ class FlashRL:
                 created_at=self._runtime_created_at,
                 labels=self._runtime_labels(),
                 spec={
-                    "modelName": self.training_model_config.model_name,
+                    "modelName": self.training_config.model_name,
                     "referenceEnabled": self.reference_enabled,
                     "adminBaseUrl": self.admin_base_url,
                 },
@@ -542,19 +547,28 @@ class FlashRL:
                 created_at=self._runtime_created_at,
                 labels=self._runtime_labels(),
                 spec={
-                    "modelName": self.training_model_config.model_name,
-                    "device": self.training_model_config.device or "auto",
-                    "dtype": self.training_model_config.dtype,
-                    "numThreads": self.training_model_config.num_threads,
+                    "backend": self.training_config.backend,
+                    "modelName": self.training_config.model_name,
+                    "device": self.training_config.device or "auto",
+                    "dtype": self.training_config.dtype,
+                    "numThreads": self.training_config.num_threads,
+                    "dpSize": self.training_config.dp_size,
                 },
                 status={
                     "phase": self._component_phase(),
-                    "device": str(self._training_backend.actor.device),
-                    "optimizer": type(self._training_backend.optimizer).__name__,
+                    "device": str(self._training_backend.device),
+                    "optimizer": self._training_backend.optimizer_name,
                     "loaded": True,
+                    "worldSize": self._training_backend.world_size,
                 },
             )
         ]
+
+    def _training_child_admin_objects(self) -> list[dict[str, Any]]:
+        """Return backend-owned training child objects."""
+        if self._training_backend is None:
+            return []
+        return self._training_backend.list_admin_objects()
 
     def _serving_backend_admin_objects(self) -> list[dict[str, Any]]:
         """Return the serving backend admin object."""
@@ -601,7 +615,7 @@ class FlashRL:
 
     def _reference_admin_objects(self) -> list[dict[str, Any]]:
         """Return the optional reference model admin object."""
-        if self._reference is None:
+        if self._training_backend is None or not self._training_backend.reference_loaded:
             return []
         return [
             build_admin_object(
@@ -611,8 +625,8 @@ class FlashRL:
                 created_at=self._runtime_created_at,
                 labels=self._runtime_labels(),
                 spec={
-                    "modelName": self.training_model_config.model_name,
-                    "device": self.reference_device or self.training_model_config.device or "auto",
+                    "modelName": self.training_config.model_name,
+                    "device": self._training_backend.resolved_reference_device,
                 },
                 status={
                     "phase": self._component_phase(),
@@ -664,12 +678,15 @@ class FlashRL:
         try:
             if self._serving_backend is not None:
                 self._serving_backend.close()
+            if self._training_backend is not None:
+                self._training_backend.close()
         finally:
             self._runtime_phase = "Closed"
             if self._admin_server is not None:
                 self._admin_server.close()
                 self._admin_server = None
         self._serving_backend = None
+        self._training_backend = None
 
     def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
         """Train on dataset or use the configured dataset loader."""
@@ -704,28 +721,32 @@ class FlashRL:
             self.logging_config,
             model_name=self.training_model_config.model_name,
         )
+        self._run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
         self._run_logger.start_run(
             dataset_size=len(dataset),
             batch_size=self.trainer_config.batch_size,
             max_epochs=self.trainer_config.max_epochs,
             total_batches=total_batches,
-            device=self.training_model_config.device or "auto",
-            dtype=self.training_model_config.dtype,
-            cpu_threads=self.training_model_config.num_threads,
+            device=self.training_config.device or "auto",
+            dtype=self.training_config.dtype,
+            cpu_threads=self.training_config.num_threads,
             runtime_shape="single-device-per-backend",
             reference_enabled=self.reference_enabled,
-            reference_device=self.reference_device
-            or self.training_model_config.device
-            or "auto",
+            reference_device=self._training_backend.resolved_reference_device,
             group_size=self.grpo_config.group_size,
             clip_ratio=self.grpo_config.clip_ratio,
             prompts_per_step=prompts_per_step,
             steps_per_epoch=(math.ceil(len(dataset) / prompts_per_step) if dataset else 0),
             total_planned_steps=total_batches,
+            training_backend=self.training_config.backend,
+            training_device=str(self._training_backend.device),
+            training_dp_size=self.training_config.dp_size,
             serving_backend=self.serving_config.backend,
             serving_device=str(self._serving_backend.device),
             serving_num_replicas=self.serving_config.num_replicas,
             admin_base_url=self.admin_base_url,
+            max_new_tokens=self.rollout_config.max_new_tokens,
+            include_startup_divider=bool(self._runtime_bootstrap_console_lines),
         )
         for event in self._runtime_bootstrap_events:
             self._run_logger.log_model_load(

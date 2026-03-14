@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
-from flashrl.framework.config import TrainerConfig
+from flashrl.framework.config import TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
     Message,
@@ -26,6 +26,7 @@ from flashrl.framework.data_models import (
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.run_logger import RunLogger
+from flashrl.framework.training import TrainingBackend
 from flashrl.framework.trainer.grpo import GRPOTrainer
 
 
@@ -185,26 +186,63 @@ class FakeActor:
         return None
 
 
-class FakeTrainingBackend:
+class FakeTrainingBackend(TrainingBackend):
     """Training backend used for logging tests."""
 
     init_count = 0
 
-    def __init__(self, config, learning_rate: float = 1e-5) -> None:
-        del config
+    def __init__(
+        self,
+        config,
+        learning_rate: float = 1e-5,
+        grpo_config: GrpoConfig | None = None,
+        reference_enabled: bool = False,
+        reference_device: str | None = None,
+    ) -> None:
         type(self).init_count += 1
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
+        super().__init__(
+            resolved_config,
+            learning_rate=learning_rate,
+            grpo_config=grpo_config or GrpoConfig(group_size=2),
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+        )
         self.actor = FakeActor(bias_shift=0.25)
         self.actor.train()
+        self.device = self.actor.device
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.startup_events = [
+            {
+                "component": "training_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
+        if reference_enabled:
+            self.reference = FakeReferenceModel(
+                config=resolved_config.model_copy(
+                    update={"device": reference_device or resolved_config.device}
+                )
+            )
+            self.startup_events.append(
+                {
+                    "component": "reference_model",
+                    "status": "completed",
+                    "metadata": {
+                        "device": str(self.reference.device),
+                        "cpu_threads": resolved_config.num_threads,
+                        "duration_seconds": 0.0,
+                    },
+                }
+            )
 
-    def save_checkpoint(self, path: str) -> None:
-        torch.save(self.actor.model.state_dict(), path)
-
-    def load_checkpoint(self, path: str) -> None:
-        self.actor.model.load_state_dict(torch.load(path, weights_only=False))
-
-    def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.sync_from_training_actor(self.actor)
+    def save_checkpoint(self, path: str, controller_state: dict | None = None) -> None:
+        super().save_checkpoint(path, controller_state=controller_state)
 
 
 def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
@@ -319,13 +357,24 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     FakeTrainingBackend.init_count = 0
     FakeServingBackend.init_count = 0
     FakeReferenceModel.init_count = 0
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", FakeTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            FakeTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
         lambda config, startup_logger=None: FakeServingBackend(config),
     )
-    monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
 
 def read_events(run_dir: Path) -> list[dict]:
@@ -474,12 +523,13 @@ def test_flashrl_constructor_emits_bootstrap_stage_lines(
     )
 
     output = capsys.readouterr().out
-    assert "FlashRL startup  model=fake/model  serving=vllm replicas=2  reference=disabled" in output
-    assert "startup training_backend  starting" in output
-    assert "startup training_backend  ready device=cpu cpu=1" in output
-    assert "startup serving_backend   starting backend=vllm replicas=2" in output
-    assert "startup serving_backend   ready backend=vllm device=cpu replicas=2" in output
-    assert re.search(r"startup admin\s+ready url=http://127\.0\.0\.1:\d+", output)
+    assert "FlashRL startup\n  startup  model=fake/model  training=huggingface  dp_size=1" in output
+    assert "serving=vllm replicas=2  reference=disabled" in output
+    assert "  startup  training_backend  starting backend=huggingface dp_size=1" in output
+    assert "  ready    training_backend  backend=huggingface device=cpu dp_size=1 cpu=1" in output
+    assert "  startup  serving_backend   starting backend=vllm replicas=2" in output
+    assert "  ready    serving_backend   backend=vllm device=cpu replicas=2" in output
+    assert re.search(r"  ready\s+admin\s+url=http://127\.0\.0\.1:\d+", output)
     assert "FlashRL training run" not in output
 
     trainer.close()
@@ -550,6 +600,7 @@ def test_run_logger_compact_console_groups_step_output(
         serving_device="auto",
         serving_num_replicas=2,
         admin_base_url="http://127.0.0.1:44123/admin",
+        max_new_tokens=256,
     )
     logger.log_model_load(
         "training_backend",
@@ -744,10 +795,10 @@ def test_run_logger_compact_console_groups_step_output(
     assert "FlashRL training run\n  run      " in transcript
     assert "  serving  backend=vllm  device=auto  replicas=2" in transcript
     assert "  admin    http://127.0.0.1:44123/admin" in transcript
-    assert "  grpo     completions_per_prompt=2  clip=0.2000" in transcript
+    assert "  grpo     completions_per_prompt=2  clip=0.2000  max_new_tokens=256" in transcript
     assert "  mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in transcript
     assert "  progress steps_per_epoch=2  total_steps=2" in transcript
-    assert "load training_backend" in transcript
+    assert "load training_backend" not in transcript
     assert (
         "step 1/2  epoch 1/1  batch 1/2  prompt_window=1-2/4  "
         "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
@@ -1250,6 +1301,9 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         prompts_per_step=2,
         steps_per_epoch=3,
         total_planned_steps=3,
+        training_backend="huggingface",
+        training_device="cpu",
+        training_dp_size=1,
         serving_backend="huggingface",
         serving_device="cpu",
         admin_base_url="http://127.0.0.1:43123/admin",
@@ -1322,10 +1376,11 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert "phase_group_totals" not in epoch_summary["payload"]
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
-    assert "runtime=single-device-per-backend reference=disabled" in transcript
-    assert "serving backend=huggingface device=cpu" in transcript
-    assert "admin=http://127.0.0.1:43123/admin" in transcript
-    assert "cpu_threads=1" in transcript
+    assert "  runtime  single-device-per-backend  reference=disabled ref_device=auto" in transcript
+    assert "  training backend=huggingface  device=cpu  dp_size=1" in transcript
+    assert "  serving  backend=huggingface  device=cpu" in transcript
+    assert "  admin    http://127.0.0.1:43123/admin" in transcript
+    assert "cpu=1" in transcript
     assert (
         "step=1 epoch=1/1 batch=1/3 prompt_window=1-2/6 completions_this_step=4 "
         "prompts_this_step=2 planned_prompts_per_step=2 completions_per_prompt=2 "
@@ -1423,6 +1478,9 @@ def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
         prompts_per_step=2,
         steps_per_epoch=1,
         total_planned_steps=1,
+        training_backend="huggingface",
+        training_device="cpu",
+        training_dp_size=1,
         serving_backend="huggingface",
         serving_device="cpu",
     )
@@ -1676,19 +1734,23 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     trainer.load_checkpoint(str(checkpoint_path))
 
     output = capsys.readouterr().out
-    assert "FlashRL startup  model=fake/model  serving=huggingface  reference=disabled" in output
-    assert "startup training_backend  starting" in output
-    assert "startup serving_backend   starting backend=huggingface" in output
-    assert re.search(r"startup admin\s+ready url=http://127\.0\.0\.1:\d+", output)
+    assert "FlashRL startup\n  startup  model=fake/model  training=huggingface  dp_size=1" in output
+    assert "serving=huggingface  reference=disabled" in output
+    assert "  startup  training_backend  starting backend=huggingface dp_size=1" in output
+    assert "  ready    training_backend  backend=huggingface device=cpu dp_size=1 cpu=1" in output
+    assert "  startup  serving_backend   starting backend=huggingface" in output
+    assert re.search(r"  ready\s+admin\s+url=http://127\.0\.0\.1:\d+", output)
+    assert "  ========================================================================" in output
     assert "FlashRL training run" in output
     assert "  run      " in output
     assert "cpu=1" in output
     assert "reference=disabled" in output
+    assert "  training backend=huggingface  device=cpu  dp_size=1" in output
     assert "  serving  backend=huggingface  device=cpu" in output
     assert re.search(r"  admin    http://127\.0\.0\.1:\d+", output)
-    assert "completions_per_prompt=2  clip=0.2000" in output
-    assert "load training_backend" in output
-    assert "load serving_backend" in output
+    assert "completions_per_prompt=2  clip=0.2000  max_new_tokens=512" in output
+    assert "load training_backend" not in output
+    assert "load serving_backend" not in output
     assert "loaded reference_model" not in output
     assert "mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in output
     assert "progress steps_per_epoch=2  total_steps=2" in output

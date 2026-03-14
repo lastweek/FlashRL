@@ -5,17 +5,15 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
-import sys
-
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flashrl.framework import FlashRL
 from flashrl.framework.data_models import Prompt
 
-from examples.reasoning.train import (
+from flashrl.framework.examples.reasoning.train import (
+    DEFAULT_MATH_DATASET,
     DEFAULT_REASONING_CHECKPOINT_PATH,
     DEFAULT_REASONING_EVAL_BATCH_SIZE,
+    SUPPORTED_MATH_DATASETS,
     build_math_eval_dataset,
     math_reward_fn,
     prepare_reasoning_environment,
@@ -88,6 +86,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Path to the FlashRL runtime/training profile.",
     )
     parser.add_argument(
+        "--dataset",
+        choices=SUPPORTED_MATH_DATASETS,
+        default=DEFAULT_MATH_DATASET,
+        help="Math dataset to evaluate.",
+    )
+    parser.add_argument(
         "--checkpoint",
         default=None,
         help="Optional checkpoint path to load before evaluation.",
@@ -115,7 +119,7 @@ def main(argv: list[str] | None = None) -> int:
 
     flashrl: FlashRL | None = None
     try:
-        dataset = build_math_eval_dataset(limit=args.eval_limit)
+        dataset = build_math_eval_dataset(dataset=args.dataset, limit=args.eval_limit)
         batch_size = args.batch_size
         checkpoint = args.checkpoint
         if checkpoint is None:

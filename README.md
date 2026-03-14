@@ -50,16 +50,16 @@ The reasoning example now lives in its own folder with a thin training script
 and a YAML config:
 
 ```bash
-python3 -m examples.reasoning.train
+python3 -m flashrl.framework.examples.reasoning.train
 ```
 
 Or run it directly from YAML:
 
 ```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
+python3 -m flashrl.framework.flashrl --config flashrl/framework/examples/reasoning/config.yaml
 ```
 
-See [examples/README.md](examples/README.md) for details.
+See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.
 
 ### Inspect Run Artifacts
 

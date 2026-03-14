@@ -5,11 +5,12 @@ evaluation helpers, one or more YAML configs, and an example-specific README.
 
 ## Reasoning Example
 
-The reasoning example is a strict R1-Zero-style math prototype over GSM8K. It
-trains a base Qwen model with rule-based rewards, no system prompt, and a strict
-`<think>...</think><answer>...</answer>` output contract.
+The reasoning example is a strict R1-Zero-style math prototype with explicit
+dataset selection. It trains a base Qwen model with rule-based rewards, no
+system prompt, and a strict `<think>...</think><answer>...</answer>` output
+contract.
 
-See [examples/reasoning/README.md](reasoning/README.md) for:
+See [flashrl/framework/examples/reasoning/README.md](reasoning/README.md) for:
 
 - supported run modes
 - the CLI-first example workflow
@@ -25,9 +26,9 @@ FlashRL YAML configs reference Python code with `module:attribute` strings:
 
 ```yaml
 hooks:
-  rollout_fn: examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: examples.reasoning.train:math_reward_fn
-  dataset_fn: examples.reasoning.train:build_math_train_dataset
+  rollout_fn: flashrl.framework.examples.reasoning.train:reasoning_rollout_fn
+  reward_fn: flashrl.framework.examples.reasoning.train:math_reward_fn
+  dataset_fn: flashrl.framework.examples.reasoning.train:build_math_train_dataset
 ```
 
 ## Managed vLLM Backend

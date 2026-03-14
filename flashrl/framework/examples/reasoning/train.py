@@ -1,4 +1,4 @@
-"""Strict R1-Zero style math training example backed by GSM8K."""
+"""Strict R1-Zero style math training example with explicit dataset selection."""
 
 from __future__ import annotations
 
@@ -9,11 +9,7 @@ import os
 from pathlib import Path
 import re
 import shutil
-import sys
 from typing import Any
-
-if __package__ in {None, ""}:
-    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from flashrl.framework import FlashRL
 from flashrl.framework.data_models import (
@@ -24,14 +20,20 @@ from flashrl.framework.data_models import (
     RolloutOutput,
 )
 
+DEFAULT_MATH_DATASET = "gsm8k"
+SUPPORTED_MATH_DATASETS = ("gsm8k", "aime25")
 
-DEFAULT_GSM8K_DATASET_CANDIDATES = (
+# Some environments expose GSM8K under `openai/gsm8k`, while others expose the
+# equivalent `gsm8k` alias. Try both so the example stays one-command friendly.
+DEFAULT_GSM8K_HF_LOAD_CANDIDATES = (
     ("openai/gsm8k", "main"),
     ("gsm8k", "main"),
 )
-DEFAULT_GSM8K_SOURCE = "gsm8k"
 DEFAULT_GSM8K_TRAIN_SPLIT = "train"
 DEFAULT_GSM8K_EVAL_SPLIT = "test"
+DEFAULT_AIME25_HF_DATASET = "math-ai/aime25"
+DEFAULT_AIME25_TRAIN_SPLIT = "test"
+DEFAULT_AIME25_EVAL_SPLIT = "test"
 DEFAULT_REASONING_CHECKPOINT_PATH = "/tmp/flashrl_reasoning_checkpoint.pt"
 DEFAULT_REASONING_EVAL_BATCH_SIZE = 8
 FINAL_ANSWER_PATTERN = re.compile(r"####\s*(.+)$", re.MULTILINE)
@@ -76,30 +78,72 @@ def _resolve_math_limit(*, split_kind: str, explicit_limit: int | None) -> int |
     return None
 
 
+def _resolve_math_dataset(dataset: str) -> str:
+    """Validate one built-in math dataset choice."""
+    if dataset not in SUPPORTED_MATH_DATASETS:
+        choices = ", ".join(SUPPORTED_MATH_DATASETS)
+        raise ValueError(f"dataset must be one of {{{choices}}} (got {dataset!r}).")
+    return dataset
+
+
+def _load_dataset_module():
+    """Import `datasets.load_dataset` lazily so the example can fail clearly."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:  # pragma: no cover - exercised in live example usage
+        raise RuntimeError(
+            "flashrl.framework.examples.reasoning requires the `datasets` package to load math datasets. "
+            "Install project dependencies or `pip install datasets`."
+        ) from exc
+    return load_dataset
+
+
+def _print_dataset_summary(
+    *,
+    dataset_name: str,
+    source: str,
+    split: str,
+    available: int,
+    selected: int,
+    problem_field: str,
+    answer_field: str,
+    target_format: str,
+) -> None:
+    """Print one compact dataset summary before the run starts."""
+    print(
+        f"dataset  name={dataset_name}  source={source}  split={split}  "
+        f"available={available}  selected={selected}",
+        flush=True,
+    )
+    print(
+        f"format   problem_field={problem_field}  answer_field={answer_field}  "
+        f"target={target_format}",
+        flush=True,
+    )
+
+
 def _load_gsm8k_split(
     split: str,
     *,
     limit: int | None = None,
 ) -> list[dict[str, str]]:
     """Load and normalize one GSM8K split."""
-    try:
-        from datasets import load_dataset
-    except ImportError as exc:  # pragma: no cover - exercised in live example usage
-        raise RuntimeError(
-            "examples.reasoning requires the `datasets` package to load GSM8K. "
-            "Install project dependencies or `pip install datasets`."
-        ) from exc
+    load_dataset = _load_dataset_module()
 
     dataset_error: Exception | None = None
     raw_dataset = None
-    for dataset_name, config_name in DEFAULT_GSM8K_DATASET_CANDIDATES:
+    loaded_source = None
+    for dataset_name, config_name in DEFAULT_GSM8K_HF_LOAD_CANDIDATES:
         try:
             raw_dataset = load_dataset(dataset_name, config_name, split=split)
+            loaded_source = dataset_name
             break
         except Exception as exc:  # pragma: no cover - depends on external dataset availability
             dataset_error = exc
     if raw_dataset is None:
         raise RuntimeError("Unable to load GSM8K from Hugging Face.") from dataset_error
+
+    available_count = len(raw_dataset)
 
     if limit is not None and hasattr(raw_dataset, "select"):
         raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
@@ -112,7 +156,7 @@ def _load_gsm8k_split(
         rows.append(
             {
                 "task_id": task_id,
-                "source": DEFAULT_GSM8K_SOURCE,
+                "source": str(loaded_source),
                 "split": split,
                 "problem": problem,
                 "final_answer": final_answer,
@@ -120,21 +164,89 @@ def _load_gsm8k_split(
         )
         if limit is not None and len(rows) >= limit:
             break
+
+    _print_dataset_summary(
+        dataset_name="gsm8k",
+        source=str(loaded_source),
+        split=split,
+        available=available_count,
+        selected=len(rows),
+        problem_field="question",
+        answer_field="answer",
+        target_format="parse #### + numeric normalize",
+    )
+    return rows
+
+
+def _load_aime25_split(
+    split: str,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    """Load and normalize the `math-ai/aime25` split."""
+    load_dataset = _load_dataset_module()
+    try:
+        raw_dataset = load_dataset(DEFAULT_AIME25_HF_DATASET, split=split)
+    except Exception as exc:  # pragma: no cover - depends on external dataset availability
+        raise RuntimeError("Unable to load AIME25 from Hugging Face.") from exc
+
+    available_count = len(raw_dataset)
+
+    if limit is not None and hasattr(raw_dataset, "select"):
+        raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
+
+    rows: list[dict[str, str]] = []
+    for index, row in enumerate(raw_dataset):
+        task_id = str(row.get("id") or f"aime25-{split}-{index:06d}")
+        problem = str(row["problem"]).strip()
+        final_answer = _normalize_math_answer(str(row["answer"]))
+        if not final_answer:
+            raise ValueError(f"AIME25 answer normalized to empty text: {task_id}")
+        rows.append(
+            {
+                "task_id": task_id,
+                "source": DEFAULT_AIME25_HF_DATASET,
+                "split": split,
+                "problem": problem,
+                "final_answer": final_answer,
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
+
+    _print_dataset_summary(
+        dataset_name="aime25",
+        source=DEFAULT_AIME25_HF_DATASET,
+        split=split,
+        available=available_count,
+        selected=len(rows),
+        problem_field="problem",
+        answer_field="answer",
+        target_format="direct numeric normalize",
+    )
     return rows
 
 
 def build_math_train_dataset(
+    dataset: str = DEFAULT_MATH_DATASET,
     limit: int | None = None,
 ) -> list[Prompt]:
     """Build the math training dataset for both YAML hooks and the example CLI."""
+    resolved_dataset = _resolve_math_dataset(dataset)
     resolved_limit = _resolve_math_limit(
         split_kind="train",
         explicit_limit=limit,
     )
-    rows = _load_gsm8k_split(
-        DEFAULT_GSM8K_TRAIN_SPLIT,
-        limit=resolved_limit,
-    )
+    if resolved_dataset == "gsm8k":
+        rows = _load_gsm8k_split(
+            DEFAULT_GSM8K_TRAIN_SPLIT,
+            limit=resolved_limit,
+        )
+    else:
+        rows = _load_aime25_split(
+            DEFAULT_AIME25_TRAIN_SPLIT,
+            limit=resolved_limit,
+        )
     return [
         Prompt(
             text=render_math_prompt(row["problem"]),
@@ -152,17 +264,25 @@ def build_math_train_dataset(
 
 
 def build_math_eval_dataset(
+    dataset: str = DEFAULT_MATH_DATASET,
     limit: int | None = None,
 ) -> list[Prompt]:
     """Build the held-out math evaluation dataset."""
+    resolved_dataset = _resolve_math_dataset(dataset)
     resolved_limit = _resolve_math_limit(
         split_kind="eval",
         explicit_limit=limit,
     )
-    rows = _load_gsm8k_split(
-        DEFAULT_GSM8K_EVAL_SPLIT,
-        limit=resolved_limit,
-    )
+    if resolved_dataset == "gsm8k":
+        rows = _load_gsm8k_split(
+            DEFAULT_GSM8K_EVAL_SPLIT,
+            limit=resolved_limit,
+        )
+    else:
+        rows = _load_aime25_split(
+            DEFAULT_AIME25_EVAL_SPLIT,
+            limit=resolved_limit,
+        )
     return [
         Prompt(
             text=render_math_prompt(row["problem"]),
@@ -249,7 +369,26 @@ def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
 
 
 def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
-    """Compute strict format and exact-answer rewards from rollout metadata."""
+    """Compute the math reward from rollout metadata.
+
+    Reward matrix:
+    - `1.1`: one non-empty `<answer>` block parses, the normalized answer
+      matches the prompt's `final_answer`, and the full response is exactly one
+      non-empty `<think>...</think><answer>...</answer>` sequence.
+      Example: `<think>...</think><answer>42</answer>`.
+    - `1.0`: the normalized answer still matches, but the strict format check
+      fails. Example: `<think>...</think><answer>42</answer> extra`.
+    - `0.1`: the strict format check passes, but the parsed answer is wrong.
+      Example: `<think>...</think><answer>41</answer>`.
+    - `0.0`: no single non-empty answer block can be parsed, or both checks
+      fail. Example: `<answer>42</answer><answer>42</answer>` or `<answer>42`.
+
+    `answer_parse_pass` only checks whether one non-empty answer block can be
+    extracted. `accuracy_pass` compares the normalized parsed answer against the
+    prompt metadata. `format_pass` is stricter: it requires exactly one
+    non-empty `<think>` block followed by exactly one non-empty `<answer>` block,
+    no non-whitespace text outside those tags, and no truncation.
+    """
     text = rollout.text
     prompt_metadata = _prompt_metadata_from_rollout(rollout)
     expected_answer = _normalize_math_answer(str(prompt_metadata.get("final_answer", "")))
@@ -259,32 +398,40 @@ def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     think_blocks = THINK_BLOCK_PATTERN.findall(text)
     answer_blocks = ANSWER_BLOCK_PATTERN.findall(text)
     strict_match = STRICT_RESPONSE_PATTERN.fullmatch(text)
-    parsed_answer = _extract_answer_block(text)
-    normalized_answer = _normalize_math_answer(parsed_answer or "")
-
     has_single_think_block = len(think_blocks) == 1
     has_single_answer_block = len(answer_blocks) == 1
     think_content = strict_match.group("think").strip() if strict_match is not None else ""
     answer_content = strict_match.group("answer").strip() if strict_match is not None else ""
+    has_non_empty_strict_blocks = bool(think_content and answer_content)
 
-    # The format bonus is intentionally strict: any duplicate tag, missing close
-    # tag, or trailing text after `</answer>` should fail the structure check.
+    # Format stays strict on purpose:
+    # - `<think>...</think><answer>42</answer>` can earn the `+0.1` bonus
+    # - `<think>...</think><answer>42</answer> extra` cannot
+    # - duplicate tags, missing close tags, or `finish_reason == "length"` cannot
     format_pass = bool(
         strict_match is not None
         and has_single_think_block
         and has_single_answer_block
-        and think_content
-        and answer_content
+        and has_non_empty_strict_blocks
         and not truncated
     )
-    answer_parse_pass = has_single_answer_block and parsed_answer is not None
+
+    parsed_answer = _extract_answer_block(text)
+    answer_parse_pass = parsed_answer is not None
+    normalized_answer = _normalize_math_answer(parsed_answer or "")
+    # Accuracy is intentionally independent from strict format:
+    # - `<answer>$42.00.</answer>` still matches `42` after normalization
+    # - `<think>...</think><answer>42</answer> extra` still earns `1.0`
     accuracy_pass = bool(answer_parse_pass and normalized_answer == expected_answer)
 
-    reward = 0.0
-    if accuracy_pass:
-        reward += 1.0
-    if format_pass:
-        reward += 0.1
+    # Reward examples:
+    # - strict correct -> `1.1`
+    # - strict wrong -> `0.1`
+    # - correct but malformed -> `1.0`
+    # - duplicate or missing answer block -> `0.0`
+    accuracy_reward = 1.0 if accuracy_pass else 0.0
+    format_reward = 0.1 if format_pass else 0.0
+    reward = accuracy_reward + format_reward
 
     return RewardOutput(
         reward=reward,
@@ -392,6 +539,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Path to the FlashRL runtime/training profile.",
     )
     parser.add_argument(
+        "--dataset",
+        choices=SUPPORTED_MATH_DATASETS,
+        default=DEFAULT_MATH_DATASET,
+        help="Math dataset to use for training.",
+    )
+    parser.add_argument(
         "--train-limit",
         type=int,
         default=None,
@@ -418,7 +571,7 @@ def main(argv: list[str] | None = None) -> int:
 
     flashrl: FlashRL | None = None
     try:
-        dataset = build_math_train_dataset(limit=args.train_limit)
+        dataset = build_math_train_dataset(dataset=args.dataset, limit=args.train_limit)
         flashrl = FlashRL.from_yaml(args.config)
         if args.checkpoint:
             flashrl.load_checkpoint(args.checkpoint)
@@ -428,7 +581,7 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"\nFlashRL reasoning example failed: {exc}", file=sys.stderr)
         print(
-            "\nNote: This example loads a base Qwen checkpoint and the GSM8K dataset.",
+            "\nNote: This example loads a base Qwen checkpoint and a Hugging Face math dataset.",
             file=sys.stderr,
         )
         print(
@@ -437,8 +590,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(
-            "Use --train-limit to cap the GSM8K training set and --checkpoint-out to control "
-            "where the final checkpoint is written.",
+            "Use --dataset to switch between gsm8k and aime25, --train-limit to cap the "
+            "selected training set, and --checkpoint-out to control where the final "
+            "checkpoint is written.",
             file=sys.stderr,
         )
         print(

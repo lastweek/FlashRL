@@ -7,11 +7,11 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.reasoning.train import math_reward_fn, render_math_prompt
+from flashrl.framework.examples.reasoning.train import math_reward_fn, render_math_prompt
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
-from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.trainer.grpo import GRPOTrainer
@@ -39,7 +39,11 @@ def build_trainer(
     shuffle_each_epoch: bool = False,
 ) -> GRPOTrainer:
     """Build a small offline GRPO trainer for algorithm tests."""
-    training_backend = TinyTrainingBackend(learning_rate=1e-2)
+    training_backend = TinyTrainingBackend(
+        learning_rate=1e-2,
+        group_size=group_size,
+        reference=reference,
+    )
     serving_backend = serving_backend or TinyServingBackend()
     rollout = UserDefinedRollout(
         rollout_fn=rollout_fn or make_rollout_fn(response_suffix="grpo", repeat=2),
@@ -155,6 +159,50 @@ def test_grpo_compute_advantages_rejects_mismatched_group_shape() -> None:
             prompt_count=2,
             group_size=2,
         )
+
+
+def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None:
+    """Controller-side reward/advantage logic should hand one learner batch to training."""
+
+    class RecordingTrainingBackend(TinyTrainingBackend):
+        def __init__(self) -> None:
+            super().__init__(learning_rate=1e-2, group_size=2)
+            self.recorded_batches: list[LearnerBatch] = []
+
+        def optimize_batch(self, learner_batch: LearnerBatch):
+            self.recorded_batches.append(learner_batch)
+            return super().optimize_batch(learner_batch)
+
+    training_backend = RecordingTrainingBackend()
+    serving_backend = TinyServingBackend()
+    rollout = UserDefinedRollout(
+        rollout_fn=make_rollout_fn(response_suffix="handoff", repeat=1),
+        serving_backend=serving_backend,
+        config=SimpleNamespace(),
+    )
+    reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
+    trainer = GRPOTrainer(
+        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
+        grpo_config=GrpoConfig(group_size=2, clip_ratio=0.2, kl_coefficient=0.0),
+        training_backend=training_backend,
+        serving_backend=serving_backend,
+        reference=None,
+        reward_fn=reward,
+        rollout_generator=rollout,
+        run_logger=None,
+        metrics_sink=None,
+    )
+
+    trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
+
+    assert len(training_backend.recorded_batches) == 1
+    learner_batch = training_backend.recorded_batches[0]
+    assert learner_batch.prompt_count == 2
+    assert learner_batch.group_size == 2
+    assert len(learner_batch.prompt_token_ids) == 4
+    assert len(learner_batch.response_token_ids) == 4
+    assert len(learner_batch.response_token_logprobs) == 4
+    assert len(learner_batch.advantages) == 4
 
 
 def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:

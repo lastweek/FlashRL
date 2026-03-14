@@ -89,3 +89,21 @@ class TrainingBatch(BaseModel):
     def __len__(self) -> int:
         """Return batch size."""
         return len(self.prompts)
+
+
+class LearnerBatch(BaseModel):
+    """CPU-resident optimization batch handed from controller to training."""
+
+    prompt_token_ids: list[list[int]]
+    response_token_ids: list[list[int]]
+    response_token_logprobs: list[list[float]]
+    advantages: list[float]
+    group_size: int = 1
+    prompt_count: int = 0
+    prompt_indices: list[int] = Field(default_factory=list)
+    candidate_indices: list[int] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+    def __len__(self) -> int:
+        """Return the number of rollout samples in the learner batch."""
+        return len(self.prompt_token_ids)

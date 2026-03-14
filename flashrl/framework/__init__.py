@@ -1,8 +1,8 @@
 """Framework layer: Core RL training APIs."""
 
-from flashrl.framework.backends.training import TrainingBackend
 from flashrl.framework.config import (
     CommonConfig,
+    FSDP2Config,
     GrpoConfig,
     HookConfig,
     LoggingConfig,
@@ -15,12 +15,14 @@ from flashrl.framework.config import (
     RolloutConfig,
     ServingConfig,
     ServingSectionConfig,
+    TrainingConfig,
     TensorBoardMetricsConfig,
     TrainingSectionConfig,
     TrainerConfig,
 )
 from flashrl.framework.data_models import (
     Conversation,
+    LearnerBatch,
     Message,
     Prompt,
     RewardOutput,
@@ -36,6 +38,12 @@ from flashrl.framework.serving import (
     VLLMServingBackend,
     create_serving_backend,
 )
+from flashrl.framework.training import (
+    FSDP2TrainingBackend,
+    HuggingFaceTrainingBackend,
+    TrainingBackend,
+    create_training_backend,
+)
 
 __all__ = [
     "FlashRL",
@@ -44,7 +52,9 @@ __all__ = [
     "GrpoConfig",
     "TrainerConfig",
     "ModelConfig",
+    "TrainingConfig",
     "ServingConfig",
+    "FSDP2Config",
     "TrainingSectionConfig",
     "ServingSectionConfig",
     "RolloutConfig",
@@ -60,6 +70,7 @@ __all__ = [
     "Prompt",
     "Message",
     "Conversation",
+    "LearnerBatch",
     "ToolCall",
     "ToolResult",
     "RolloutOutput",
@@ -71,4 +82,7 @@ __all__ = [
     "VLLMServingBackend",
     "create_serving_backend",
     "TrainingBackend",
+    "HuggingFaceTrainingBackend",
+    "FSDP2TrainingBackend",
+    "create_training_backend",
 ]

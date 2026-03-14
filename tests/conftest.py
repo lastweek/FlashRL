@@ -8,7 +8,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
+from flashrl.framework.config import GrpoConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.training import TrainingBackend
 
 
 class TinyTokenizer:
@@ -255,13 +257,50 @@ class TinyActor:
         return None
 
 
-class TinyTrainingBackend:
+class TinyTrainingBackend(TrainingBackend):
     """Local training backend fake for GRPO tests."""
 
-    def __init__(self, learning_rate: float = 1e-3) -> None:
+    def __init__(
+        self,
+        learning_rate: float = 1e-3,
+        *,
+        group_size: int = 2,
+        reference: TinyReferenceModel | None = None,
+    ) -> None:
+        super().__init__(
+            TrainingConfig(model_name="fake/model", device="cpu", dtype="float32"),
+            learning_rate=learning_rate,
+            grpo_config=GrpoConfig(group_size=group_size),
+            reference_enabled=reference is not None,
+        )
         self.actor = TinyActor(bias_shift=0.25)
         self.actor.train()
+        self.device = self.actor.device
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.reference = reference
+        self.startup_events = [
+            {
+                "component": "training_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": 1,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
+        if self.reference is not None:
+            self.startup_events.append(
+                {
+                    "component": "reference_model",
+                    "status": "completed",
+                    "metadata": {
+                        "device": str(self.reference.device),
+                        "cpu_threads": 1,
+                        "duration_seconds": 0.0,
+                    },
+                }
+            )
 
     def sync_weights_to(self, serving_backend: "TinyServingBackend") -> None:
         serving_backend.sync_from_training_actor(self.actor)

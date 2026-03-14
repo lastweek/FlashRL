@@ -19,7 +19,7 @@ import yaml
 
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.metrics as metrics_module
-from examples.reasoning import train as reasoning_example
+from flashrl.framework.examples.reasoning import train as reasoning_example
 from flashrl.framework import (
     FlashRL,
     GrpoConfig,
@@ -28,12 +28,14 @@ from flashrl.framework import (
     PushgatewayMetricsConfig,
     TensorBoardMetricsConfig,
 )
+from flashrl.framework.config import TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.metrics import (
     CompositeMetricsSink,
     PrometheusMetricsSink,
     TensorBoardMetricsSink,
 )
+from flashrl.framework.training import TrainingBackend
 
 
 class FakeTokenizer:
@@ -222,25 +224,62 @@ class FakeActor:
         self._live_rollout_candidate_index = None
 
 
-class FakeTrainingBackend:
+class FakeTrainingBackend(TrainingBackend):
     """Training backend used for metrics tests."""
 
     last_config = None
+    last_reference_config = None
 
-    def __init__(self, config, learning_rate: float = 1e-5) -> None:
-        type(self).last_config = config
+    def __init__(
+        self,
+        config,
+        learning_rate: float = 1e-5,
+        grpo_config: GrpoConfig | None = None,
+        reference_enabled: bool = False,
+        reference_device: str | None = None,
+    ) -> None:
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
+        type(self).last_config = resolved_config
+        type(self).last_reference_config = None
+        super().__init__(
+            resolved_config,
+            learning_rate=learning_rate,
+            grpo_config=grpo_config or GrpoConfig(group_size=2),
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+        )
         self.actor = FakeActor(bias_shift=0.25)
         self.actor.train()
+        self.device = self.actor.device
         self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
-
-    def save_checkpoint(self, path: str) -> None:
-        torch.save(self.actor.model.state_dict(), path)
-
-    def load_checkpoint(self, path: str) -> None:
-        self.actor.model.load_state_dict(torch.load(path, weights_only=False))
-
-    def sync_weights_to(self, serving_backend) -> None:
-        serving_backend.sync_from_training_actor(self.actor)
+        self.startup_events = [
+            {
+                "component": "training_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
+        if reference_enabled:
+            reference_config = resolved_config.model_copy(
+                update={"device": reference_device or resolved_config.device}
+            )
+            type(self).last_reference_config = reference_config
+            self.reference = FakeReferenceModel(reference_config)
+            self.startup_events.append(
+                {
+                    "component": "reference_model",
+                    "status": "completed",
+                    "metadata": {
+                        "device": str(self.reference.device),
+                        "cpu_threads": reference_config.num_threads,
+                        "duration_seconds": 0.0,
+                    },
+                }
+            )
 
 
 def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
@@ -391,14 +430,26 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     """Patch FlashRL to use fake local backends."""
     FakeTrainingBackend.last_config = None
     FakeServingBackend.last_config = None
+    FakeTrainingBackend.last_reference_config = None
     FakeReferenceModel.last_config = None
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", FakeTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            FakeTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
         lambda config, startup_logger=None: FakeServingBackend(config),
     )
-    monkeypatch.setattr(flashrl_module, "ReferenceModel", FakeReferenceModel)
 
 
 def sample_value(registry, name: str) -> tuple[float, dict[str, str]]:
@@ -1615,7 +1666,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
 
     monkeypatch.setattr(FakeActor, "generate_batch", scripted_generate_batch)
 
-    trainer = FlashRL.from_yaml("examples/reasoning/config.yaml")
+    trainer = FlashRL.from_yaml("flashrl/framework/examples/reasoning/config.yaml")
     trainer.logging_config = LoggingConfig(
         log_dir=tmp_path,
         console=False,
@@ -1679,17 +1730,22 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("metric/grafana/provisioning/datasources/prometheus.yml").exists()
     assert Path("metric/grafana/provisioning/dashboards/dashboards.yml").exists()
     assert Path("metric/grafana/dashboards/flashrl-v1.json").exists()
-    assert "observability/docker-compose.yml" not in Path("examples/README.md").read_text(
+    assert "observability/docker-compose.yml" not in Path(
+        "flashrl/framework/examples/README.md"
+    ).read_text(
         encoding="utf-8"
     )
-    assert Path("examples/__init__.py").exists()
-    assert Path("examples/reasoning/__init__.py").exists()
-    assert Path("examples/reasoning/train.py").exists()
-    assert Path("examples/reasoning/config.yaml").exists()
-    assert Path("examples/reasoning/config_vllm.yaml").exists()
+    assert not Path("examples").exists()
+    assert Path("flashrl/framework/examples/__init__.py").exists()
+    assert Path("flashrl/framework/examples/reasoning/__init__.py").exists()
+    assert Path("flashrl/framework/examples/reasoning/train.py").exists()
+    assert Path("flashrl/framework/examples/reasoning/config.yaml").exists()
+    assert Path("flashrl/framework/examples/reasoning/config_vllm.yaml").exists()
 
-    docs = Path("examples/README.md").read_text(encoding="utf-8")
-    reasoning_docs = Path("examples/reasoning/README.md").read_text(encoding="utf-8")
+    docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
+    reasoning_docs = Path("flashrl/framework/examples/reasoning/README.md").read_text(
+        encoding="utf-8"
+    )
     root_docs = Path("README.md").read_text(encoding="utf-8")
     assert "tensorboard --logdir logs" in root_docs
     assert "TensorBoard is the default local metrics path." in docs
@@ -1699,12 +1755,20 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "reasoning/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
-    assert "python3 -m examples.reasoning.train" in reasoning_docs
-    assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in reasoning_docs
+    assert "python3 -m flashrl.framework.examples.reasoning.train" in reasoning_docs
+    assert (
+        "python3 -m flashrl.framework.flashrl --config "
+        "flashrl/framework/examples/reasoning/config.yaml"
+    ) in reasoning_docs
     assert "config_vllm.yaml" in reasoning_docs
+    assert "--dataset" in reasoning_docs
+    assert "aime25" in reasoning_docs
     assert "--train-limit" in reasoning_docs
     assert "--eval-limit" in reasoning_docs
     assert "--checkpoint-out" in reasoning_docs
+    assert "available` is the full size" in reasoning_docs
+    assert "selected` is the number of rows actually used" in reasoning_docs
+    assert "not copied into `console.log`" in reasoning_docs
     assert "math.yaml" not in reasoning_docs
     assert "model:" not in reasoning_docs
     assert "trainer:" not in reasoning_docs
@@ -1720,8 +1784,12 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "FLASHRL_VLLM_PYTHON" in docs
     assert "optional `vllm` extra" in docs
 
-    example_yaml = Path("examples/reasoning/config.yaml").read_text(encoding="utf-8")
-    vllm_example_yaml = Path("examples/reasoning/config_vllm.yaml").read_text(
+    example_yaml = Path("flashrl/framework/examples/reasoning/config.yaml").read_text(
+        encoding="utf-8"
+    )
+    vllm_example_yaml = Path(
+        "flashrl/framework/examples/reasoning/config_vllm.yaml"
+    ).read_text(
         encoding="utf-8"
     )
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")

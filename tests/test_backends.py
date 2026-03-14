@@ -7,9 +7,13 @@ from pathlib import Path
 import pytest
 import torch
 
-import flashrl.framework.backends.training as training_module
-from flashrl.framework.backends.training import TrainingBackend
-from flashrl.framework.config import ModelConfig, ServingConfig
+import flashrl.framework.training.huggingface as training_module
+from flashrl.framework.training import (
+    FSDP2TrainingBackend,
+    HuggingFaceTrainingBackend,
+    create_training_backend,
+)
+from flashrl.framework.config import GrpoConfig, ModelConfig, ServingConfig, TrainingConfig
 import flashrl.framework.serving.huggingface as serving_module
 from flashrl.framework.serving import HuggingFaceServingBackend
 from tests.conftest import TinyActor
@@ -33,9 +37,10 @@ def test_training_backend_initializes_train_mode_optimizer_and_threads(
     monkeypatch.setattr(training_module, "set_num_threads", lambda value: thread_calls.append(value))
     monkeypatch.setattr(training_module, "ActorModel", BackendActor)
 
-    backend = TrainingBackend(
-        ModelConfig(model_name="fake/model", num_threads=3),
+    backend = HuggingFaceTrainingBackend(
+        TrainingConfig(model_name="fake/model", num_threads=3),
         learning_rate=5e-4,
+        grpo_config=GrpoConfig(group_size=2),
     )
 
     assert thread_calls == [3]
@@ -75,9 +80,15 @@ def test_training_backend_checkpoint_round_trip_and_sync(
     monkeypatch.setattr(training_module, "ActorModel", BackendActor)
     monkeypatch.setattr(serving_module, "ActorModel", BackendActor)
 
-    config = ModelConfig(model_name="fake/model", num_threads=1)
-    training_backend = TrainingBackend(config, learning_rate=1e-3)
-    serving_backend = HuggingFaceServingBackend(ServingConfig(**config.model_dump()))
+    config = TrainingConfig(model_name="fake/model", num_threads=1)
+    training_backend = HuggingFaceTrainingBackend(
+        config,
+        learning_rate=1e-3,
+        grpo_config=GrpoConfig(group_size=2),
+    )
+    serving_backend = HuggingFaceServingBackend(
+        ServingConfig(**config.model_dump(include={"model_name", "device", "dtype", "max_length", "load_in_8bit", "trust_remote_code", "num_threads", "metadata"}))
+    )
 
     with torch.no_grad():
         training_backend.actor.model.logit_bias.fill_(2.0)
@@ -101,3 +112,28 @@ def test_training_backend_checkpoint_round_trip_and_sync(
         training_backend.actor.model.logit_bias,
         serving_backend._actor.model.logit_bias,
     )
+
+
+def test_training_backend_factory_selects_expected_backend(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training backend factory should select the requested implementation."""
+    monkeypatch.setattr(training_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(training_module, "ActorModel", BackendActor)
+    huggingface = create_training_backend(
+        TrainingConfig(model_name="fake/model"),
+        learning_rate=1e-5,
+        grpo_config=GrpoConfig(group_size=2),
+    )
+
+    assert isinstance(huggingface, HuggingFaceTrainingBackend)
+
+
+def test_fsdp2_training_backend_rejects_multi_rank_until_launcher_exists() -> None:
+    """FSDP2 backend should reject dp_size > 1 until worker orchestration is enabled."""
+    with pytest.raises(ValueError, match="dp_size=1"):
+        FSDP2TrainingBackend(
+            TrainingConfig(model_name="fake/model", backend="fsdp2", dp_size=2),
+            learning_rate=1e-5,
+            grpo_config=GrpoConfig(group_size=2),
+        )

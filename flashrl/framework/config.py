@@ -5,7 +5,7 @@ from pathlib import Path
 import re
 from typing import Any, Literal
 import yaml
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
@@ -81,6 +81,31 @@ class ServingConfig(ModelConfig):
     num_replicas: int = Field(default=1, ge=1)
     vllm_args: list[str] = Field(default_factory=list)
     debug_live_rollout: bool = False
+
+
+class FSDP2Config(BaseConfig):
+    """Configuration for the FSDP2 training backend."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    reshard_after_forward: bool = True
+    use_orig_params: bool = True
+    cpu_offload: bool = False
+
+
+class TrainingConfig(ModelConfig):
+    """Configuration for the training model copy and backend."""
+
+    backend: Literal["huggingface", "fsdp2"] = "huggingface"
+    dp_size: int = Field(default=1, ge=1)
+    fsdp2: FSDP2Config = Field(default_factory=FSDP2Config)
+
+    @model_validator(mode="after")
+    def validate_backend_shape(self) -> "TrainingConfig":
+        """Reject invalid backend/config combinations early."""
+        if self.backend == "huggingface" and self.dp_size != 1:
+            raise ValueError("training.dp_size must be 1 when training.backend='huggingface'.")
+        return self
 
 
 class RolloutConfig(BaseConfig):
@@ -196,6 +221,9 @@ class TrainingSectionConfig(CommonConfig):
     """YAML training section: model-copy settings plus loop settings."""
 
     num_threads: int | None = None
+    backend: Literal["huggingface", "fsdp2"] = "huggingface"
+    dp_size: int = Field(default=1, ge=1)
+    fsdp2: FSDP2Config = Field(default_factory=FSDP2Config)
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10

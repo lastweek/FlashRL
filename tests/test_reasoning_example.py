@@ -5,12 +5,13 @@ from __future__ import annotations
 import ast
 import os
 from pathlib import Path
+import sys
 from types import SimpleNamespace
 
 import pytest
 
-from examples.reasoning import train as reasoning_example
-from examples.reasoning.eval import evaluate_model
+from flashrl.framework.examples.reasoning import train as reasoning_example
+from flashrl.framework.examples.reasoning.eval import evaluate_model
 from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
 
 pytestmark = pytest.mark.unit
@@ -20,13 +21,14 @@ def make_prompt(
     *,
     problem: str = "Janet has 15 apples and buys 27 more. How many apples does she have now?",
     final_answer: str = "42",
+    source: str = "openai/gsm8k",
 ) -> Prompt:
     """Build one strict reasoning prompt with GSM8K-style metadata."""
     return Prompt(
         text=reasoning_example.render_math_prompt(problem),
         metadata={
             "task_id": "gsm8k-train-000000",
-            "source": "gsm8k",
+            "source": source,
             "split": "train",
             "problem": problem,
             "final_answer": final_answer,
@@ -83,7 +85,7 @@ def test_build_math_train_dataset_loads_gsm8k_rows_into_prompt_metadata(
         return [
             {
                 "task_id": "gsm8k-train-000001",
-                "source": "gsm8k",
+                "source": "openai/gsm8k",
                 "split": split,
                 "problem": "What is 15 + 27?",
                 "final_answer": "42",
@@ -92,18 +94,116 @@ def test_build_math_train_dataset_loads_gsm8k_rows_into_prompt_metadata(
 
     monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
 
-    dataset = reasoning_example.build_math_train_dataset(limit=3)
+    dataset = reasoning_example.build_math_train_dataset(dataset="gsm8k", limit=3)
 
     assert len(dataset) == 1
     assert "Problem: What is 15 + 27?" in dataset[0].text
     assert dataset[0].metadata == {
         "task_id": "gsm8k-train-000001",
-        "source": "gsm8k",
+        "source": "openai/gsm8k",
         "split": "train",
         "problem": "What is 15 + 27?",
         "final_answer": "42",
         "verifier": "numeric_exact",
     }
+
+
+def test_build_math_train_dataset_selects_aime25_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AIME25 selection should use the explicit AIME loader and test split."""
+    seen_calls: list[tuple[str, int | None]] = []
+
+    def fake_load(split: str, *, limit=None):
+        seen_calls.append((split, limit))
+        return [
+            {
+                "task_id": "aime25-test-000001",
+                "source": "math-ai/aime25",
+                "split": split,
+                "problem": "Compute 20 + 22.",
+                "final_answer": "42",
+            }
+        ]
+
+    monkeypatch.setattr(reasoning_example, "_load_aime25_split", fake_load)
+
+    dataset = reasoning_example.build_math_train_dataset(dataset="aime25", limit=2)
+
+    assert seen_calls == [(reasoning_example.DEFAULT_AIME25_TRAIN_SPLIT, 2)]
+    assert dataset[0].metadata["source"] == "math-ai/aime25"
+    assert dataset[0].metadata["final_answer"] == "42"
+
+
+@pytest.mark.parametrize(
+    ("dataset_name", "build_fn_name", "split", "expected_source", "problem_field", "target_format"),
+    [
+        ("gsm8k", "build_math_train_dataset", "train", "openai/gsm8k", "question", "parse #### + numeric normalize"),
+        ("gsm8k", "build_math_eval_dataset", "test", "openai/gsm8k", "question", "parse #### + numeric normalize"),
+        ("aime25", "build_math_train_dataset", "test", "math-ai/aime25", "problem", "direct numeric normalize"),
+        ("aime25", "build_math_eval_dataset", "test", "math-ai/aime25", "problem", "direct numeric normalize"),
+    ],
+)
+def test_build_math_dataset_prints_compact_summary(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    dataset_name: str,
+    build_fn_name: str,
+    split: str,
+    expected_source: str,
+    problem_field: str,
+    target_format: str,
+) -> None:
+    """Dataset loading should print the selected split summary to stdout."""
+    expected_split = split
+
+    def fake_load_dataset(dataset_id: str, *args, split: str):
+        assert split == expected_split
+        if dataset_name == "gsm8k":
+            assert dataset_id == "openai/gsm8k"
+            assert args == ("main",)
+            return [
+                {
+                    "id": "gsm8k-row-1",
+                    "question": "What is 15 + 27?",
+                    "answer": "work\n#### 42",
+                },
+                {
+                    "id": "gsm8k-row-2",
+                    "question": "What is 12 + 15 + 8?",
+                    "answer": "work\n#### 35",
+                },
+            ]
+        assert dataset_id == reasoning_example.DEFAULT_AIME25_HF_DATASET
+        assert args == ()
+        return [
+            {
+                "id": "aime25-row-1",
+                "problem": "Compute 20 + 22.",
+                "answer": "42",
+            },
+            {
+                "id": "aime25-row-2",
+                "problem": "Compute 30 + 5.",
+                "answer": "35",
+            },
+        ]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+
+    build_fn = getattr(reasoning_example, build_fn_name)
+    dataset = build_fn(dataset=dataset_name, limit=1)
+    output = capsys.readouterr().out
+
+    assert len(dataset) == 1
+    assert (
+        f"dataset  name={dataset_name}  source={expected_source}  split={split}  available=2  selected=1"
+        in output
+    )
+    assert (
+        f"format   problem_field={problem_field}  answer_field=answer  target={target_format}"
+        in output
+    )
 
 
 def test_build_math_train_dataset_uses_only_explicit_limit_not_env(
@@ -121,8 +221,8 @@ def test_build_math_train_dataset_uses_only_explicit_limit_not_env(
 
     monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
 
-    reasoning_example.build_math_train_dataset()
-    reasoning_example.build_math_train_dataset(limit=5)
+    reasoning_example.build_math_train_dataset(dataset="gsm8k")
+    reasoning_example.build_math_train_dataset(dataset="gsm8k", limit=5)
 
     assert seen_limits == [None, 5]
 
@@ -141,10 +241,101 @@ def test_build_math_eval_dataset_uses_only_explicit_limit_not_env(
 
     monkeypatch.setattr(reasoning_example, "_load_gsm8k_split", fake_load)
 
-    reasoning_example.build_math_eval_dataset()
-    reasoning_example.build_math_eval_dataset(limit=7)
+    reasoning_example.build_math_eval_dataset(dataset="gsm8k")
+    reasoning_example.build_math_eval_dataset(dataset="gsm8k", limit=7)
 
     assert seen_limits == [None, 7]
+
+
+def test_build_math_eval_dataset_selects_aime25_loader(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Held-out AIME25 evaluation should use the same explicit split."""
+    seen_calls: list[tuple[str, int | None]] = []
+
+    def fake_load(split: str, *, limit=None):
+        seen_calls.append((split, limit))
+        return [
+            {
+                "task_id": "aime25-test-000001",
+                "source": "math-ai/aime25",
+                "split": split,
+                "problem": "Compute 20 + 22.",
+                "final_answer": "42",
+            }
+        ]
+
+    monkeypatch.setattr(reasoning_example, "_load_aime25_split", fake_load)
+
+    dataset = reasoning_example.build_math_eval_dataset(dataset="aime25", limit=4)
+
+    assert seen_calls == [(reasoning_example.DEFAULT_AIME25_EVAL_SPLIT, 4)]
+    assert dataset[0].metadata["source"] == "math-ai/aime25"
+
+
+def test_load_gsm8k_split_falls_back_and_records_loaded_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The loader should try both HF ids and preserve the one that succeeded."""
+
+    def fake_load_dataset(dataset_name: str, config_name: str, *, split: str):
+        assert config_name == "main"
+        if dataset_name == "openai/gsm8k":
+            raise RuntimeError("first alias unavailable")
+        assert dataset_name == "gsm8k"
+        assert split == reasoning_example.DEFAULT_GSM8K_TRAIN_SPLIT
+        return [
+            {
+                "id": "gsm8k-train-000001",
+                "question": "What is 15 + 27?",
+                "answer": "work\n#### 42",
+            }
+        ]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+
+    rows = reasoning_example._load_gsm8k_split(reasoning_example.DEFAULT_GSM8K_TRAIN_SPLIT)
+
+    assert rows == [
+        {
+            "task_id": "gsm8k-train-000001",
+            "source": "gsm8k",
+            "split": "train",
+            "problem": "What is 15 + 27?",
+            "final_answer": "42",
+        }
+    ]
+
+
+def test_load_aime25_split_maps_problem_answer_and_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """AIME25 rows should use direct problem/answer fields and numeric normalization."""
+
+    def fake_load_dataset(dataset_name: str, *, split: str):
+        assert dataset_name == reasoning_example.DEFAULT_AIME25_HF_DATASET
+        assert split == reasoning_example.DEFAULT_AIME25_TRAIN_SPLIT
+        return [
+            {
+                "id": "aime25-000001",
+                "problem": "Compute 40 + 2.",
+                "answer": "042.0",
+            }
+        ]
+
+    monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
+
+    rows = reasoning_example._load_aime25_split(reasoning_example.DEFAULT_AIME25_TRAIN_SPLIT)
+
+    assert rows == [
+        {
+            "task_id": "aime25-000001",
+            "source": "math-ai/aime25",
+            "split": "test",
+            "problem": "Compute 40 + 2.",
+            "final_answer": "42",
+        }
+    ]
 
 
 def test_extract_math_target_answer_normalizes_gsm8k_final_answers() -> None:
@@ -153,14 +344,26 @@ def test_extract_math_target_answer_normalizes_gsm8k_final_answers() -> None:
     assert reasoning_example._extract_math_target_answer("work\n#### 42.0") == "42"
 
 
-def test_math_reward_requires_single_well_formed_blocks() -> None:
-    """Only strict single-block formatting should receive the format bonus."""
+def test_math_reward_cases_cover_accuracy_and_format_matrix() -> None:
+    """Reward cases should cover the documented 1.1 / 1.0 / 0.1 / 0.0 matrix."""
     prompt = make_prompt()
 
     perfect = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
             "<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
+        )
+    )
+    normalized = reasoning_example.math_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think><answer>$42.00.</answer>",
+        )
+    )
+    strict_wrong = reasoning_example.math_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 41.</think><answer>41</answer>",
         )
     )
     trailing = reasoning_example.math_reward_fn(
@@ -175,33 +378,59 @@ def test_math_reward_requires_single_well_formed_blocks() -> None:
             "<think>Add 15 and 27 to get 42.</think><answer>42</answer><answer>42</answer>",
         )
     )
+    empty_answer = reasoning_example.math_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think><answer> </answer>",
+        )
+    )
+    missing_answer = reasoning_example.math_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think>",
+        )
+    )
 
     assert perfect.reward == pytest.approx(1.1)
     assert perfect.metadata["accuracy_pass"] is True
     assert perfect.metadata["format_pass"] is True
+    assert normalized.reward == pytest.approx(1.1)
+    assert normalized.metadata["normalized_answer"] == "42"
+    assert normalized.metadata["accuracy_pass"] is True
+    assert normalized.metadata["format_pass"] is True
+    assert strict_wrong.reward == pytest.approx(0.1)
+    assert strict_wrong.metadata["answer_parse_pass"] is True
+    assert strict_wrong.metadata["accuracy_pass"] is False
+    assert strict_wrong.metadata["format_pass"] is True
     assert trailing.reward == pytest.approx(1.0)
     assert trailing.metadata["accuracy_pass"] is True
     assert trailing.metadata["format_pass"] is False
     assert duplicate_answer.reward == pytest.approx(0.0)
     assert duplicate_answer.metadata["answer_parse_pass"] is False
     assert duplicate_answer.metadata["format_pass"] is False
+    assert empty_answer.reward == pytest.approx(0.0)
+    assert empty_answer.metadata["answer_parse_pass"] is False
+    assert empty_answer.metadata["format_pass"] is False
+    assert missing_answer.reward == pytest.approx(0.0)
+    assert missing_answer.metadata["answer_parse_pass"] is False
+    assert missing_answer.metadata["format_pass"] is False
 
 
 def test_math_reward_marks_truncated_outputs_invalid_for_format() -> None:
-    """Length truncation should never receive the format reward."""
+    """Length truncation should remove only the format bonus when parsing still works."""
     prompt = make_prompt()
     reward = reasoning_example.math_reward_fn(
         make_rollout(
             prompt,
-            "<think>Add 15 and 27 to get 42.",
+            "<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
             finish_reason="length",
         )
     )
 
-    assert reward.reward == pytest.approx(0.0)
+    assert reward.reward == pytest.approx(1.0)
     assert reward.metadata["truncated"] is True
     assert reward.metadata["format_pass"] is False
-    assert reward.metadata["accuracy_pass"] is False
+    assert reward.metadata["accuracy_pass"] is True
 
 
 def test_extract_answer_block_requires_exactly_one_non_empty_block() -> None:
@@ -219,7 +448,7 @@ def test_evaluate_model_reports_exact_match_format_and_truncation() -> None:
             text=reasoning_example.render_math_prompt("What is 15 + 27?"),
             metadata={
                 "task_id": "gsm8k-test-000001",
-                "source": "gsm8k",
+                "source": "openai/gsm8k",
                 "split": "test",
                 "problem": "What is 15 + 27?",
                 "final_answer": "42",
@@ -230,7 +459,7 @@ def test_evaluate_model_reports_exact_match_format_and_truncation() -> None:
             text=reasoning_example.render_math_prompt("What is 12 + 15 + 8?"),
             metadata={
                 "task_id": "gsm8k-test-000002",
-                "source": "gsm8k",
+                "source": "openai/gsm8k",
                 "split": "test",
                 "problem": "What is 12 + 15 + 8?",
                 "final_answer": "35",
@@ -301,15 +530,17 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
     """The example CLIs should expose only the intended explicit operator knobs."""
     train_help = reasoning_example.build_argument_parser().format_help()
     assert "--config" in train_help
+    assert "--dataset" in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" in train_help
     assert "--checkpoint-out" in train_help
     assert "--task-config" not in train_help
 
-    from examples.reasoning import eval as reasoning_eval
+    from flashrl.framework.examples.reasoning import eval as reasoning_eval
 
     eval_help = reasoning_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
+    assert "--dataset" in eval_help
     assert "--eval-limit" in eval_help
     assert "--checkpoint" in eval_help
     assert "--batch-size" in eval_help
@@ -328,11 +559,13 @@ def test_prepare_reasoning_environment_sets_default_vllm_runtime(
     """The direct example entrypoint should auto-fill the default vLLM runtime."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
     monkeypatch.setattr(
-        "examples.reasoning.train.find_default_vllm_python",
+        "flashrl.framework.examples.reasoning.train.find_default_vllm_python",
         lambda: "/tmp/fake-vllm-python",
     )
 
-    reasoning_example.prepare_reasoning_environment("examples/reasoning/config_vllm.yaml")
+    reasoning_example.prepare_reasoning_environment(
+        "flashrl/framework/examples/reasoning/config_vllm.yaml"
+    )
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
     os.environ.pop("FLASHRL_VLLM_PYTHON", None)
@@ -344,23 +577,26 @@ def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
     """Only the vLLM example config should trigger env auto-discovery."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
     monkeypatch.setattr(
-        "examples.reasoning.train.find_default_vllm_python",
+        "flashrl.framework.examples.reasoning.train.find_default_vllm_python",
         lambda: "/tmp/fake-vllm-python",
     )
 
-    reasoning_example.prepare_reasoning_environment("examples/reasoning/config.yaml")
+    reasoning_example.prepare_reasoning_environment(
+        "flashrl/framework/examples/reasoning/config.yaml"
+    )
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ
 
 
 def test_eval_module_imports_only_public_helpers_from_train() -> None:
     """eval.py should only depend on train.py helpers that are meant to be shared."""
-    source = Path("examples/reasoning/eval.py").read_text(encoding="utf-8")
+    source = Path("flashrl/framework/examples/reasoning/eval.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     imported_names = [
         alias.name
         for node in ast.walk(tree)
-        if isinstance(node, ast.ImportFrom) and node.module == "examples.reasoning.train"
+        if isinstance(node, ast.ImportFrom)
+        and node.module == "flashrl.framework.examples.reasoning.train"
         for alias in node.names
     ]
 

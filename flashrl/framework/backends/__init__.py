@@ -1,5 +1,7 @@
-"""Training backends."""
+"""Legacy backend package.
 
-from flashrl.framework.backends.training import TrainingBackend
+Serving and training backends now live in ``flashrl.framework.serving`` and
+``flashrl.framework.training``.
+"""
 
-__all__ = ["TrainingBackend"]
+__all__: list[str] = []

@@ -34,7 +34,7 @@ PROMPT_WRAP_WIDTH = 88
 PROMPT_MAX_LINES = 6
 PROMPT_MAX_CHARS = 320
 PROMPT_GIST_MAX_CHARS = 96
-PROMPT_SEPARATOR = "  " + ("=" * 72)
+SECTION_SEPARATOR = "  " + ("=" * 72)
 STEP_SEPARATOR = "  " + ("-" * 72)
 
 ANSI_RESET = "\033[0m"
@@ -136,10 +136,15 @@ class RunLogger:
         prompts_per_step: int | None = None,
         steps_per_epoch: int | None = None,
         total_planned_steps: int | None = None,
+        training_backend: str | None = None,
+        training_device: str | None = None,
+        training_dp_size: int | None = None,
         serving_backend: str | None = None,
         serving_device: str | None = None,
         serving_num_replicas: int | None = None,
         admin_base_url: str | None = None,
+        max_new_tokens: int | None = None,
+        include_startup_divider: bool = False,
     ) -> None:
         """Log the start of a training run."""
         self._total_batches = total_batches
@@ -170,6 +175,9 @@ class RunLogger:
             "planned_completions_per_step": batch_size,
             "steps_per_epoch": steps_per_epoch,
             "total_planned_steps": total_planned_steps,
+            "training_backend": training_backend,
+            "training_device": training_device,
+            "training_dp_size": training_dp_size,
             "serving_backend": serving_backend,
             "serving_device": serving_device,
             "serving_num_replicas": serving_num_replicas,
@@ -179,6 +187,8 @@ class RunLogger:
         self._emit_event("run_started", payload)
 
         if self.config.console_mode == "compact":
+            if include_startup_divider:
+                self._emit_console(SECTION_SEPARATOR)
             self._emit_console_lines(
                 self._format_compact_run_header(
                     device=device,
@@ -196,50 +206,47 @@ class RunLogger:
                     prompts_per_step=prompts_per_step,
                     steps_per_epoch=steps_per_epoch,
                     total_planned_steps=total_planned_steps,
+                    training_backend=training_backend,
+                    training_device=training_device,
+                    training_dp_size=training_dp_size,
                     serving_backend=serving_backend,
                     serving_device=serving_device,
                     serving_num_replicas=serving_num_replicas,
                     admin_base_url=admin_base_url,
+                    max_new_tokens=max_new_tokens,
                 )
             )
             return
 
-        reference_state = "enabled" if reference_enabled else "disabled"
-        self._emit_console(f"FlashRL training run {self.run_id}")
-        self._emit_console(
-            f"  model={self.model_name} device={device} dtype={dtype} cpu_threads={cpu_threads}"
-        )
-        self._emit_console(
-            f"  dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}"
-        )
-        self._emit_console(
-            f"  runtime={runtime_shape} reference={reference_state} reference_device={reference_device}"
-        )
-        serving_line = self._format_verbose_serving_line(
-            serving_backend=serving_backend,
-            serving_device=serving_device,
-            serving_num_replicas=serving_num_replicas,
-        )
-        if serving_line is not None:
-            self._emit_console(serving_line)
-        if admin_base_url is not None:
-            self._emit_console(f"  admin={admin_base_url}")
-        if group_size is not None:
-            line = f"  grpo=completions_per_prompt:{group_size}"
-            if clip_ratio is not None:
-                line += f" clip_ratio={clip_ratio:.4f}"
-            self._emit_console(line)
-        if prompts_per_step is not None and steps_per_epoch is not None and total_planned_steps is not None:
-            self._emit_console(
-                "  mapping="
-                f"dataset_prompts:{dataset_size} "
-                f"prompts_per_step:{prompts_per_step} "
-                f"completions_per_prompt:{group_size} "
-                f"completions_per_step:{batch_size} "
-                f"steps_per_epoch:{steps_per_epoch} "
-                f"total_steps:{total_planned_steps}"
+        if include_startup_divider:
+            self._emit_console(SECTION_SEPARATOR)
+        self._emit_console_lines(
+            self._format_compact_run_header(
+                device=device,
+                dtype=dtype,
+                cpu_threads=cpu_threads,
+                dataset_size=dataset_size,
+                batch_size=batch_size,
+                max_epochs=max_epochs,
+                total_batches=total_batches,
+                runtime_shape=runtime_shape,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+                group_size=group_size,
+                clip_ratio=clip_ratio,
+                prompts_per_step=prompts_per_step,
+                steps_per_epoch=steps_per_epoch,
+                total_planned_steps=total_planned_steps,
+                training_backend=training_backend,
+                training_device=training_device,
+                training_dp_size=training_dp_size,
+                serving_backend=serving_backend,
+                serving_device=serving_device,
+                serving_num_replicas=serving_num_replicas,
+                admin_base_url=admin_base_url,
+                max_new_tokens=max_new_tokens,
             )
-        self._emit_console(f"  logs={self.run_dir}")
+        )
 
     def log_model_load(
         self,
@@ -257,18 +264,11 @@ class RunLogger:
 
         if status != "completed":
             return
-        if self.config.console_mode == "compact":
-            self._emit_console(self._format_compact_load_line(component, metadata))
-            return
 
-        line = f"loaded {component}"
-        if metadata.get("device") is not None:
-            line += f" device={metadata['device']}"
-        if metadata.get("cpu_threads") is not None:
-            line += f" cpu_threads={metadata['cpu_threads']}"
-        if metadata.get("duration_seconds") is not None:
-            line += f" latency={self._format_duration(metadata['duration_seconds'])}"
-        self._emit_console(line)
+    def replay_startup_lines(self, lines: list[str]) -> None:
+        """Replay cached startup lines into console.log without reprinting them live."""
+        for line in lines:
+            self._emit_file_line(line)
 
     def log_epoch_start(self, epoch: int, total_epochs: int, num_batches: int) -> None:
         """Log the start of an epoch."""
@@ -681,10 +681,14 @@ class RunLogger:
         prompts_per_step: int | None,
         steps_per_epoch: int | None,
         total_planned_steps: int | None,
+        training_backend: str | None,
+        training_device: str | None,
+        training_dp_size: int | None,
         serving_backend: str | None,
         serving_device: str | None,
         serving_num_replicas: int | None,
         admin_base_url: str | None,
+        max_new_tokens: int | None,
     ) -> list[str]:
         reference_state = "enabled" if reference_enabled else "disabled"
         lines = [
@@ -694,6 +698,13 @@ class RunLogger:
             f"  data     dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}",
             f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
         ]
+        training_line = self._format_compact_training_line(
+            training_backend=training_backend,
+            training_device=training_device,
+            training_dp_size=training_dp_size,
+        )
+        if training_line is not None:
+            lines.append(training_line)
         serving_line = self._format_compact_serving_line(
             serving_backend=serving_backend,
             serving_device=serving_device,
@@ -707,6 +718,8 @@ class RunLogger:
             grpo_line = f"  grpo     completions_per_prompt={group_size}"
             if clip_ratio is not None:
                 grpo_line += f"  clip={self._format_fixed(float(clip_ratio), 4)}"
+            if max_new_tokens is not None:
+                grpo_line += f"  max_new_tokens={max_new_tokens}"
             lines.append(grpo_line)
         if prompts_per_step is not None and steps_per_epoch is not None and total_planned_steps is not None:
             lines.append(
@@ -722,6 +735,20 @@ class RunLogger:
             )
         lines.append(f"  logs     {self.run_dir}")
         return lines
+
+    def _format_compact_training_line(
+        self,
+        *,
+        training_backend: str | None,
+        training_device: str | None,
+        training_dp_size: int | None,
+    ) -> str | None:
+        if training_backend is None or training_device is None:
+            return None
+        line = f"  training backend={training_backend}  device={training_device}"
+        if training_dp_size is not None:
+            line += f"  dp_size={training_dp_size}"
+        return line
 
     def _format_compact_serving_line(
         self,
@@ -751,11 +778,19 @@ class RunLogger:
             line += f" replicas={serving_num_replicas}"
         return line
 
-    def _format_compact_load_line(self, component: str, metadata: dict[str, Any]) -> str:
-        device = metadata.get("device", "unknown")
-        cpu_threads = metadata.get("cpu_threads", "?")
-        duration = self._format_duration(float(metadata.get("duration_seconds", 0.0)))
-        return f"load {component:<16} device={device}  cpu={cpu_threads}  {duration}"
+    def _format_verbose_training_line(
+        self,
+        *,
+        training_backend: str | None,
+        training_device: str | None,
+        training_dp_size: int | None,
+    ) -> str | None:
+        if training_backend is None or training_device is None:
+            return None
+        line = f"  training backend={training_backend} device={training_device}"
+        if training_dp_size is not None:
+            line += f" dp_size={training_dp_size}"
+        return line
 
     def _format_compact_step_header(self, payload: dict[str, Any]) -> str:
         total_batches = self._total_batches if self._total_batches else "?"
@@ -1239,7 +1274,7 @@ class RunLogger:
         if rollout_status_match:
             label, spacing, value = rollout_status_match.groups()
             return f"{self._color(label, 'serving_candidate')}{spacing}{value}"
-        if line == STEP_SEPARATOR:
+        if line in {SECTION_SEPARATOR, STEP_SEPARATOR}:
             return self._color(line, "divider")
 
         compact_label_match = re.match(

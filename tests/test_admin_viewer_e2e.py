@@ -46,7 +46,19 @@ def test_viewer_renders_live_runtime_and_run_history_workspaces(
     page: Page,
 ) -> None:
     """The unified viewer should render live admin data and expose run history UI."""
-    monkeypatch.setattr(flashrl_module, "TrainingBackend", StubTrainingBackend)
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+            StubTrainingBackend(
+                config,
+                learning_rate=learning_rate,
+                grpo_config=grpo_config,
+                reference_enabled=reference_enabled,
+                reference_device=reference_device,
+            )
+        ),
+    )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
