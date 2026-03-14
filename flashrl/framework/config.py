@@ -132,13 +132,32 @@ class LoggingConfig(BaseConfig):
     rich_progress: bool = False
 
 
-class MetricsConfig(BaseConfig):
-    """Configuration for Prometheus/Grafana observability."""
+class TensorBoardMetricsConfig(BaseConfig):
+    """Configuration for TensorBoard scalar logging."""
+
+    model_config = ConfigDict(extra="forbid")
 
     enabled: bool = True
-    backend: Literal["pushgateway"] = "pushgateway"
-    pushgateway_url: str = "http://localhost:9091"
+
+
+class PushgatewayMetricsConfig(BaseConfig):
+    """Configuration for Pushgateway-backed Prometheus metrics."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    url: str = "http://localhost:9091"
     job_name: str = "flashrl"
+
+
+class MetricsConfig(BaseConfig):
+    """Configuration for run metrics sinks."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = True
+    tensorboard: TensorBoardMetricsConfig = Field(default_factory=TensorBoardMetricsConfig)
+    pushgateway: PushgatewayMetricsConfig = Field(default_factory=PushgatewayMetricsConfig)
 
 
 class RuntimeConfig(BaseConfig):

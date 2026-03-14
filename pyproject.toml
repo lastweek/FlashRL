@@ -18,6 +18,7 @@ dependencies = [
     "pyyaml>=6.0",
     "prometheus-client>=0.20.0",
     "rich>=13.0.0",
+    "tensorboard>=2.14.0",
     "uvicorn>=0.30.0",
 ]
 

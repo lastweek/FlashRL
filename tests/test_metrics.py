@@ -20,9 +20,20 @@ import yaml
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.metrics as metrics_module
 from examples.reasoning import train as reasoning_example
-from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
+from flashrl.framework import (
+    FlashRL,
+    GrpoConfig,
+    LoggingConfig,
+    MetricsConfig,
+    PushgatewayMetricsConfig,
+    TensorBoardMetricsConfig,
+)
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
-from flashrl.framework.metrics import PrometheusMetricsSink
+from flashrl.framework.metrics import (
+    CompositeMetricsSink,
+    PrometheusMetricsSink,
+    TensorBoardMetricsSink,
+)
 
 
 class FakeTokenizer:
@@ -294,6 +305,45 @@ class FakeReferenceModel:
         self.model = FakeCausalLM(bias_shift=0.0)
 
 
+class FakeSummaryWriter:
+    """Minimal file-backed scalar writer used to test TensorBoard sink wiring."""
+
+    instances: list["FakeSummaryWriter"] = []
+    counter = 0
+
+    def __init__(self, log_dir: str) -> None:
+        type(self).counter += 1
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.path = self.log_dir / f"events.out.tfevents.fake.{type(self).counter}"
+        self.path.touch()
+        self.flush_count = 0
+        self.closed = False
+        type(self).instances.append(self)
+
+    def add_scalar(self, tag: str, scalar_value: float, global_step: int) -> None:
+        record = {
+            "tag": tag,
+            "value": float(scalar_value),
+            "step": int(global_step),
+        }
+        with self.path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    def flush(self) -> None:
+        self.flush_count += 1
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def install_fake_tensorboard_writer(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Patch the runtime TensorBoard writer with a deterministic file writer."""
+    FakeSummaryWriter.instances.clear()
+    FakeSummaryWriter.counter = 0
+    monkeypatch.setattr(metrics_module, "_create_summary_writer", lambda log_dir: FakeSummaryWriter(log_dir))
+
+
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
     """Create a rollout function with deterministic responses."""
 
@@ -367,6 +417,18 @@ def read_events(run_dir: Path) -> list[dict]:
         for line in (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
+
+
+def read_tensorboard_scalars(run_dir: Path) -> list[dict[str, object]]:
+    """Load fake TensorBoard scalar records from one run directory."""
+    records: list[dict[str, object]] = []
+    for path in sorted(run_dir.glob("events.out.tfevents*")):
+        records.extend(
+            json.loads(line)
+            for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip()
+        )
+    return records
 
 
 def write_executable(path: Path, content: str) -> None:
@@ -484,6 +546,8 @@ def write_yaml_run_config(
     hook_module: str,
     log_dir: Path,
     metrics_enabled: bool = False,
+    tensorboard_enabled: bool | None = None,
+    pushgateway_enabled: bool = False,
     common_dtype: str | None = None,
     serving_num_threads: int = 3,
     serving_debug_live_rollout: bool = False,
@@ -494,6 +558,8 @@ def write_yaml_run_config(
 ) -> Path:
     """Write a temporary YAML config for FlashRL.from_yaml tests."""
     config_path = tmp_path / "run.yaml"
+    if tensorboard_enabled is None:
+        tensorboard_enabled = metrics_enabled
     training_section = {
         "learning_rate": 1.0e-5,
         "batch_size": 2,
@@ -534,8 +600,14 @@ def write_yaml_run_config(
                 },
                 "metrics": {
                     "enabled": metrics_enabled,
-                    "pushgateway_url": "http://localhost:9091",
-                    "job_name": "flashrl-test",
+                    "tensorboard": {
+                        "enabled": tensorboard_enabled,
+                    },
+                    "pushgateway": {
+                        "enabled": pushgateway_enabled,
+                        "url": "http://localhost:9091",
+                        "job_name": "flashrl-test",
+                    },
                 },
                 "runtime": {
                     "reference_enabled": False,
@@ -554,28 +626,30 @@ def write_yaml_run_config(
 
 
 def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> None:
-    """The sink should own the six expected gauges and push the registry."""
+    """The Prometheus sink should own the expected gauges and push the registry."""
     pushes: list[tuple[str, str]] = []
 
     sink = PrometheusMetricsSink(
-        MetricsConfig(
+        PushgatewayMetricsConfig(
             enabled=True,
-            pushgateway_url="http://localhost:9091",
+            url="http://localhost:9091",
             job_name="flashrl-test",
         ),
         model_name="fake/model",
         push_fn=lambda url, job, registry: pushes.append((url, job)),
     )
 
-    sink.observe_stage("rollout", 1.25)
-    sink.observe_stage("reward", 0.5)
+    sink.observe_stage({"stage": "rollout", "latency_seconds": 1.25})
+    sink.observe_stage({"stage": "reward", "latency_seconds": 0.5})
     sink.observe_step(
-        loss=0.75,
-        reward_mean=1.5,
-        kl_mean=0.25,
-        step_duration_seconds=2.0,
+        {
+            "loss": 0.75,
+            "reward_mean": 1.5,
+            "kl_divergence": 0.25,
+            "step_duration_seconds": 2.0,
+        }
     )
-    sink.observe_serving_debug(ttft_seconds=0.12, tpot_seconds=0.03)
+    sink.observe_serving_debug({"ttft_seconds": 0.12, "tpot_seconds": 0.03})
     sink.push()
 
     assert {metric.name for metric in sink.registry.collect()} == {
@@ -606,8 +680,173 @@ def test_prometheus_metrics_sink_creates_expected_metrics_and_pushes_once() -> N
 
 
 def test_metrics_config_defaults_enabled() -> None:
-    """Metrics should default to enabled for local runs."""
-    assert MetricsConfig().enabled is True
+    """Metrics should default to TensorBoard-on and Pushgateway-off."""
+    config = MetricsConfig()
+    assert config.enabled is True
+    assert config.tensorboard.enabled is True
+    assert config.pushgateway.enabled is False
+
+
+def test_composite_metrics_sink_forwards_to_all_children() -> None:
+    """Composite metrics sink should broadcast all lifecycle and metric events."""
+
+    class RecordingSink:
+        def __init__(self) -> None:
+            self.events: list[tuple[str, object]] = []
+
+        def start_run(self, *, run_dir: Path, run_id: str) -> None:
+            self.events.append(("start_run", (run_dir, run_id)))
+
+        def observe_stage(self, payload: dict[str, object]) -> None:
+            self.events.append(("observe_stage", payload))
+
+        def observe_step(self, payload: dict[str, object]) -> None:
+            self.events.append(("observe_step", payload))
+
+        def observe_serving_debug(self, payload: dict[str, object]) -> None:
+            self.events.append(("observe_serving_debug", payload))
+
+        def push(self) -> None:
+            self.events.append(("push", None))
+
+        def finish_run(self) -> None:
+            self.events.append(("finish_run", None))
+
+        def close(self) -> None:
+            self.events.append(("close", None))
+
+    left = RecordingSink()
+    right = RecordingSink()
+    sink = CompositeMetricsSink([left, right])
+
+    sink.start_run(run_dir=Path("/tmp/run"), run_id="run-1")
+    sink.observe_stage({"stage": "reward", "step": 1, "latency_seconds": 0.1})
+    sink.observe_step({"step": 1, "loss": 0.2})
+    sink.observe_serving_debug({"step": 1, "ttft_seconds": 0.1, "tpot_seconds": 0.02})
+    sink.push()
+    sink.finish_run()
+    sink.close()
+
+    assert [name for name, _ in left.events] == [
+        "start_run",
+        "observe_stage",
+        "observe_step",
+        "observe_serving_debug",
+        "push",
+        "finish_run",
+        "close",
+    ]
+    assert left.events == right.events
+
+
+def test_tensorboard_metrics_sink_writes_expected_scalars_and_flushes(tmp_path: Path) -> None:
+    """TensorBoard sink should write scalar records into the run root and flush on push."""
+    sink = TensorBoardMetricsSink(
+        TensorBoardMetricsConfig(enabled=True),
+        writer_factory=lambda log_dir: FakeSummaryWriter(log_dir),
+    )
+
+    sink.start_run(run_dir=tmp_path, run_id="run-1")
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "rollout",
+            "latency_seconds": 0.4,
+            "prompt_tokens_mean": 12.0,
+            "prompt_tokens_max": 18,
+            "response_tokens_mean": 4.0,
+            "response_tokens_max": 6,
+        }
+    )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "reward",
+            "latency_seconds": 0.2,
+            "reward_mean": 1.5,
+            "reward_std": 0.5,
+            "reward_min": 1.0,
+            "reward_max": 2.0,
+            "accuracy_pass_rate": 0.5,
+            "format_pass_rate": 1.0,
+            "truncation_rate": 0.0,
+            "reward_per_item_mean_seconds": 0.01,
+        }
+    )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "advantage",
+            "latency_seconds": 0.1,
+            "advantage_mean": 0.0,
+            "advantage_std": 1.0,
+            "advantage_min": -1.0,
+            "advantage_max": 1.0,
+        }
+    )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "prepare_inputs",
+            "latency_seconds": 0.05,
+            "full_tokens_mean": 20.0,
+            "full_tokens_max": 24,
+            "response_tokens_total": 8,
+        }
+    )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "loss_assembly",
+            "latency_seconds": 0.08,
+            "importance_sampling_ratio_mean": 1.1,
+            "importance_sampling_ratio_std": 0.2,
+            "importance_sampling_ratio_min": 0.8,
+            "importance_sampling_ratio_max": 1.4,
+            "clip_fraction": 0.25,
+        }
+    )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "optimizer",
+            "latency_seconds": 0.03,
+            "learning_rate": 1.0e-5,
+        }
+    )
+    sink.observe_step(
+        {
+            "step": 3,
+            "loss": 0.75,
+            "policy_loss": 0.5,
+            "kl_divergence": 0.25,
+            "tokens_per_second": 42.0,
+            "step_duration_seconds": 2.0,
+        }
+    )
+    sink.observe_serving_debug({"step": 3, "ttft_seconds": 0.12, "tpot_seconds": 0.03})
+    sink.push()
+    writer = FakeSummaryWriter.instances[-1]
+    sink.finish_run()
+
+    assert writer.flush_count == 1
+    assert writer.closed is True
+
+    records = read_tensorboard_scalars(tmp_path)
+    assert any(record["tag"] == "train/loss" and record["step"] == 3 for record in records)
+    assert any(record["tag"] == "train/learning_rate" and record["step"] == 3 for record in records)
+    assert any(record["tag"] == "reward/mean" and record["value"] == pytest.approx(1.5) for record in records)
+    assert any(
+        record["tag"] == "importance_sampling_ratio/clip_fraction"
+        and record["value"] == pytest.approx(0.25)
+        for record in records
+    )
+    assert any(
+        record["tag"] == "timing/stage/reward_seconds"
+        and record["value"] == pytest.approx(0.2)
+        for record in records
+    )
+    assert any(record["tag"] == "serving/ttft_seconds" for record in records)
 
 
 def test_grpo_config_rejects_group_size_below_two() -> None:
@@ -626,9 +865,9 @@ def test_prometheus_metrics_sink_warns_once_and_continues_on_push_failure() -> N
         raise OSError("connection refused")
 
     sink = PrometheusMetricsSink(
-        MetricsConfig(
+        PushgatewayMetricsConfig(
             enabled=True,
-            pushgateway_url="http://localhost:9091",
+            url="http://localhost:9091",
             job_name="flashrl-test",
         ),
         model_name="fake/model",
@@ -645,11 +884,11 @@ def test_prometheus_metrics_sink_warns_once_and_continues_on_push_failure() -> N
     assert "best-effort mode" in str(caught[0].message)
 
 
-def test_flashrl_metrics_push_process_lifetime_across_runs(
+def test_flashrl_pushgateway_metrics_process_lifetime_across_runs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Metrics should update and push across consecutive runs with one sink instance."""
+    """Pushgateway metrics should update and push across consecutive runs with one sink instance."""
     pushes: list[tuple[str, str]] = []
 
     def fake_push(url: str, job: str, registry) -> None:
@@ -671,8 +910,12 @@ def test_flashrl_metrics_push_process_lifetime_across_runs(
         ),
         metrics_config=MetricsConfig(
             enabled=True,
-            pushgateway_url="http://localhost:9091",
-            job_name="flashrl-test",
+            tensorboard=TensorBoardMetricsConfig(enabled=False),
+            pushgateway=PushgatewayMetricsConfig(
+                enabled=True,
+                url="http://localhost:9091",
+                job_name="flashrl-test",
+            ),
         ),
     )
     assert trainer._metrics_sink is not None
@@ -710,7 +953,7 @@ def test_flashrl_default_metrics_push_failure_does_not_fail_training(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Default-on metrics should warn and continue when Pushgateway is unavailable."""
+    """Enabled Pushgateway metrics should warn and continue when Pushgateway is unavailable."""
     def failing_push(url: str, job: str, registry) -> None:
         del url, job, registry
         raise OSError("pushgateway offline")
@@ -729,6 +972,15 @@ def test_flashrl_default_metrics_push_failure_does_not_fail_training(
             console=False,
             file=True,
         ),
+        metrics_config=MetricsConfig(
+            enabled=True,
+            tensorboard=TensorBoardMetricsConfig(enabled=False),
+            pushgateway=PushgatewayMetricsConfig(
+                enabled=True,
+                url="http://localhost:9091",
+                job_name="flashrl-test",
+            ),
+        ),
     )
 
     dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
@@ -737,6 +989,101 @@ def test_flashrl_default_metrics_push_failure_does_not_fail_training(
 
     assert trainer._metrics_sink is not None
     assert (trainer._run_logger.run_dir / "events.jsonl").exists()
+
+
+def test_flashrl_default_metrics_create_tensorboard_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Default metrics should create TensorBoard event files in each run directory."""
+    install_fake_tensorboard_writer(monkeypatch)
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(response_suffix="tensorboard", repeat=2),
+        reward_fn=reward_fn,
+        batch_size=2,
+        max_epochs=1,
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+    )
+
+    trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
+
+    assert trainer._metrics_sink is not None
+    event_files = sorted(trainer._run_logger.run_dir.glob("events.out.tfevents*"))
+    assert event_files
+    scalars = read_tensorboard_scalars(trainer._run_logger.run_dir)
+    assert any(record["tag"] == "train/loss" for record in scalars)
+    assert any(record["tag"] == "reward/mean" for record in scalars)
+    assert any(record["tag"] == "importance_sampling_ratio/mean" for record in scalars)
+
+
+def test_flashrl_disabled_metrics_skip_tensorboard_events(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Disabled metrics should not create TensorBoard event files."""
+    install_fake_tensorboard_writer(monkeypatch)
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(response_suffix="disabled", repeat=2),
+        reward_fn=reward_fn,
+        batch_size=2,
+        max_epochs=1,
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+
+    trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
+
+    assert not list(trainer._run_logger.run_dir.glob("events.out.tfevents*"))
+
+
+def test_flashrl_tensorboard_writer_reopens_cleanly_across_runs(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Reusing one FlashRL instance should reopen a fresh TensorBoard writer per run."""
+    install_fake_tensorboard_writer(monkeypatch)
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(response_suffix="tb-reuse", repeat=2),
+        reward_fn=reward_fn,
+        batch_size=2,
+        max_epochs=1,
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+    )
+
+    dataset = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+    trainer.train(dataset)
+    first_run_dir = trainer._run_logger.run_dir
+    first_writer = FakeSummaryWriter.instances[0]
+    trainer.train(dataset)
+    second_run_dir = trainer._run_logger.run_dir
+    second_writer = FakeSummaryWriter.instances[1]
+
+    assert first_run_dir != second_run_dir
+    assert first_writer.closed is True
+    assert second_writer.closed is True
+    assert list(first_run_dir.glob("events.out.tfevents*"))
+    assert list(second_run_dir.glob("events.out.tfevents*"))
 
 
 def test_flashrl_rejects_batch_size_not_divisible_by_group_size(
@@ -1116,6 +1463,8 @@ def test_flashrl_yaml_serving_debug_live_rollout_wires_events_artifacts_and_metr
         hook_module=hook_module,
         log_dir=tmp_path / "debug-logs",
         metrics_enabled=True,
+        tensorboard_enabled=False,
+        pushgateway_enabled=True,
         serving_debug_live_rollout=True,
     )
 
@@ -1134,10 +1483,16 @@ def test_flashrl_yaml_serving_debug_live_rollout_wires_events_artifacts_and_metr
     transcript = trainer._run_logger.console_path.read_text(encoding="utf-8")
 
     assert any(event["event"] == "serving_debug" for event in events)
-    assert "serve step=1 epoch=1/1 batch=1/4 prompt=1/1 completions_per_prompt=2" in transcript
-    assert "  prompt: yaml prompt 0" in transcript
-    assert "  candidate 1/2" in transcript
-    assert "\n\n  candidate 2/2" in transcript
+    assert (
+        "step 1/4  epoch 1/1  batch 1/4  prompt_window=1-1/4  "
+        "prompts_this_step=1/1  completions_per_prompt=2  completions_this_step=2/2"
+        in transcript
+    )
+    assert "  prompt 1/1  yaml prompt 0" in transcript
+    assert "    rollout 1/2 running..." in transcript
+    assert "    rollout 1/2 done  ttft=100.0ms  tpot=20.0ms" in transcript
+    assert "  candidate " not in transcript
+    assert "serve step=" not in transcript
     assert any(
         "ttft_seconds" in candidate["rollout"]["metadata"]
         and "tpot_seconds" in candidate["rollout"]["metadata"]
@@ -1178,7 +1533,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     monkeypatch.setattr(
         reasoning_example,
         "_load_gsm8k_split",
-        lambda split, limit=None: [
+        lambda split, limit=None, **kwargs: [
             {
                 "task_id": f"gsm8k-{split}-000001",
                 "source": "gsm8k",
@@ -1268,11 +1623,15 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     )
     trainer.metrics_config = MetricsConfig(
         enabled=True,
-        pushgateway_url="http://localhost:9091",
-        job_name="flashrl-test",
+        tensorboard=TensorBoardMetricsConfig(enabled=False),
+        pushgateway=PushgatewayMetricsConfig(
+            enabled=True,
+            url="http://localhost:9091",
+            job_name="flashrl-test",
+        ),
     )
     trainer._metrics_sink = PrometheusMetricsSink(
-        trainer.metrics_config,
+        trainer.metrics_config.pushgateway,
         model_name=trainer.training_model_config.model_name,
     )
     assert trainer._trainer is not None
@@ -1328,16 +1687,24 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("examples/reasoning/train.py").exists()
     assert Path("examples/reasoning/config.yaml").exists()
     assert Path("examples/reasoning/config_vllm.yaml").exists()
+    assert Path("examples/reasoning/math.yaml").exists()
 
     docs = Path("examples/README.md").read_text(encoding="utf-8")
     reasoning_docs = Path("examples/reasoning/README.md").read_text(encoding="utf-8")
+    root_docs = Path("README.md").read_text(encoding="utf-8")
+    assert "tensorboard --logdir logs" in root_docs
+    assert "TensorBoard is the default local metrics path." in docs
+    assert "metrics.pushgateway.enabled: true" in docs
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
     assert "reasoning/README.md" in docs
     assert "http://localhost:3000" in docs
+    assert "tensorboard --logdir logs" in docs
     assert "python3 -m examples.reasoning.train" in reasoning_docs
     assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in reasoning_docs
     assert "config_vllm.yaml" in reasoning_docs
+    assert "math.yaml" in reasoning_docs
+    assert "--task-config examples/reasoning/math.yaml" in reasoning_docs
     assert "model:" not in reasoning_docs
     assert "trainer:" not in reasoning_docs
     assert "common.model_name" in reasoning_docs
@@ -1363,6 +1730,12 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "training:" in example_yaml
     assert "serving:" in example_yaml
     assert "grpo:" in example_yaml
+    assert "metrics:" in example_yaml
+    assert "runtime:" in example_yaml
+    assert "hooks:" in example_yaml
+    assert "tensorboard:" in example_yaml
+    assert "pushgateway:" in example_yaml
+    assert "pushgateway_url:" not in example_yaml
     assert "common:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct\n  num_threads:" not in example_yaml
     assert "training:\n  num_threads: 1" in example_yaml
     assert "serving:\n  num_threads: 1\n  debug_live_rollout:" in example_yaml
@@ -1373,6 +1746,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "~/.venv-vllm-metal" not in vllm_example_yaml
     assert "vllm_args:" not in vllm_example_yaml
     assert 'requires-python = ">=3.10"' in pyproject
+    assert '"tensorboard>=2.14.0"' in pyproject
     assert '[project.optional-dependencies]' in pyproject
     assert 'vllm = [' in pyproject
     assert '"vllm>=0.16.0"' in pyproject

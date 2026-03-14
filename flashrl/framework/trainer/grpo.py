@@ -19,7 +19,7 @@ from flashrl.framework.rollout.user_defined import UserDefinedRollout
 
 if TYPE_CHECKING:
     from flashrl.framework.backends.training import TrainingBackend
-    from flashrl.framework.metrics import PrometheusMetricsSink
+    from flashrl.framework.metrics import MetricsSink
     from flashrl.framework.run_logger import RunLogger
     from flashrl.framework.serving import ServingBackend
 
@@ -86,9 +86,32 @@ class OptimizationResult:
     loss: float
     policy_loss: float
     kl_divergence: float
+    learning_rate: float
     stage_timings: dict[str, float]
     response_tokens_total: int
     reference_active: bool
+
+
+@dataclass
+class LossAssemblyResult:
+    """Full response-only GRPO loss assembly output."""
+
+    loss: torch.Tensor
+    policy_loss: torch.Tensor
+    kl_divergence: torch.Tensor
+    response_tokens_total: int
+    importance_sampling_ratio_mean: float
+    importance_sampling_ratio_std: float
+    importance_sampling_ratio_min: float
+    importance_sampling_ratio_max: float
+    clip_fraction: float
+
+    def __iter__(self):
+        """Preserve tuple-style unpacking in existing call sites and tests."""
+        yield self.loss
+        yield self.policy_loss
+        yield self.kl_divergence
+        yield self.response_tokens_total
 
 
 class GRPOTrainer:
@@ -104,7 +127,7 @@ class GRPOTrainer:
         reward_fn: UserDefinedReward,
         rollout_generator: UserDefinedRollout,
         run_logger: "RunLogger | None" = None,
-        metrics_sink: "PrometheusMetricsSink | None" = None,
+        metrics_sink: "MetricsSink | None" = None,
     ) -> None:
         """Initialize GRPO trainer."""
         self.config = config
@@ -191,6 +214,8 @@ class GRPOTrainer:
     ) -> dict[str, Any]:
         """Run one full training step and emit detailed stage logs."""
         step_started_at = time.perf_counter()
+        if self.run_logger is not None:
+            self.run_logger.log_step_start(context.payload())
 
         rollout_started_at = time.perf_counter()
         self._install_serving_debug(context)
@@ -302,6 +327,7 @@ class GRPOTrainer:
             "loss": result.loss,
             "policy_loss": result.policy_loss,
             "kl_divergence": result.kl_divergence,
+            "learning_rate": result.learning_rate,
             "reward_mean": reward_mean,
             **reward_rate_stats,
             "response_tokens_total": response_tokens_total,
@@ -324,12 +350,7 @@ class GRPOTrainer:
                 reward=reward_values[0] if reward_values else 0.0,
             )
         if self.metrics_sink is not None:
-            self.metrics_sink.observe_step(
-                loss=result.loss,
-                reward_mean=reward_mean,
-                kl_mean=result.kl_divergence,
-                step_duration_seconds=step_duration_seconds,
-            )
+            self.metrics_sink.observe_step(payload)
             self.metrics_sink.push()
 
         return payload
@@ -429,33 +450,38 @@ class GRPOTrainer:
                 clip_ratio=self.grpo_config.clip_ratio,
             )
         )
-        loss, policy_loss, kl_divergence, response_tokens_total = loss_result
         self._log_stage(
             context,
             "loss_assembly",
             loss_seconds,
             {
-                "loss": float(loss.item()),
-                "policy_loss": float(policy_loss.item()),
-                "kl_divergence": float(kl_divergence.item()),
-                "response_tokens_total": response_tokens_total,
+                "loss": float(loss_result.loss.item()),
+                "policy_loss": float(loss_result.policy_loss.item()),
+                "kl_divergence": float(loss_result.kl_divergence.item()),
+                "response_tokens_total": loss_result.response_tokens_total,
+                "importance_sampling_ratio_mean": loss_result.importance_sampling_ratio_mean,
+                "importance_sampling_ratio_std": loss_result.importance_sampling_ratio_std,
+                "importance_sampling_ratio_min": loss_result.importance_sampling_ratio_min,
+                "importance_sampling_ratio_max": loss_result.importance_sampling_ratio_max,
+                "clip_fraction": loss_result.clip_fraction,
             },
         )
 
-        _, backward_seconds = self._measure(self._backward_step(loss))
+        _, backward_seconds = self._measure(self._backward_step(loss_result.loss))
         self._log_stage(
             context,
             "backward",
             backward_seconds,
-            {"loss": float(loss.item())},
+            {"loss": float(loss_result.loss.item())},
         )
 
         _, optimizer_seconds = self._measure(self.training_backend.optimizer.step)
+        learning_rate = float(self.training_backend.optimizer.param_groups[0]["lr"])
         self._log_stage(
             context,
             "optimizer",
             optimizer_seconds,
-            {"learning_rate": float(self.training_backend.optimizer.param_groups[0]["lr"])},
+            {"learning_rate": learning_rate},
         )
 
         _, sync_seconds = self._measure(
@@ -473,7 +499,7 @@ class GRPOTrainer:
         if context is not None:
             partial_step_seconds = sum(stage_timings.values())
             tokens_per_second = (
-                response_tokens_total / partial_step_seconds
+                loss_result.response_tokens_total / partial_step_seconds
                 if partial_step_seconds > 0.0
                 else 0.0
             )
@@ -488,11 +514,12 @@ class GRPOTrainer:
             )
 
         return OptimizationResult(
-            loss=float(loss.item()),
-            policy_loss=float(policy_loss.item()),
-            kl_divergence=float(kl_divergence.item()),
+            loss=float(loss_result.loss.item()),
+            policy_loss=float(loss_result.policy_loss.item()),
+            kl_divergence=float(loss_result.kl_divergence.item()),
+            learning_rate=learning_rate,
             stage_timings=stage_timings,
-            response_tokens_total=response_tokens_total,
+            response_tokens_total=loss_result.response_tokens_total,
             reference_active=reference_active,
         )
 
@@ -520,7 +547,7 @@ class GRPOTrainer:
         advantages: torch.Tensor,
         kl_coefficient: float,
         clip_ratio: float,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, int]:
+    ) -> LossAssemblyResult:
         """Assemble the response-only GRPO objective and count response tokens.
 
         We optimize the sampled response tokens with the paper-style GRPO split:
@@ -607,6 +634,25 @@ class GRPOTrainer:
         masked_surrogate = surrogate_objective * response_mask
         policy_loss = -masked_surrogate.sum() / response_token_count
 
+        ratio_values = ratio[response_mask_bool]
+        if ratio_values.numel() > 0:
+            importance_sampling_ratio_mean = float(ratio_values.mean().item())
+            importance_sampling_ratio_std = float(ratio_values.std(unbiased=False).item())
+            importance_sampling_ratio_min = float(ratio_values.min().item())
+            importance_sampling_ratio_max = float(ratio_values.max().item())
+            clip_fraction = float(
+                ((ratio_values < (1.0 - clip_ratio)) | (ratio_values > (1.0 + clip_ratio)))
+                .float()
+                .mean()
+                .item()
+            )
+        else:
+            importance_sampling_ratio_mean = 0.0
+            importance_sampling_ratio_std = 0.0
+            importance_sampling_ratio_min = 0.0
+            importance_sampling_ratio_max = 0.0
+            clip_fraction = 0.0
+
         # 5. Separate reference regularization term.
         if ref_logits is not None:
             reference_token_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
@@ -628,7 +674,17 @@ class GRPOTrainer:
 
         # 6. Final objective used for backprop.
         loss = policy_loss + kl_coefficient * kl_divergence
-        return loss, policy_loss, kl_divergence, response_tokens_total
+        return LossAssemblyResult(
+            loss=loss,
+            policy_loss=policy_loss,
+            kl_divergence=kl_divergence,
+            response_tokens_total=response_tokens_total,
+            importance_sampling_ratio_mean=importance_sampling_ratio_mean,
+            importance_sampling_ratio_std=importance_sampling_ratio_std,
+            importance_sampling_ratio_min=importance_sampling_ratio_min,
+            importance_sampling_ratio_max=importance_sampling_ratio_max,
+            clip_fraction=clip_fraction,
+        )
 
     def _backward_step(self, loss: torch.Tensor) -> Callable[[], None]:
         """Return the backward closure used in timing."""
@@ -809,7 +865,7 @@ class GRPOTrainer:
         if self.run_logger is not None:
             self.run_logger.log_step_stage(payload)
         if self.metrics_sink is not None:
-            self.metrics_sink.observe_stage(stage, latency_seconds)
+            self.metrics_sink.observe_stage(payload)
 
     def _install_serving_debug(self, context: StepContext) -> None:
         """Install serving live-rollout debug hooks for the current step when enabled."""
@@ -842,10 +898,7 @@ class GRPOTrainer:
             if self.run_logger is not None:
                 self.run_logger.log_serving_debug_done(payload)
             if self.metrics_sink is not None:
-                self.metrics_sink.observe_serving_debug(
-                    ttft_seconds=float(payload["ttft_seconds"]),
-                    tpot_seconds=float(payload["tpot_seconds"]),
-                )
+                self.metrics_sink.observe_serving_debug(payload)
 
     def _compute_advantages(
         self,

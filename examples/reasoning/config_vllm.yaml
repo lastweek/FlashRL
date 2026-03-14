@@ -1,3 +1,4 @@
+# FlashRL runtime/training profile only. Math-example knobs live in math.yaml.
 common:
   model_name: Qwen/Qwen2.5-1.5B
 
@@ -31,13 +32,17 @@ logging:
 
 metrics:
   enabled: true
-  pushgateway_url: http://localhost:9091
-  job_name: flashrl
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
 
 runtime:
   reference_enabled: false
 
 hooks:
   rollout_fn: examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: examples.reasoning.train:reasoning_reward_fn
-  dataset_fn: examples.reasoning.train:build_dataset
+  reward_fn: examples.reasoning.train:math_reward_fn
+  dataset_fn: examples.reasoning.train:build_math_train_dataset

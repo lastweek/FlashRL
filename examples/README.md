@@ -12,6 +12,7 @@ trains a base Qwen model with rule-based rewards, no system prompt, and a strict
 See [examples/reasoning/README.md](reasoning/README.md) for:
 
 - supported run modes
+- the split between `config*.yaml` and `math.yaml`
 - config differences
 - evaluation commands
 - environment variables
@@ -25,8 +26,8 @@ FlashRL YAML configs reference Python code with `module:attribute` strings:
 ```yaml
 hooks:
   rollout_fn: examples.reasoning.train:reasoning_rollout_fn
-  reward_fn: examples.reasoning.train:reasoning_reward_fn
-  dataset_fn: examples.reasoning.train:build_dataset
+  reward_fn: examples.reasoning.train:math_reward_fn
+  dataset_fn: examples.reasoning.train:build_math_train_dataset
 ```
 
 ## Managed vLLM Backend
@@ -59,9 +60,17 @@ source ./dev.sh
 
 ## Local Observability
 
-FlashRL ships with a small local `Grafana + Prometheus + Pushgateway` stack.
-Metrics are enabled by default and use best-effort Pushgateway pushes, so
-training still runs if the metrics stack is not available.
+TensorBoard is the default local metrics path. Each FlashRL run writes
+TensorBoard event files directly into its run directory under `logs/`.
+
+**Open TensorBoard:**
+```bash
+tensorboard --logdir logs
+```
+
+FlashRL also ships with a small optional `Grafana + Prometheus + Pushgateway`
+stack. Enable `metrics.pushgateway.enabled: true` in your run config when you
+want to publish the same training metrics into the local dashboard stack.
 
 **Start the stack:**
 ```bash

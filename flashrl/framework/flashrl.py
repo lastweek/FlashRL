@@ -28,7 +28,7 @@ from .config import (
 )
 from .data_models import Prompt, RewardOutput, RolloutOutput
 from .models.reference import ReferenceModel
-from .metrics import PrometheusMetricsSink
+from .metrics import MetricsSink, build_metrics_sink
 from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
@@ -207,7 +207,7 @@ class FlashRL:
         self._reward: UserDefinedReward | None = None
         self._trainer: GRPOTrainer | None = None
         self._run_logger: RunLogger | None = None
-        self._metrics_sink: PrometheusMetricsSink | None = None
+        self._metrics_sink: MetricsSink | None = None
         self._run_lifecycle_totals: dict[str, float] = {}
         self._runtime_bootstrap_events: list[dict[str, Any]] = []
         self._runtime_bootstrap_totals: dict[str, float] = {}
@@ -221,11 +221,10 @@ class FlashRL:
         self._last_runtime_error: str | None = None
         self._closed = False
 
-        if self.metrics_config.enabled:
-            self._metrics_sink = PrometheusMetricsSink(
-                self.metrics_config,
-                model_name=self.training_model_config.model_name,
-            )
+        self._metrics_sink = build_metrics_sink(
+            self.metrics_config,
+            model_name=self.training_model_config.model_name,
+        )
 
         self._initialize_runtime()
 
@@ -656,6 +655,8 @@ class FlashRL:
         if self._closed:
             return
         self._closed = True
+        if self._metrics_sink is not None:
+            self._metrics_sink.close()
         if self._run_logger is not None:
             self._run_logger.close()
             self._run_logger = None
@@ -742,6 +743,11 @@ class FlashRL:
         self._last_runtime_error = None
         self._runtime_phase = "Training"
         try:
+            if self._metrics_sink is not None:
+                self._metrics_sink.start_run(
+                    run_dir=self._run_logger.run_dir,
+                    run_id=self._run_logger.run_id,
+                )
             training_loop_started_at = time.perf_counter()
             self._trainer.train(dataset)
         except Exception as exc:
@@ -766,6 +772,8 @@ class FlashRL:
             )
             self._trainer.attach_run_logger(None)
             self._resume_from_checkpoint = False
+            if self._metrics_sink is not None:
+                self._metrics_sink.finish_run()
             if status == "completed":
                 self._runtime_phase = "Ready"
             if self._run_logger is not None:

@@ -68,6 +68,12 @@ FlashRL writes machine-readable per-run artifacts under `logs/` by default:
 - `console.log`
 - `rollouts.jsonl`
 
+TensorBoard is also enabled by default for framework runs:
+
+```bash
+tensorboard --logdir logs
+```
+
 To inspect them, open the unified static viewer in Chrome or Edge:
 
 ```bash
