@@ -7,7 +7,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from examples.reasoning.train import REASONING_PROMPTS, reasoning_reward_fn
+from examples.reasoning.train import reasoning_reward_fn, render_reasoning_prompt
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import TrainerConfig
@@ -35,6 +35,8 @@ def build_trainer(
     rollout_fn=None,
     reference=None,
     serving_backend=None,
+    seed: int = 42,
+    shuffle_each_epoch: bool = False,
 ) -> GRPOTrainer:
     """Build a small offline GRPO trainer for algorithm tests."""
     training_backend = TinyTrainingBackend(learning_rate=1e-2)
@@ -46,7 +48,12 @@ def build_trainer(
     )
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
     return GRPOTrainer(
-        config=TrainerConfig(batch_size=batch_size, max_epochs=1),
+        config=TrainerConfig(
+            batch_size=batch_size,
+            max_epochs=1,
+            seed=seed,
+            shuffle_each_epoch=shuffle_each_epoch,
+        ),
         grpo_config=GrpoConfig(
             group_size=group_size,
             clip_ratio=0.2,
@@ -84,6 +91,39 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
         ["prompt 2", "prompt 3"],
         ["prompt 4"],
         ["prompt 4"],
+    ]
+
+
+def test_grpo_shuffles_dataset_each_epoch_when_enabled() -> None:
+    """Trainer should reshuffle prompt order deterministically from the configured seed."""
+    prompt_batches: list[list[str]] = []
+    rollout_impl = make_rollout_fn(response_suffix="shuffle", repeat=1)
+
+    def rollout_fn(prompts, serving_backend):
+        prompt_batches.append([prompt.text for prompt in prompts])
+        return rollout_impl(prompts, serving_backend)
+
+    trainer = build_trainer(
+        batch_size=4,
+        group_size=2,
+        rollout_fn=rollout_fn,
+        seed=7,
+        shuffle_each_epoch=True,
+    )
+    trainer.config.max_epochs = 2
+    dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
+
+    trainer.train(dataset)
+
+    assert prompt_batches == [
+        ["prompt 3", "prompt 1"],
+        ["prompt 3", "prompt 1"],
+        ["prompt 0", "prompt 2"],
+        ["prompt 0", "prompt 2"],
+        ["prompt 0", "prompt 2"],
+        ["prompt 0", "prompt 2"],
+        ["prompt 3", "prompt 1"],
+        ["prompt 3", "prompt 1"],
     ]
 
 
@@ -294,12 +334,22 @@ def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
 def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
     """The example reward should separate GRPO candidates within one prompt group."""
     trainer = build_trainer(batch_size=4, group_size=4)
-    prompt_text = REASONING_PROMPTS[0]
+    prompt = Prompt(
+        text=render_reasoning_prompt("What is 15 + 27?"),
+        metadata={
+            "task_id": "gsm8k-train-000000",
+            "source": "gsm8k",
+            "split": "train",
+            "problem": "What is 15 + 27?",
+            "final_answer": "42",
+            "verifier": "numeric_exact",
+        },
+    )
     responses = [
-        "<reason>Add 15 and 27 to get 42 in the final line.</reason>\n42",
-        "<reason>Add 15 and 27 to get 41 in the final line.</reason>\n41",
-        "42",
-        "<reason>Add 15 and 27 and stop early\n42",
+        "<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
+        "<think>Add 15 and 27 to get 41.</think><answer>41</answer>",
+        "<think>Add 15 and 27 to get 42.</think><answer>42</answer>\nextra",
+        "<think>Add 15 and 27 to get 42.",
     ]
     rewards = [
         reasoning_reward_fn(
@@ -309,9 +359,13 @@ def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
                 prompt_token_ids=[1, 2, 3],
                 response_token_ids=[4, 5, 6],
                 response_token_logprobs=[-0.1, -0.1, -0.1],
+                metadata={
+                    "prompt_metadata": dict(prompt.metadata),
+                    "finish_reason": "length" if response == responses[-1] else "stop",
+                },
                 conversation=Conversation(
                     messages=[
-                        Message(role="user", content=prompt_text),
+                        Message(role="user", content=prompt.text),
                         Message(role="assistant", content=response),
                     ]
                 ),

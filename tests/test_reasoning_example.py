@@ -1,120 +1,258 @@
-"""Unit tests for the reasoning example reward design."""
+"""Unit tests for the strict reasoning example."""
 
 from __future__ import annotations
 
 import os
+from types import SimpleNamespace
 
 import pytest
 
-from examples.reasoning.train import (
-    REASONING_PROMPTS,
-    _extract_predicted_answer,
-    _prepare_example_environment,
-    _parse_expected_answer,
-    reasoning_reward_fn,
-)
-from flashrl.framework.data_models import Conversation, Message, RolloutOutput
+from examples.reasoning import train as reasoning_example
+from examples.reasoning.eval import evaluate_model
+from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
 
 pytestmark = pytest.mark.unit
 
 
-def make_rollout(prompt_text: str, response_text: str) -> RolloutOutput:
-    """Build a minimal rollout for reasoning reward tests."""
+def make_prompt(
+    *,
+    problem: str = "Janet has 15 apples and buys 27 more. How many apples does she have now?",
+    final_answer: str = "42",
+) -> Prompt:
+    """Build one strict reasoning prompt with GSM8K-style metadata."""
+    return Prompt(
+        text=reasoning_example.render_reasoning_prompt(problem),
+        metadata={
+            "task_id": "gsm8k-train-000000",
+            "source": "gsm8k",
+            "split": "train",
+            "problem": problem,
+            "final_answer": final_answer,
+            "verifier": "numeric_exact",
+        },
+    )
+
+
+def make_rollout(
+    prompt: Prompt,
+    response_text: str,
+    *,
+    finish_reason: str | None = None,
+) -> RolloutOutput:
+    """Build a minimal rollout with embedded prompt metadata."""
+    metadata = {"prompt_metadata": dict(prompt.metadata)}
+    if finish_reason is not None:
+        metadata["finish_reason"] = finish_reason
     return RolloutOutput(
         text=response_text,
         log_prob=-0.1,
         prompt_token_ids=[1, 2, 3],
         response_token_ids=[4, 5, 6],
         response_token_logprobs=[-0.1, -0.1, -0.1],
+        metadata=metadata,
         conversation=Conversation(
             messages=[
-                Message(role="user", content=prompt_text),
+                Message(role="user", content=prompt.text),
                 Message(role="assistant", content=response_text),
             ]
         ),
     )
 
 
-@pytest.mark.parametrize(
-    ("prompt_text", "expected_answer"),
-    [
-        (REASONING_PROMPTS[0], 42),
-        (REASONING_PROMPTS[1], 35),
-        (REASONING_PROMPTS[2], 13),
-        (REASONING_PROMPTS[3], 54),
-        (
-            "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I divide 24 by 3, what do I get?",
-            8,
-        ),
-    ],
-)
-def test_reasoning_prompt_parser_supports_all_committed_patterns(
-    prompt_text: str,
-    expected_answer: int,
+def test_render_reasoning_prompt_has_no_system_prompt_and_enforces_contract() -> None:
+    """The example prompt should be a user-only format contract."""
+    prompt = reasoning_example.render_reasoning_prompt("What is 15 + 27?")
+
+    assert "system" not in prompt.lower()
+    assert "<think>...</think>" in prompt
+    assert "<answer>...</answer>" in prompt
+    assert "Do not output any text before <think> or after </answer>." in prompt
+    assert "Problem: What is 15 + 27?" in prompt
+
+
+def test_build_dataset_loads_gsm8k_rows_into_prompt_metadata(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The example reward parser should understand every committed dataset prompt."""
-    assert _parse_expected_answer(prompt_text) == expected_answer
-
-
-def test_answer_extractor_prefers_final_line_then_falls_back_to_last_number() -> None:
-    """Final-line answers should win, with a deterministic whole-response fallback."""
-    assert _extract_predicted_answer("Work...\nFinal answer: 42") == 42
-    assert _extract_predicted_answer("We saw 3 and then 7 before stopping") == 7
-
-
-def test_reasoning_reward_gives_partial_credit_for_single_tag_presence() -> None:
-    """Malformed tag structure should still get partial structure reward."""
-    open_only = reasoning_reward_fn(make_rollout(REASONING_PROMPTS[0], "<reason> working"))
-    close_only = reasoning_reward_fn(make_rollout(REASONING_PROMPTS[0], "working </reason>"))
-
-    assert open_only.reward == pytest.approx(0.20)
-    assert close_only.reward == pytest.approx(0.20)
-    assert open_only.metadata["structure_score"] == pytest.approx(0.20)
-    assert close_only.metadata["structure_score"] == pytest.approx(0.20)
-
-
-def test_reasoning_reward_is_dense_and_structure_dominant() -> None:
-    """Structured outputs should score above unstructured ones even when wrong."""
-    prompt_text = REASONING_PROMPTS[0]
-    structured_correct = reasoning_reward_fn(
-        make_rollout(
-            prompt_text,
-            "<reason>Add 15 and 27 carefully to get 42 in the final line.</reason>\n42",
-        )
-    )
-    structured_wrong = reasoning_reward_fn(
-        make_rollout(
-            prompt_text,
-            "<reason>Add 15 and 27 carefully to get 41 in the final line.</reason>\n41",
-        )
-    )
-    correct_without_tags = reasoning_reward_fn(make_rollout(prompt_text, "42"))
-
-    assert structured_correct.reward == pytest.approx(1.0)
-    assert structured_wrong.reward > 0.0
-    assert correct_without_tags.reward > 0.0
-    assert structured_correct.reward > structured_wrong.reward
-    assert structured_correct.reward > correct_without_tags.reward
-    assert structured_wrong.reward > correct_without_tags.reward
-
-
-def test_reasoning_reward_metadata_explains_structure_and_correctness() -> None:
-    """Reward metadata should expose the parsed answers and score breakdown."""
-    reward = reasoning_reward_fn(
-        make_rollout(
-            "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I divide 24 by 3, what do I get?",
-            "<reason>24 divided by 3 is 8, so the answer is 8.</reason>\n8",
-        )
+    """Dataset building should render prompts and preserve verifier metadata."""
+    monkeypatch.setattr(
+        reasoning_example,
+        "_load_gsm8k_split",
+        lambda split, limit=None: [
+            {
+                "task_id": "gsm8k-train-000001",
+                "source": "gsm8k",
+                "split": split,
+                "problem": "What is 15 + 27?",
+                "final_answer": "42",
+            }
+        ],
     )
 
-    assert reward.metadata["expected_answer"] == 8
-    assert reward.metadata["predicted_answer"] == 8
-    assert reward.metadata["has_open_tag"] is True
-    assert reward.metadata["has_close_tag"] is True
-    assert reward.metadata["has_reason_content"] is True
-    assert reward.metadata["answer_parseable"] is True
-    assert reward.metadata["is_correct"] is True
-    assert reward.metadata["structure_score"] > reward.metadata["correctness_score"]
+    dataset = reasoning_example.build_dataset()
+
+    assert len(dataset) == 1
+    assert "Problem: What is 15 + 27?" in dataset[0].text
+    assert dataset[0].metadata == {
+        "task_id": "gsm8k-train-000001",
+        "source": "gsm8k",
+        "split": "train",
+        "problem": "What is 15 + 27?",
+        "final_answer": "42",
+        "verifier": "numeric_exact",
+    }
+
+
+def test_extract_ground_truth_answer_normalizes_gsm8k_final_answers() -> None:
+    """Ground-truth parsing should read the `####` target and normalize commas."""
+    assert reasoning_example._extract_ground_truth_answer("work\n#### 1,234") == "1234"
+    assert reasoning_example._extract_ground_truth_answer("work\n#### 42.0") == "42"
+
+
+def test_reasoning_reward_requires_single_well_formed_blocks() -> None:
+    """Only strict single-block formatting should receive the format bonus."""
+    prompt = make_prompt()
+
+    perfect = reasoning_example.reasoning_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
+        )
+    )
+    trailing = reasoning_example.reasoning_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think><answer>42</answer>\nextra",
+        )
+    )
+    duplicate_answer = reasoning_example.reasoning_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.</think><answer>42</answer><answer>42</answer>",
+        )
+    )
+
+    assert perfect.reward == pytest.approx(1.1)
+    assert perfect.metadata["accuracy_pass"] is True
+    assert perfect.metadata["format_pass"] is True
+    assert trailing.reward == pytest.approx(1.0)
+    assert trailing.metadata["accuracy_pass"] is True
+    assert trailing.metadata["format_pass"] is False
+    assert duplicate_answer.reward == pytest.approx(0.0)
+    assert duplicate_answer.metadata["answer_parse_pass"] is False
+    assert duplicate_answer.metadata["format_pass"] is False
+
+
+def test_reasoning_reward_marks_truncated_outputs_invalid_for_format() -> None:
+    """Length truncation should never receive the format reward."""
+    prompt = make_prompt()
+    reward = reasoning_example.reasoning_reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Add 15 and 27 to get 42.",
+            finish_reason="length",
+        )
+    )
+
+    assert reward.reward == pytest.approx(0.0)
+    assert reward.metadata["truncated"] is True
+    assert reward.metadata["format_pass"] is False
+    assert reward.metadata["accuracy_pass"] is False
+
+
+def test_extract_answer_block_requires_exactly_one_non_empty_block() -> None:
+    """Answer parsing should reject missing, empty, and duplicate blocks."""
+    assert reasoning_example._extract_answer_block("<answer>42</answer>") == "42"
+    assert reasoning_example._extract_answer_block("<answer> </answer>") is None
+    assert reasoning_example._extract_answer_block("42") is None
+    assert reasoning_example._extract_answer_block("<answer>1</answer><answer>2</answer>") is None
+
+
+def test_evaluate_model_reports_exact_match_format_and_truncation(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Held-out evaluation should reuse the strict reward parser and aggregate metrics."""
+    prompts = [
+        Prompt(
+            text=reasoning_example.render_reasoning_prompt("What is 15 + 27?"),
+            metadata={
+                "task_id": "gsm8k-test-000001",
+                "source": "gsm8k",
+                "split": "test",
+                "problem": "What is 15 + 27?",
+                "final_answer": "42",
+                "verifier": "numeric_exact",
+            },
+        ),
+        Prompt(
+            text=reasoning_example.render_reasoning_prompt("What is 12 + 15 + 8?"),
+            metadata={
+                "task_id": "gsm8k-test-000002",
+                "source": "gsm8k",
+                "split": "test",
+                "problem": "What is 12 + 15 + 8?",
+                "final_answer": "35",
+                "verifier": "numeric_exact",
+            },
+        ),
+    ]
+    monkeypatch.setattr("examples.reasoning.eval.build_eval_dataset", lambda limit=None: prompts[:limit])
+
+    class FakeServingBackend:
+        def __init__(self) -> None:
+            self.generation_defaults: dict[str, object] = {}
+
+        def set_generation_defaults(self, **kwargs) -> None:
+            self.generation_defaults = dict(kwargs)
+
+        def generate_batch(self, prompt_texts: list[str], **kwargs):
+            del kwargs
+            outputs = []
+            for index, prompt_text in enumerate(prompt_texts):
+                if "15 + 27" in prompt_text:
+                    outputs.append(
+                        SimpleNamespace(
+                            text="<think>Add 15 and 27 to get 42.</think><answer>42</answer>",
+                            prompt_token_ids=[1, 2, 3],
+                            response_token_ids=[4, 5, 6],
+                            response_token_logprobs=[-0.1, -0.1, -0.1],
+                            log_prob=-0.3,
+                            metadata={"finish_reason": "stop"},
+                        )
+                    )
+                else:
+                    outputs.append(
+                        SimpleNamespace(
+                            text="<think>Add 12 and 15 first.",
+                            prompt_token_ids=[1, 2, 3],
+                            response_token_ids=[4, 5, 6],
+                            response_token_logprobs=[-0.1, -0.1, -0.1],
+                            log_prob=-0.3,
+                            metadata={"finish_reason": "length"},
+                        )
+                    )
+            return outputs
+
+    flashrl = SimpleNamespace(
+        _serving_backend=FakeServingBackend(),
+        rollout_config=SimpleNamespace(max_new_tokens=64),
+    )
+
+    metrics = evaluate_model(flashrl, limit=2, batch_size=2)
+
+    assert flashrl._serving_backend.generation_defaults == {
+        "max_new_tokens": 64,
+        "temperature": 0.0,
+        "top_p": 1.0,
+        "top_k": 0,
+        "do_sample": False,
+    }
+    assert metrics == {
+        "sample_count": 2,
+        "reward_mean": pytest.approx(0.55),
+        "exact_match": pytest.approx(0.5),
+        "format_pass_rate": pytest.approx(0.5),
+        "truncation_rate": pytest.approx(0.5),
+    }
 
 
 def test_prepare_example_environment_sets_default_vllm_runtime(
@@ -127,7 +265,7 @@ def test_prepare_example_environment_sets_default_vllm_runtime(
         lambda: "/tmp/fake-vllm-python",
     )
 
-    _prepare_example_environment("examples/reasoning/config_vllm.yaml")
+    reasoning_example._prepare_example_environment("examples/reasoning/config_vllm.yaml")
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
 
@@ -142,6 +280,6 @@ def test_prepare_example_environment_leaves_non_vllm_configs_alone(
         lambda: "/tmp/fake-vllm-python",
     )
 
-    _prepare_example_environment("examples/reasoning/config.yaml")
+    reasoning_example._prepare_example_environment("examples/reasoning/config.yaml")
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ

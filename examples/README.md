@@ -1,90 +1,22 @@
 # FlashRL Examples
 
-Each example now lives in its own folder with:
-- `train.py` for the Python hooks and example entrypoint
-- `config.yaml` for the run configuration
+Examples live in their own folders and can include a training entrypoint,
+evaluation helpers, one or more YAML configs, and an example-specific README.
 
 ## Reasoning Example
 
-The reasoning example teaches a model to emit `<reason>` tags for step-by-step
-math answers.
+The reasoning example is a strict R1-Zero-style math prototype over GSM8K. It
+trains a base Qwen model with rule-based rewards, no system prompt, and a strict
+`<think>...</think><answer>...</answer>` output contract.
 
-**Folder:**
-```text
-examples/reasoning/
-├── train.py
-└── config.yaml
-```
+See [examples/reasoning/README.md](reasoning/README.md) for:
 
-**Run the example script:**
-```bash
-python3 -m examples.reasoning.train
-```
-
-**Run directly from YAML:**
-```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml
-```
-
-**Run with the managed `vllm` serving backend:**
-```bash
-python3 examples/reasoning/train.py --config examples/reasoning/config_vllm.yaml
-```
-
-**Or run the YAML entrypoint directly:**
-```bash
-python3 -m flashrl.framework.flashrl --config examples/reasoning/config_vllm.yaml
-```
-
-**Inspect runs after training:**
-```bash
-open docs/viewer.html
-```
-
-In Chrome or Edge, use the `Run History` workspace to open the default `logs/`
-folder and inspect run summaries, events, console logs, and grouped GRPO rollouts.
-Use the `Live Runtime` workspace when you want to connect to a running FlashRL
-admin endpoint and inspect serving state live.
-
-Older `.flashrl-runs/` directories can still be opened manually if you already
-have them.
-
-**What the YAML does:**
-- chooses shared defaults plus separate training and serving settings
-- configures grouped GRPO rollout and optimization
-- keeps logging in compact console mode
-- keeps metrics enabled by default
-- wires the rollout, reward, and dataset hooks through Python import strings
-- keeps the public rollout hook sample-oriented: one rollout per input prompt
-- treats `training.batch_size` as total sampled completions per optimizer step, so prompts per step are `batch_size / grpo.group_size`
-- supports `serving.debug_live_rollout: true` for slower token-level live serving debug with TTFT/TPOT capture
-- supports `serving.backend: vllm` for managed local `vllm serve` replicas launched from either the current FlashRL environment or a dedicated serving runtime selected via `serving.runtime_python`
-
-**Shared defaults with training/serving overrides:**
-```yaml
-common:
-  model_name: Qwen/Qwen2.5-0.5B-Instruct
-
-training:
-  num_threads: 1
-  batch_size: 4
-  max_epochs: 3
-
-serving:
-  num_threads: 1
-  debug_live_rollout: false
-
-grpo:
-  group_size: 2
-  clip_ratio: 0.2
-```
-
-**Example prompt:**
-```text
-Please solve this step by step. Use <reason> tags to show your reasoning.
-
-Question: What is 15 + 27?
-```
+- supported run modes
+- config differences
+- evaluation commands
+- environment variables
+- expected outputs and logs
+- troubleshooting
 
 ## YAML Hook Format
 
@@ -123,7 +55,6 @@ The repo helper can prepare a default dedicated runtime:
 ```bash
 ./dev.sh vllm setup
 source ./dev.sh
-python3 examples/reasoning/train.py --config examples/reasoning/config_vllm.yaml
 ```
 
 ## Local Observability
@@ -139,17 +70,17 @@ training still runs if the metrics stack is not available.
 
 `./dev.sh metrics up` waits until Grafana, Prometheus, and Pushgateway are endpoint-ready before reporting success.
 
-**Run the reasoning example:**
-```bash
-python3 -m examples.reasoning.train
-```
-
 **Open the dashboard:**
 - Grafana: `http://localhost:3000` (`admin` / `admin`)
 
 **Optional troubleshooting URLs:**
 - Prometheus: `http://localhost:9090`
 - Pushgateway: `http://localhost:9091`
+
+**Inspect FlashRL runs locally:**
+- open `docs/viewer.html` in Chrome or Edge
+- use the `Run History` workspace to inspect the default `logs/` directory
+- use the `Live Runtime` workspace to connect to a running admin endpoint
 
 **Stop or clear the stack:**
 ```bash

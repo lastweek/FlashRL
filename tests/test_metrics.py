@@ -1175,19 +1175,63 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     """The committed reasoning example YAML should run through FlashRL.from_yaml."""
     patch_backends(monkeypatch)
     monkeypatch.setattr(metrics_module, "push_to_gateway", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        reasoning_example,
+        "_load_gsm8k_split",
+        lambda split, limit=None: [
+            {
+                "task_id": f"gsm8k-{split}-000001",
+                "source": "gsm8k",
+                "split": split,
+                "problem": "What is 15 + 27?",
+                "final_answer": "42",
+            },
+            {
+                "task_id": f"gsm8k-{split}-000002",
+                "source": "gsm8k",
+                "split": split,
+                "problem": "What is 12 + 15 + 8?",
+                "final_answer": "35",
+            },
+            {
+                "task_id": f"gsm8k-{split}-000003",
+                "source": "gsm8k",
+                "split": split,
+                "problem": "What is 9 * 6?",
+                "final_answer": "54",
+            },
+            {
+                "task_id": f"gsm8k-{split}-000004",
+                "source": "gsm8k",
+                "split": split,
+                "problem": "If I divide 24 by 3, what do I get?",
+                "final_answer": "8",
+            },
+        ],
+    )
 
     def scripted_generate_batch(self, prompts: list[str], **kwargs):
         del kwargs
         outputs = []
         for prompt in prompts:
-            expected = reasoning_example._parse_expected_answer(prompt)
-            assert expected is not None
+            if "15 + 27" in prompt:
+                expected = "42"
+                wrong = "41"
+            elif "12 + 15 + 8" in prompt:
+                expected = "35"
+                wrong = "34"
+            elif "9 * 6" in prompt:
+                expected = "54"
+                wrong = "53"
+            else:
+                expected = "8"
+                wrong = "7"
             prompt_token_ids = self.tokenizer._encode(prompt, max_length=self.config.max_length)
             response_templates = [
-                f"<reason>Work through the arithmetic carefully and conclude the answer is {expected}.</reason>\n{expected}",
-                f"<reason>Work through the arithmetic carefully but conclude the answer is {int(expected) - 1}.</reason>\n{int(expected) - 1}",
-                f"{expected}",
-                f"<reason>Work through the arithmetic carefully and conclude the answer is {expected}\n{expected}",
+                f"<think>Work through the arithmetic carefully and conclude the answer is {expected}.</think><answer>{expected}</answer>",
+                f"<think>Work through the arithmetic carefully but conclude the answer is {wrong}.</think><answer>{wrong}</answer>",
+                f"<think>Work through the arithmetic carefully and conclude the answer is {expected}.</think><answer>{expected}</answer>\nextra",
+                f"<think>Work through the arithmetic carefully and conclude the answer is {expected}.",
             ]
             call_index = self._batch_call_index % len(response_templates)
             response = response_templates[call_index]
@@ -1207,7 +1251,9 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
                     response_token_ids=response_token_ids,
                     response_token_logprobs=response_token_logprobs,
                     log_prob=float(sum(response_token_logprobs)),
-                    metadata={},
+                    metadata={
+                        "finish_reason": "length" if response == response_templates[-1] else "stop",
+                    },
                 )
             )
         return outputs
@@ -1260,8 +1306,8 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     assert any(value > 0.0 for value in reward_values)
     assert any(abs(loss) > 1e-6 for loss in losses)
     assert any(
-        "structure_score" in candidate["reward"]["metadata"]
-        and "correctness_score" in candidate["reward"]["metadata"]
+        "accuracy_pass" in candidate["reward"]["metadata"]
+        and "format_pass" in candidate["reward"]["metadata"]
         for record in rollout_records
         for candidate in record["candidates"]
     )
@@ -1284,18 +1330,20 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("examples/reasoning/config_vllm.yaml").exists()
 
     docs = Path("examples/README.md").read_text(encoding="utf-8")
+    reasoning_docs = Path("examples/reasoning/README.md").read_text(encoding="utf-8")
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
-    assert "python3 -m examples.reasoning.train" in docs
-    assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in docs
-    assert "config_vllm.yaml" in docs
-    assert "model:" not in docs
-    assert "trainer:" not in docs
-    assert "common:" in docs
-    assert "training:" in docs
-    assert "serving:" in docs
-    assert "grpo:" in docs
+    assert "reasoning/README.md" in docs
     assert "http://localhost:3000" in docs
+    assert "python3 -m examples.reasoning.train" in reasoning_docs
+    assert "python3 -m flashrl.framework.flashrl --config examples/reasoning/config.yaml" in reasoning_docs
+    assert "config_vllm.yaml" in reasoning_docs
+    assert "model:" not in reasoning_docs
+    assert "trainer:" not in reasoning_docs
+    assert "common.model_name" in reasoning_docs
+    assert "training.batch_size" in reasoning_docs
+    assert "serving.backend" in reasoning_docs
+    assert "grpo.group_size" in reasoning_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs

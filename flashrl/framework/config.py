@@ -55,6 +55,8 @@ class TrainerConfig(BaseConfig):
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10
+    seed: int = 42
+    shuffle_each_epoch: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
@@ -178,6 +180,8 @@ class TrainingSectionConfig(CommonConfig):
     learning_rate: float = 1e-5
     batch_size: int = 32
     max_epochs: int = 10
+    seed: int = 42
+    shuffle_each_epoch: bool = True
 
 
 class ServingSectionConfig(CommonConfig):

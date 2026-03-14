@@ -1,5 +1,5 @@
 common:
-  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  model_name: Qwen/Qwen2.5-0.5B
 
 training:
   num_threads: 1

@@ -1,5 +1,5 @@
 common:
-  model_name: Qwen/Qwen2.5-0.5B-Instruct
+  model_name: Qwen/Qwen2.5-1.5B
 
 training:
   num_threads: 1
@@ -18,7 +18,7 @@ grpo:
   group_size: 2
   clip_ratio: 0.2
   kl_coefficient: 0.0
-  max_new_tokens: 256
+  max_new_tokens: 768
   temperature: 1.0
   top_p: 0.9
   top_k: 0

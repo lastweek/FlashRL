@@ -459,6 +459,7 @@ def test_flashrl_constructor_emits_bootstrap_stage_lines(
         reward_fn=reward_fn,
         batch_size=4,
         max_epochs=1,
+        shuffle_each_epoch=False,
         serving_config=flashrl_module.ServingConfig(
             model_name="fake/model",
             backend="vllm",
@@ -498,6 +499,7 @@ def test_flashrl_constructor_keeps_console_silent_when_disabled(
         reward_fn=reward_fn,
         batch_size=4,
         max_epochs=1,
+        shuffle_each_epoch=False,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1121,6 +1123,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
         reward_fn=reward_fn,
         batch_size=4,
         max_epochs=1,
+        shuffle_each_epoch=False,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1200,7 +1203,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         model_name="fake/model",
     )
     trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=4, max_epochs=1),
+        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.0),
         training_backend=training_backend,
         serving_backend=serving_backend,
@@ -1342,13 +1345,100 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     logger.close()
 
 
+def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
+    """Reward metadata booleans should be aggregated into per-step and per-epoch rates."""
+    training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
+    serving_backend = FakeServingBackend(config=None)
+    rollout = UserDefinedRollout(
+        rollout_fn=make_rollout_fn(response_suffix="rates", repeat=1),
+        serving_backend=serving_backend,
+        config=SimpleNamespace(),
+    )
+
+    def reward_with_metadata(rollout: RolloutOutput) -> RewardOutput:
+        is_first_candidate = rollout.text.endswith("::0")
+        return RewardOutput(
+            reward=1.0 if is_first_candidate else 0.0,
+            metadata={
+                "accuracy_pass": is_first_candidate,
+                "format_pass": True,
+                "truncated": not is_first_candidate,
+            },
+        )
+
+    logger = RunLogger(
+        LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+            console_mode="compact",
+        ),
+        model_name="fake/model",
+    )
+    trainer = GRPOTrainer(
+        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
+        grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.0),
+        training_backend=training_backend,
+        serving_backend=serving_backend,
+        reference=None,
+        reward_fn=UserDefinedReward(reward_fn=reward_with_metadata, config=SimpleNamespace()),
+        rollout_generator=rollout,
+        run_logger=logger,
+    )
+    dataset = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+
+    logger.start_run(
+        dataset_size=len(dataset),
+        batch_size=4,
+        max_epochs=1,
+        total_batches=1,
+        device="cpu",
+        dtype="float32",
+        cpu_threads=1,
+        runtime_shape="single-device-per-backend",
+        reference_enabled=False,
+        reference_device="auto",
+        group_size=2,
+        clip_ratio=0.2,
+        prompts_per_step=2,
+        steps_per_epoch=1,
+        total_planned_steps=1,
+        serving_backend="huggingface",
+        serving_device="cpu",
+    )
+    trainer.train(dataset)
+    logger.finish_run(status="completed", total_steps=trainer.total_steps)
+
+    events = read_events(logger.run_dir)
+    reward_event = next(
+        event
+        for event in events
+        if event["event"] == "step_stage" and event["payload"]["stage"] == "reward"
+    )
+    assert reward_event["payload"]["accuracy_pass_rate"] == pytest.approx(0.5)
+    assert reward_event["payload"]["format_pass_rate"] == pytest.approx(1.0)
+    assert reward_event["payload"]["truncation_rate"] == pytest.approx(0.5)
+
+    step_done = next(event for event in events if event["event"] == "step_done")
+    assert step_done["payload"]["accuracy_pass_rate"] == pytest.approx(0.5)
+    assert step_done["payload"]["format_pass_rate"] == pytest.approx(1.0)
+    assert step_done["payload"]["truncation_rate"] == pytest.approx(0.5)
+
+    epoch_summary = next(event for event in events if event["event"] == "epoch_summary")
+    assert epoch_summary["payload"]["accuracy_pass_rate"] == pytest.approx(0.5)
+    assert epoch_summary["payload"]["format_pass_rate"] == pytest.approx(1.0)
+    assert epoch_summary["payload"]["truncation_rate"] == pytest.approx(0.5)
+
+    logger.close()
+
+
 def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     """Loss assembly should use response-only GRPO terms and stored rollout log-probs."""
     training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
     serving_backend = FakeServingBackend(config=None)
     reference = FakeReferenceModel(config=None)
     trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=2, max_epochs=1),
+        config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(
             group_size=2,
             clip_ratio=0.2,
@@ -1509,7 +1599,7 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
     """GRPO advantages should be computed per prompt group, not across the whole flat batch."""
     trainer_serving_backend = FakeServingBackend(config=None)
     trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=4, max_epochs=1),
+        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2),
         training_backend=FakeTrainingBackend(config=None, learning_rate=1e-2),
         serving_backend=trainer_serving_backend,
@@ -1550,6 +1640,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
         reward_fn=reward_fn,
         batch_size=4,
         max_epochs=1,
+        shuffle_each_epoch=False,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=True,
@@ -1642,6 +1733,7 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
         reward_fn=reward_fn,
         batch_size=4,
         max_epochs=1,
+        shuffle_each_epoch=False,
         grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.1),
         reference_enabled=True,
         logging_config=LoggingConfig(
@@ -1693,6 +1785,7 @@ def test_flashrl_checkpoint_works_before_train_and_resume_skips_reset(
         reward_fn=reward_fn,
         batch_size=2,
         max_epochs=3,
+        shuffle_each_epoch=False,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1735,6 +1828,7 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
         reward_fn=failing_reward_fn,
         batch_size=2,
         max_epochs=1,
+        shuffle_each_epoch=False,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,

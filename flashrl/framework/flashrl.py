@@ -6,6 +6,7 @@ import argparse
 import importlib
 import math
 from pathlib import Path
+import random
 import sys
 import time
 from typing import Any, Callable, Sequence
@@ -126,6 +127,8 @@ class FlashRL:
         learning_rate: float = 1e-5,
         batch_size: int = 32,
         max_epochs: int = 10,
+        seed: int = 42,
+        shuffle_each_epoch: bool = True,
         clip_ratio: float = 0.2,
         kl_coefficient: float = 0.0,
         gamma: float = 1.0,
@@ -178,6 +181,8 @@ class FlashRL:
             learning_rate=learning_rate,
             batch_size=batch_size,
             max_epochs=max_epochs,
+            seed=seed,
+            shuffle_each_epoch=shuffle_each_epoch,
         )
         self.grpo_config = grpo_config or GrpoConfig(
             clip_ratio=clip_ratio,
@@ -223,6 +228,18 @@ class FlashRL:
             )
 
         self._initialize_runtime()
+
+    def _apply_random_seed(self) -> None:
+        """Apply the configured host-process RNG seed."""
+        random.seed(self.trainer_config.seed)
+        try:
+            import torch
+
+            torch.manual_seed(self.trainer_config.seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(self.trainer_config.seed)
+        except Exception:
+            return None
 
     def _bootstrap_console_enabled(self) -> bool:
         """Return whether live bootstrap console output should be emitted."""
@@ -282,6 +299,8 @@ class FlashRL:
             learning_rate=run_config.training.learning_rate,
             batch_size=run_config.training.batch_size,
             max_epochs=run_config.training.max_epochs,
+            seed=run_config.training.seed,
+            shuffle_each_epoch=run_config.training.shuffle_each_epoch,
         )
         rollout_fn = _resolve_import_string(run_config.hooks.rollout_fn)
         reward_fn = _resolve_import_string(run_config.hooks.reward_fn)
@@ -294,6 +313,8 @@ class FlashRL:
             learning_rate=trainer_config.learning_rate,
             batch_size=trainer_config.batch_size,
             max_epochs=trainer_config.max_epochs,
+            seed=trainer_config.seed,
+            shuffle_each_epoch=trainer_config.shuffle_each_epoch,
             device=training_model_config.device,
             dtype=training_model_config.dtype,
             max_length=training_model_config.max_length,
@@ -319,6 +340,7 @@ class FlashRL:
         self._runtime_bootstrap_events = []
         self._runtime_bootstrap_totals = {}
         startup_total_seconds = 0.0
+        self._apply_random_seed()
         self._emit_bootstrap_banner()
 
         self._emit_bootstrap_stage("training_backend", "starting")

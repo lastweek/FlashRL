@@ -9,7 +9,11 @@ from typing import Any
 
 import torch
 import torch.nn.functional as F
-from transformers import AutoModelForCausalLM, AutoTokenizer, TextIteratorStreamer
+from transformers import (
+    AutoModelForCausalLM,
+    AutoTokenizer,
+    TextIteratorStreamer,
+)
 
 from flashrl.framework.config import ModelConfig
 from flashrl.framework.models.device import get_device
@@ -142,6 +146,10 @@ class ActorModel:
                         [response_token_ids],
                         skip_special_tokens=True,
                     )[0]
+                    metadata = self._build_generation_metadata(
+                        response_token_ids=response_token_ids,
+                        generation_kwargs=generation_kwargs,
+                    )
                     candidates.append(
                         GeneratedSample(
                             text=text,
@@ -149,7 +157,7 @@ class ActorModel:
                             response_token_ids=response_token_ids,
                             response_token_logprobs=response_token_logprobs,
                             log_prob=float(sum(response_token_logprobs)),
-                            metadata={},
+                            metadata=metadata,
                         )
                     )
                 grouped_outputs.append(candidates)
@@ -389,8 +397,13 @@ class ActorModel:
                 "ttft_seconds": float(ttft_seconds),
                 "tpot_seconds": float(tpot_seconds),
                 "generation_seconds": float(generation_seconds),
-                "response_token_count": len(response_token_ids),
             }
+            metadata.update(
+                self._build_generation_metadata(
+                    response_token_ids=response_token_ids,
+                    generation_kwargs=generation_kwargs,
+                )
+            )
             self._emit_live_rollout_debug(
                 "done",
                 {
@@ -415,6 +428,40 @@ class ActorModel:
         if self._live_rollout_debug_callback is None:
             return
         self._live_rollout_debug_callback(kind, payload)
+
+    def _build_generation_metadata(
+        self,
+        *,
+        response_token_ids: list[int],
+        generation_kwargs: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Infer finish metadata from one generated sample."""
+        metadata: dict[str, Any] = {
+            "response_token_count": len(response_token_ids),
+        }
+        finish_reason = self._infer_finish_reason(
+            response_token_ids=response_token_ids,
+            generation_kwargs=generation_kwargs,
+        )
+        if finish_reason is not None:
+            metadata["finish_reason"] = finish_reason
+        return metadata
+
+    def _infer_finish_reason(
+        self,
+        *,
+        response_token_ids: list[int],
+        generation_kwargs: dict[str, Any],
+    ) -> str | None:
+        """Infer whether generation stopped normally or hit the length limit."""
+        eos_token_id = getattr(self.tokenizer, "eos_token_id", None)
+        if eos_token_id is not None and response_token_ids and response_token_ids[-1] == int(eos_token_id):
+            return "stop"
+
+        max_new_tokens = int(generation_kwargs.get("max_new_tokens", 0) or 0)
+        if max_new_tokens > 0 and len(response_token_ids) >= max_new_tokens:
+            return "length"
+        return None
 
     def to(self, device: torch.device) -> None:
         """Move model to device."""

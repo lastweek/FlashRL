@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import random
 import time
 from typing import TYPE_CHECKING, Any, Callable
 
@@ -137,6 +138,9 @@ class GRPOTrainer:
             epoch_number = epoch + 1
             epoch_started_at = time.perf_counter()
             epoch_step_payloads: list[dict[str, Any]] = []
+            epoch_dataset = list(dataset)
+            if self.config.shuffle_each_epoch and len(epoch_dataset) > 1:
+                random.Random(self.config.seed + epoch).shuffle(epoch_dataset)
 
             if self.run_logger is not None:
                 self.run_logger.log_epoch_start(
@@ -146,7 +150,7 @@ class GRPOTrainer:
                 )
 
             for batch_index, prompts in enumerate(
-                self._batch_prompts(dataset, prompts_per_step),
+                self._batch_prompts(epoch_dataset, prompts_per_step),
                 start=1,
             ):
                 next_step = self.total_steps + 1
@@ -215,6 +219,7 @@ class GRPOTrainer:
         rewards, reward_seconds = self._compute_rewards(context, grouped_prompts, rollouts)
         reward_values = [reward.reward for reward in rewards]
         reward_stats = self._summary_stats("reward", reward_values)
+        reward_rate_stats = self._reward_rate_stats(rewards)
         reward_per_item_mean_seconds = reward_seconds / len(rewards) if rewards else 0.0
         self._log_stage(
             context,
@@ -222,6 +227,7 @@ class GRPOTrainer:
             reward_seconds,
             {
                 **reward_stats,
+                **reward_rate_stats,
                 "reward_per_item_mean_seconds": reward_per_item_mean_seconds,
             },
         )
@@ -297,6 +303,7 @@ class GRPOTrainer:
             "policy_loss": result.policy_loss,
             "kl_divergence": result.kl_divergence,
             "reward_mean": reward_mean,
+            **reward_rate_stats,
             "response_tokens_total": response_tokens_total,
             "tokens_per_second": tokens_per_second,
             "step_duration_seconds": step_duration_seconds,
@@ -777,6 +784,10 @@ class GRPOTrainer:
             "tokens_per_second": self._mean([payload["tokens_per_second"] for payload in step_payloads]),
             "duration_seconds": duration_seconds,
             "stage_totals": stage_totals,
+            **self._mean_payload_metrics(
+                step_payloads,
+                ("accuracy_pass_rate", "format_pass_rate", "truncation_rate"),
+            ),
         }
 
     def _log_stage(
@@ -892,6 +903,37 @@ class GRPOTrainer:
             f"{prefix}_min": float(tensor.min().item()),
             f"{prefix}_max": float(tensor.max().item()),
         }
+
+    def _reward_rate_stats(self, rewards: list[RewardOutput]) -> dict[str, float]:
+        """Aggregate common boolean reward metadata into per-step rates."""
+        mappings = (
+            ("accuracy_pass", "accuracy_pass_rate"),
+            ("format_pass", "format_pass_rate"),
+            ("truncated", "truncation_rate"),
+        )
+        stats: dict[str, float] = {}
+        for source_key, target_key in mappings:
+            values = [
+                float(bool(reward.metadata[source_key]))
+                for reward in rewards
+                if source_key in reward.metadata
+            ]
+            if values:
+                stats[target_key] = self._mean(values)
+        return stats
+
+    def _mean_payload_metrics(
+        self,
+        payloads: list[dict[str, Any]],
+        keys: tuple[str, ...],
+    ) -> dict[str, float]:
+        """Average selected float payload metrics across a list of step payloads."""
+        result: dict[str, float] = {}
+        for key in keys:
+            values = [float(payload[key]) for payload in payloads if key in payload]
+            if values:
+                result[key] = self._mean(values)
+        return result
 
     def _accumulate_totals(
         self,

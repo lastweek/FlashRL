@@ -120,6 +120,20 @@ def test_actor_model_generate_batch_returns_structured_samples(
     assert all(len(sample.response_token_logprobs) == len(sample.response_token_ids) for sample in samples)
 
 
+def test_actor_model_generation_metadata_marks_eos_completion_as_stop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Actor metadata should infer a normal stop when generation ends at EOS."""
+    tiny_model, _ = patch_hf_loaders(monkeypatch, actor_module)
+
+    actor = ActorModel(ModelConfig(model_name="fake/model", device="cpu"))
+    samples = actor.generate_batch(["prompt"])
+
+    assert samples[0].metadata["finish_reason"] == "stop"
+    assert tiny_model.last_generate_kwargs is not None
+    assert "stopping_criteria" not in tiny_model.last_generate_kwargs
+
+
 def test_actor_model_debug_live_rollout_uses_sequential_path_and_emits_timings(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

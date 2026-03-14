@@ -793,12 +793,19 @@ class RunLogger:
                 f"response_tok {self._format_compact_ratio(payload['response_tokens_mean'], payload['response_tokens_max'])}"
             )
         if stage == "reward":
-            return (
+            details = (
                 f"mean {self._format_fixed(float(payload['reward_mean']), 4)}  "
                 f"std {self._format_fixed(float(payload['reward_std']), 4)}  "
                 f"min {self._format_compact_scalar(payload['reward_min'])}  "
                 f"max {self._format_compact_scalar(payload['reward_max'])}"
             )
+            if "accuracy_pass_rate" in payload:
+                details += f"  acc {self._format_fixed(float(payload['accuracy_pass_rate']), 2)}"
+            if "format_pass_rate" in payload:
+                details += f"  fmt {self._format_fixed(float(payload['format_pass_rate']), 2)}"
+            if "truncation_rate" in payload:
+                details += f"  trunc {self._format_fixed(float(payload['truncation_rate']), 2)}"
+            return details
         if stage == "advantage":
             return (
                 f"mean {self._format_fixed(float(payload['advantage_mean']), 4)}  "
@@ -849,6 +856,15 @@ class RunLogger:
                 f"duration {self._format_duration(float(payload['duration_seconds']))}"
             )
         ]
+        metric_suffix = []
+        if "accuracy_pass_rate" in payload:
+            metric_suffix.append(f"acc {self._format_fixed(float(payload['accuracy_pass_rate']), 2)}")
+        if "format_pass_rate" in payload:
+            metric_suffix.append(f"fmt {self._format_fixed(float(payload['format_pass_rate']), 2)}")
+        if "truncation_rate" in payload:
+            metric_suffix.append(f"trunc {self._format_fixed(float(payload['truncation_rate']), 2)}")
+        if metric_suffix:
+            lines[0] += "  " + "  ".join(metric_suffix)
         if payload["stage_totals"]:
             lines.append(
                 "  stages  "
@@ -948,6 +964,9 @@ class RunLogger:
                 "reward_std",
                 "reward_min",
                 "reward_max",
+                "accuracy_pass_rate",
+                "format_pass_rate",
+                "truncation_rate",
                 "reward_per_item_mean_seconds",
             ],
             "advantage": [

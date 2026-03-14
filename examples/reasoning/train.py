@@ -1,13 +1,16 @@
-"""DeepSeek-R1 style reasoning training example."""
+"""Strict R1-Zero style math training example backed by GSM8K."""
 
 from __future__ import annotations
 
 import argparse
+from decimal import Decimal, InvalidOperation
+from fractions import Fraction
 import os
 from pathlib import Path
 import re
 import shutil
 import sys
+from typing import Any
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
@@ -22,15 +25,161 @@ from flashrl.framework.data_models import (
 )
 
 
-REASONING_PROMPTS = [
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 15 + 27?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 12 + 15 + 8?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: If I have 20 items and give away 7, how many remain?",
-    "Please solve this step by step. Use <reason> tags to show your reasoning.\n\nQuestion: What is 9 × 6?",
-]
+GSM8K_DATASET_CANDIDATES = (
+    ("openai/gsm8k", "main"),
+    ("gsm8k", "main"),
+)
+FINAL_ANSWER_PATTERN = re.compile(r"####\s*(.+)$", re.MULTILINE)
+THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
+ANSWER_BLOCK_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
+STRICT_RESPONSE_PATTERN = re.compile(
+    r"^\s*<think>(?P<think>.*?)</think>\s*<answer>(?P<answer>.*?)</answer>\s*$",
+    re.IGNORECASE | re.DOTALL,
+)
 
-NUMBER_PATTERN = re.compile(r"-?\d+(?:\.\d+)?")
-REASON_BLOCK_PATTERN = re.compile(r"<reason>(.*?)</reason>", re.IGNORECASE | re.DOTALL)
+
+def render_reasoning_prompt(problem: str) -> str:
+    """Render one strict user prompt with no system role."""
+    return (
+        "Solve the following math problem.\n"
+        "Respond with exactly one <think>...</think> block followed immediately by "
+        "exactly one <answer>...</answer> block.\n"
+        "Put only the final answer inside <answer>.\n"
+        "Do not output any text before <think> or after </answer>.\n\n"
+        f"Problem: {problem.strip()}"
+    )
+
+
+def _normalize_answer_text(text: str) -> str:
+    """Normalize one answer string for exact-match comparison."""
+    value = str(text).strip()
+    value = value.replace("\u2212", "-")
+    value = re.sub(r"\s+", "", value)
+    value = value.replace(",", "")
+    value = value.replace("$", "")
+    value = value.rstrip(".")
+    if not value:
+        return ""
+
+    if re.fullmatch(r"-?\d+/\d+", value):
+        fraction = Fraction(value)
+        if fraction.denominator == 1:
+            return str(fraction.numerator)
+        return f"{fraction.numerator}/{fraction.denominator}"
+
+    try:
+        decimal_value = Decimal(value)
+    except InvalidOperation:
+        return value
+
+    normalized = format(decimal_value, "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".")
+    if normalized in {"", "-0"}:
+        return "0"
+    return normalized
+
+
+def _extract_ground_truth_answer(raw_answer: str) -> str:
+    """Extract and normalize the final GSM8K answer after the `####` marker."""
+    match = FINAL_ANSWER_PATTERN.search(raw_answer)
+    if match is None:
+        raise ValueError(f"GSM8K answer is missing a final '####' marker: {raw_answer[:80]!r}")
+    normalized = _normalize_answer_text(match.group(1))
+    if not normalized:
+        raise ValueError(f"GSM8K answer normalized to empty text: {raw_answer[:80]!r}")
+    return normalized
+
+
+def _dataset_limit_from_env(split: str) -> int | None:
+    """Read an optional dataset limit from environment variables."""
+    specific_key = f"FLASHRL_REASONING_{split.upper()}_LIMIT"
+    raw_value = os.environ.get(specific_key) or os.environ.get("FLASHRL_REASONING_DATASET_LIMIT")
+    if raw_value is None:
+        return None
+    limit = int(raw_value)
+    if limit < 1:
+        raise ValueError(f"{specific_key} must be >= 1 when set (got {limit}).")
+    return limit
+
+
+def _load_gsm8k_split(
+    split: str,
+    *,
+    limit: int | None = None,
+) -> list[dict[str, str]]:
+    """Load and normalize one GSM8K split."""
+    try:
+        from datasets import load_dataset
+    except ImportError as exc:  # pragma: no cover - exercised in live example usage
+        raise RuntimeError(
+            "examples.reasoning requires the `datasets` package to load GSM8K. "
+            "Install project dependencies or `pip install datasets`."
+        ) from exc
+
+    dataset_error: Exception | None = None
+    raw_dataset = None
+    for dataset_name, config_name in GSM8K_DATASET_CANDIDATES:
+        try:
+            raw_dataset = load_dataset(dataset_name, config_name, split=split)
+            break
+        except Exception as exc:  # pragma: no cover - depends on external dataset availability
+            dataset_error = exc
+    if raw_dataset is None:
+        raise RuntimeError("Unable to load GSM8K from Hugging Face.") from dataset_error
+
+    if limit is not None and hasattr(raw_dataset, "select"):
+        raw_dataset = raw_dataset.select(range(min(limit, len(raw_dataset))))
+
+    rows: list[dict[str, str]] = []
+    for index, row in enumerate(raw_dataset):
+        task_id = str(row.get("id") or f"gsm8k-{split}-{index:06d}")
+        problem = str(row["question"]).strip()
+        final_answer = _extract_ground_truth_answer(str(row["answer"]))
+        rows.append(
+            {
+                "task_id": task_id,
+                "source": "gsm8k",
+                "split": split,
+                "problem": problem,
+                "final_answer": final_answer,
+            }
+        )
+        if limit is not None and len(rows) >= limit:
+            break
+    return rows
+
+
+def _build_prompt_dataset(split: str, limit: int | None = None) -> list[Prompt]:
+    """Build one prompt dataset split with stable metadata."""
+    resolved_limit = _dataset_limit_from_env(split) if limit is None else limit
+    rows = _load_gsm8k_split(split, limit=resolved_limit)
+    prompts: list[Prompt] = []
+    for row in rows:
+        prompts.append(
+            Prompt(
+                text=render_reasoning_prompt(row["problem"]),
+                metadata={
+                    "task_id": row["task_id"],
+                    "source": row["source"],
+                    "split": row["split"],
+                    "problem": row["problem"],
+                    "final_answer": row["final_answer"],
+                    "verifier": "numeric_exact",
+                },
+            )
+        )
+    return prompts
+
+
+def build_dataset() -> list[Prompt]:
+    """Build the training split used by the YAML example."""
+    return _build_prompt_dataset("train")
+
+
+def build_eval_dataset(limit: int | None = None) -> list[Prompt]:
+    """Build the held-out evaluation split."""
+    return _build_prompt_dataset("test", limit=limit)
 
 
 def reasoning_rollout_fn(
@@ -48,7 +197,10 @@ def reasoning_rollout_fn(
                 prompt_token_ids=sample.prompt_token_ids,
                 response_token_ids=sample.response_token_ids,
                 response_token_logprobs=sample.response_token_logprobs,
-                metadata=dict(sample.metadata),
+                metadata={
+                    **dict(sample.metadata),
+                    "prompt_metadata": dict(prompt.metadata),
+                },
                 conversation=Conversation(
                     messages=[
                         Message(role="user", content=prompt.text),
@@ -60,163 +212,77 @@ def reasoning_rollout_fn(
     return rollouts
 
 
-def _normalize_number(value: float) -> int | float:
-    """Return integral values as ints so metadata stays readable."""
-    if float(value).is_integer():
-        return int(value)
-    return float(value)
+def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
+    """Recover the original prompt metadata attached by the rollout hook."""
+    prompt_metadata = rollout.metadata.get("prompt_metadata")
+    if isinstance(prompt_metadata, dict):
+        return prompt_metadata
+    return {}
 
 
-def _parse_number(text: str) -> int | float:
-    """Parse one numeric literal into an int or float."""
-    return _normalize_number(float(text))
-
-
-def _extract_question_text(prompt_text: str) -> str:
-    """Extract the arithmetic question from the full user prompt."""
-    _, separator, question = prompt_text.rpartition("Question:")
-    if separator:
-        return question.strip()
-    return prompt_text.strip()
-
-
-def _parse_expected_answer(prompt_text: str) -> int | float | None:
-    """Parse the expected arithmetic answer from the committed prompt patterns."""
-    question = _extract_question_text(prompt_text)
-    matchers = [
-        (
-            re.compile(r"What is (\d+) \+ (\d+) \+ (\d+)\?$"),
-            lambda match: int(match.group(1)) + int(match.group(2)) + int(match.group(3)),
-        ),
-        (
-            re.compile(r"What is (\d+) \+ (\d+)\?$"),
-            lambda match: int(match.group(1)) + int(match.group(2)),
-        ),
-        (
-            re.compile(r"What is (\d+) (?:×|x|\*) (\d+)\?$"),
-            lambda match: int(match.group(1)) * int(match.group(2)),
-        ),
-        (
-            re.compile(r"What is (\d+) - (\d+)\?$"),
-            lambda match: int(match.group(1)) - int(match.group(2)),
-        ),
-        (
-            re.compile(r"If I divide (\d+) by (\d+), what do I get\?$"),
-            lambda match: _normalize_number(int(match.group(1)) / int(match.group(2))),
-        ),
-        (
-            re.compile(r"If I have (\d+) apples and get (\d+) more, how many do I have\?$"),
-            lambda match: int(match.group(1)) + int(match.group(2)),
-        ),
-        (
-            re.compile(r"If I have (\d+) items and give away (\d+), how many remain\?$"),
-            lambda match: int(match.group(1)) - int(match.group(2)),
-        ),
-    ]
-
-    for pattern, resolver in matchers:
-        match = pattern.fullmatch(question)
-        if match is not None:
-            return resolver(match)
-    return None
-
-
-def _extract_predicted_answer(response_text: str) -> int | float | None:
-    """Extract the model's predicted final numeric answer deterministically."""
-    lines = [line.strip() for line in response_text.splitlines() if line.strip()]
-    candidates: list[str] = []
-    if lines:
-        candidates.append(lines[-1])
-
-    sentences = [
-        sentence.strip()
-        for sentence in re.split(r"(?<=[.!?])\s+", " ".join(lines or [response_text]))
-        if sentence.strip()
-    ]
-    if sentences:
-        candidates.append(sentences[-1])
-
-    for candidate in candidates:
-        numbers = NUMBER_PATTERN.findall(candidate)
-        if numbers:
-            return _parse_number(numbers[-1])
-
-    numbers = NUMBER_PATTERN.findall(response_text)
-    if numbers:
-        return _parse_number(numbers[-1])
-    return None
-
-
-def _prompt_text_from_rollout(rollout: RolloutOutput) -> str:
-    """Recover the original user prompt text from the rollout conversation."""
-    last_user_message = rollout.conversation.last_user_message()
-    if last_user_message is not None:
-        return last_user_message.content
-    for message in rollout.conversation.messages:
-        if message.role == "user":
-            return message.content
-    return ""
-
-
-def _numbers_equal(left: int | float | None, right: int | float | None) -> bool:
-    """Compare numeric answers with a small float tolerance."""
-    if left is None or right is None:
-        return False
-    return abs(float(left) - float(right)) < 1e-9
+def _extract_answer_block(response_text: str) -> str | None:
+    """Extract the single parsed answer block when one exists."""
+    matches = ANSWER_BLOCK_PATTERN.findall(response_text)
+    if len(matches) != 1:
+        return None
+    answer_text = matches[0].strip()
+    if not answer_text:
+        return None
+    return answer_text
 
 
 def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
-    """Reward reasoning structure heavily and arithmetic correctness second."""
+    """Compute strict format and exact-answer rewards from rollout metadata."""
     text = rollout.text
-    prompt_text = _prompt_text_from_rollout(rollout)
-    expected_answer = _parse_expected_answer(prompt_text)
-    predicted_answer = _extract_predicted_answer(text)
+    prompt_metadata = _prompt_metadata_from_rollout(rollout)
+    expected_answer = _normalize_answer_text(str(prompt_metadata.get("final_answer", "")))
+    finish_reason = rollout.metadata.get("finish_reason")
+    truncated = finish_reason == "length"
 
-    has_open_tag = "<reason>" in text.lower()
-    has_close_tag = "</reason>" in text.lower()
-    reason_match = REASON_BLOCK_PATTERN.search(text)
-    reason_content = reason_match.group(1).strip() if reason_match is not None else ""
-    has_reason_content = bool(reason_content)
+    think_blocks = THINK_BLOCK_PATTERN.findall(text)
+    answer_blocks = ANSWER_BLOCK_PATTERN.findall(text)
+    strict_match = STRICT_RESPONSE_PATTERN.fullmatch(text)
+    parsed_answer = _extract_answer_block(text)
+    normalized_answer = _normalize_answer_text(parsed_answer or "")
 
-    structure_score = 0.0
-    if has_open_tag:
-        structure_score += 0.20
-    if has_close_tag:
-        structure_score += 0.20
-    if has_reason_content:
-        structure_score += 0.20
-    if has_reason_content and len(reason_content.split()) >= 8:
-        structure_score += 0.10
+    has_single_think_block = len(think_blocks) == 1
+    has_single_answer_block = len(answer_blocks) == 1
+    think_content = strict_match.group("think").strip() if strict_match is not None else ""
+    answer_content = strict_match.group("answer").strip() if strict_match is not None else ""
+    format_pass = bool(
+        strict_match is not None
+        and has_single_think_block
+        and has_single_answer_block
+        and think_content
+        and answer_content
+        and not truncated
+    )
+    answer_parse_pass = has_single_answer_block and parsed_answer is not None
+    accuracy_pass = bool(answer_parse_pass and normalized_answer == expected_answer)
 
-    correctness_score = 0.0
-    if predicted_answer is not None:
-        correctness_score += 0.05
-    if _numbers_equal(predicted_answer, expected_answer):
-        correctness_score += 0.25
-
-    reward = min(structure_score + correctness_score, 1.0)
-    is_correct = _numbers_equal(predicted_answer, expected_answer)
+    reward = 0.0
+    if accuracy_pass:
+        reward += 1.0
+    if format_pass:
+        reward += 0.1
 
     return RewardOutput(
         reward=reward,
         metadata={
             "expected_answer": expected_answer,
-            "predicted_answer": predicted_answer,
-            "has_open_tag": has_open_tag,
-            "has_close_tag": has_close_tag,
-            "has_reason_content": has_reason_content,
-            "reason_content_length": len(reason_content),
-            "structure_score": structure_score,
-            "correctness_score": correctness_score,
-            "answer_parseable": predicted_answer is not None,
-            "is_correct": is_correct,
+            "parsed_answer": parsed_answer,
+            "normalized_answer": normalized_answer,
+            "answer_parse_pass": answer_parse_pass,
+            "accuracy_pass": accuracy_pass,
+            "format_pass": format_pass,
+            "truncated": truncated,
+            "finish_reason": finish_reason,
+            "think_block_count": len(think_blocks),
+            "answer_block_count": len(answer_blocks),
+            "think_char_count": len(think_content),
+            "answer_char_count": len(answer_content),
         },
     )
-
-
-def build_dataset() -> list[Prompt]:
-    """Build the fixed reasoning dataset used by this example."""
-    return [Prompt(text=prompt) for prompt in REASONING_PROMPTS]
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -224,7 +290,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run the FlashRL reasoning example.")
     parser.add_argument(
         "--config",
-        default=str(Path(__file__).with_name("config.yaml")),
+        default=str(Path(__file__).with_name("config_vllm.yaml")),
         help="Path to the example YAML config file.",
     )
     return parser
@@ -270,6 +336,7 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     _prepare_example_environment(args.config)
 
+    flashrl: FlashRL | None = None
     try:
         flashrl = FlashRL.from_yaml(args.config)
         flashrl.train()
@@ -277,11 +344,12 @@ def main(argv: list[str] | None = None) -> int:
     except Exception as exc:
         print(f"\nFlashRL reasoning example failed: {exc}", file=sys.stderr)
         print(
-            "\nNote: This example downloads 'Qwen/Qwen2.5-0.5B-Instruct'.",
+            "\nNote: This example loads a base Qwen checkpoint and the GSM8K dataset.",
             file=sys.stderr,
         )
         print(
-            "If you're offline or have network issues, use a local model in the YAML config.",
+            "If you're offline or have network issues, use a local model in the YAML config "
+            "and make sure Hugging Face dataset access is available.",
             file=sys.stderr,
         )
         print(
@@ -291,6 +359,9 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return 1
+    finally:
+        if flashrl is not None:
+            flashrl.close()
     return 0
 
 

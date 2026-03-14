@@ -495,7 +495,7 @@ class VLLMServingBackend(ServingBackend):
         group_size: int,
         generation_kwargs: dict[str, Any],
     ) -> dict[str, Any]:
-        return {
+        payload = {
             "model": self.config.model_name,
             "prompt": prompt,
             "n": int(group_size),
@@ -510,6 +510,7 @@ class VLLMServingBackend(ServingBackend):
             "return_token_ids": True,
             "stream": False,
         }
+        return payload
 
     def _parse_grouped_response(
         self,

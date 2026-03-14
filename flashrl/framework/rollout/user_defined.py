@@ -48,13 +48,14 @@ class UserDefinedRollout:
 
     def _generation_kwargs(self) -> dict[str, int | float | bool]:
         """Return generation defaults derived from rollout config."""
-        return {
+        generation_kwargs: dict[str, int | float | bool] = {
             "max_new_tokens": getattr(self.config, "max_new_tokens", 512),
             "temperature": getattr(self.config, "temperature", 1.0),
             "top_p": getattr(self.config, "top_p", 0.9),
             "top_k": getattr(self.config, "top_k", 0),
             "do_sample": getattr(self.config, "do_sample", True),
         }
+        return generation_kwargs
 
     def _apply_generation_defaults(self) -> None:
         """Apply generation defaults to the serving backend."""
