@@ -25,7 +25,7 @@ from flashrl.framework.data_models import (
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
-from flashrl.framework.run_logger import RunLogger
+from flashrl.framework.run_logger import RunLogger, _factor_shared_messages
 from flashrl.framework.training import TrainingBackend
 from flashrl.framework.trainer.grpo import GRPOTrainer
 
@@ -398,6 +398,183 @@ def read_rollouts(run_dir: Path) -> list[dict]:
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from terminal output."""
     return ANSI_ESCAPE_RE.sub("", text)
+
+
+def test_factor_shared_messages_extracts_common_prefix() -> None:
+    """Shared rollout context should be stored once per prompt group."""
+    messages = [
+        [
+            {"role": "system", "content": "shared system"},
+            {"role": "user", "content": "prompt 0"},
+            {"role": "assistant", "content": "answer a"},
+        ],
+        [
+            {"role": "system", "content": "shared system"},
+            {"role": "user", "content": "prompt 0"},
+            {"role": "assistant", "content": "answer b"},
+        ],
+    ]
+
+    shared, suffixes = _factor_shared_messages(messages)
+
+    assert shared == messages[0][:2]
+    assert suffixes == [[messages[0][2]], [messages[1][2]]]
+
+
+def test_factor_shared_messages_falls_back_without_common_prefix() -> None:
+    """Divergent transcripts should not be force-compacted."""
+    messages = [
+        [{"role": "user", "content": "prompt a"}],
+        [{"role": "assistant", "content": "answer b"}],
+    ]
+
+    shared, suffixes = _factor_shared_messages(messages)
+
+    assert shared == []
+    assert suffixes == messages
+
+
+def test_rollout_schema_v2_is_smaller_than_legacy_shape(tmp_path: Path) -> None:
+    """The compact rollout schema should serialize smaller than the legacy record."""
+    logger = RunLogger(
+        LoggingConfig(log_dir=tmp_path, console=False, file=True),
+        model_name="org/model-name",
+    )
+    prompt = Prompt(text="prompt 0", metadata={"task_id": "task-0", "source": "unit"})
+    rollouts = [
+        RolloutOutput(
+            text="first answer",
+            log_prob=-0.8,
+            prompt_token_ids=[1, 2, 3],
+            response_token_ids=[4, 5],
+            response_token_logprobs=[-0.4, -0.4],
+            conversation=Conversation(
+                messages=[
+                    Message(role="user", content="prompt 0"),
+                    Message(role="assistant", content="first answer"),
+                ]
+            ),
+            metadata={
+                "finish_reason": "stop",
+                "ttft_seconds": 0.1,
+                "tpot_seconds": 0.02,
+                "generation_seconds": 0.2,
+                "response_token_count": 2,
+                "prompt_metadata": {"task_id": "task-0", "source": "unit"},
+            },
+        ),
+        RolloutOutput(
+            text="second answer",
+            log_prob=-1.2,
+            prompt_token_ids=[1, 2, 3],
+            response_token_ids=[6, 7, 8],
+            response_token_logprobs=[-0.4, -0.4, -0.4],
+            conversation=Conversation(
+                messages=[
+                    Message(role="user", content="prompt 0"),
+                    Message(role="assistant", content="second answer"),
+                ]
+            ),
+            metadata={
+                "finish_reason": "length",
+                "ttft_seconds": 0.15,
+                "tpot_seconds": 0.03,
+                "generation_seconds": 0.45,
+                "response_token_count": 3,
+                "prompt_metadata": {"task_id": "task-0", "source": "unit"},
+            },
+        ),
+    ]
+    rewards = [
+        RewardOutput(
+            reward=1.0,
+            metadata={
+                "pass_rate": 1.0,
+                "passed_tests": 5,
+                "total_tests": 5,
+                "accuracy_pass": True,
+                "format_pass": True,
+                "truncated": False,
+                "execution_seconds": 0.12,
+                "failure_reason": None,
+                "checker_used": True,
+                "execution_status": "passed",
+                "code_preview": "print(1)",
+            },
+        ),
+        RewardOutput(
+            reward=0.25,
+            metadata={
+                "pass_rate": 0.2,
+                "passed_tests": 1,
+                "total_tests": 5,
+                "accuracy_pass": False,
+                "format_pass": True,
+                "truncated": True,
+                "execution_seconds": 0.3,
+                "failure_reason": "wrong_answer",
+                "checker_used": True,
+                "execution_status": "failed",
+                "code_preview": "print(2)",
+            },
+        ),
+    ]
+
+    logger.log_rollout_batch(
+        step=1,
+        epoch=1,
+        batch_index=1,
+        batches_in_epoch=1,
+        prompts=[prompt, prompt],
+        rollouts=rollouts,
+        rewards=rewards,
+        prompt_indices=[0, 0],
+        candidate_indices=[0, 1],
+        group_size=2,
+        prompt_count=1,
+    )
+
+    v2_record = read_rollouts(logger.run_dir)[0]
+    legacy_record = {
+        "run_id": logger.run_id,
+        "run_index": logger.run_index,
+        "step": 1,
+        "epoch": 1,
+        "batch_index": 1,
+        "batches_in_epoch": 1,
+        "prompt_index": 0,
+        "group_size": 2,
+        "prompt_count": 1,
+        "sample_count": 2,
+        "prompt": {
+            "text": prompt.text,
+            "metadata": prompt.metadata,
+        },
+        "candidates": [
+            {
+                "candidate_index": candidate_index,
+                "rollout": {
+                    "response_text": rollout.text,
+                    "log_prob": rollout.log_prob,
+                    "prompt_token_count": len(rollout.prompt_token_ids),
+                    "response_token_count": len(rollout.response_token_ids),
+                    "metadata": rollout.metadata,
+                },
+                "conversation": rollout.conversation.model_dump(mode="json"),
+                "reward": {
+                    "value": reward.reward,
+                    "metadata": reward.metadata,
+                },
+            }
+            for candidate_index, rollout, reward in zip([0, 1], rollouts, rewards, strict=True)
+        ],
+    }
+
+    assert len(json.dumps(v2_record, ensure_ascii=True)) < len(
+        json.dumps(legacy_record, ensure_ascii=True)
+    )
+
+    logger.close()
 
 
 def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
@@ -1125,6 +1302,7 @@ def test_static_viewer_exists_and_contains_run_history_sections() -> None:
     assert "Open run folder" in html
     assert ".flashrl-runs" not in html
     assert "logs/" in html
+    assert "schema_version" in html
     assert "showDirectoryPicker" in html
     assert "Run List" in html
     assert "Overview" in html
@@ -1133,6 +1311,8 @@ def test_static_viewer_exists_and_contains_run_history_sections() -> None:
     assert "Rollouts" in html
     assert "Live Runtime" in html
     assert "Run History" in html
+    assert "shared_messages" in html
+    assert "completion_messages" in html
     assert "step-filter" in html
     assert "epoch-filter" in html
     assert "events.jsonl" in html
@@ -1402,19 +1582,27 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert first_rollout["run_index"] == logger.run_index
     assert first_rollout["step"] == 1
     assert first_rollout["prompt_index"] == 0
+    assert first_rollout["schema_version"] == 2
     assert first_rollout["group_size"] == 2
     assert first_rollout["prompt_count"] == 2
-    assert first_rollout["sample_count"] == 4
-    assert first_rollout["prompt"]["text"] == "prompt 0"
+    assert first_rollout["candidate_count"] == 2
+    assert first_rollout["batch_candidate_count"] == 4
+    assert first_rollout["input"]["prompt_preview"] == "prompt 0"
+    assert first_rollout["input"]["prompt_token_count"] > 0
+    assert first_rollout["input"]["shared_messages"][0]["content"] == "prompt 0"
+    assert first_rollout["summary"]["reward_mean"] > 0.0
     assert "sample_index" not in first_rollout
+    assert "sample_count" not in first_rollout
+    assert "prompt" not in first_rollout
     assert len(first_rollout["candidates"]) == 2
     assert [candidate["candidate_index"] for candidate in first_rollout["candidates"]] == [0, 1]
     first_candidate = first_rollout["candidates"][0]
-    assert first_candidate["rollout"]["response_text"].startswith("sample detail")
-    assert first_candidate["rollout"]["prompt_token_count"] > 0
-    assert first_candidate["rollout"]["response_token_count"] > 0
-    assert first_candidate["conversation"]["messages"][0]["role"] == "user"
-    assert first_candidate["conversation"]["messages"][1]["role"] == "assistant"
+    assert first_candidate["output"]["preview"].startswith("sample detail")
+    assert first_candidate["output"]["response_token_count"] > 0
+    assert first_candidate["output"]["avg_log_prob_per_token"] is not None
+    assert first_candidate["completion_messages"][0]["role"] == "assistant"
+    assert "rollout" not in first_candidate
+    assert "conversation" not in first_candidate
     assert first_candidate["reward"]["value"] > 0.0
 
     logger.close()
@@ -1792,9 +1980,10 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
 
     rollouts = read_rollouts(trainer._run_logger.run_dir)
     assert len(rollouts) == len(dataset)
-    assert rollouts[0]["prompt"]["text"] == "prompt 0"
+    assert rollouts[0]["schema_version"] == 2
+    assert rollouts[0]["input"]["prompt_preview"] == "prompt 0"
     assert rollouts[0]["candidates"][0]["reward"]["value"] > 0.0
-    assert rollouts[0]["candidates"][0]["conversation"]["messages"][0]["content"] == "prompt 0"
+    assert rollouts[0]["input"]["shared_messages"][0]["content"] == "prompt 0"
     assert rollouts[0]["prompt_index"] == 0
     assert rollouts[0]["candidates"][0]["candidate_index"] == 0
     assert "sample_index" not in rollouts[0]

@@ -190,8 +190,9 @@ code     task=codeforces-train-1000A  tests=1/1  pass_rate=1.00  format=ok  rewa
 preview  import sys | print(sum(map(int, sys.stdin.read().split())))
 ```
 
-This example also stores `execution_status` and `code_preview` in reward
-metadata, so the same summary is visible later in `rollouts.jsonl`.
+This example also promotes `execution_status`, `code_preview`, `pass_rate`,
+`failure_reason`, and related checker fields into the candidate reward block in
+`rollouts.jsonl`, with uncommon leftovers kept under `reward.metadata`.
 
 ## Sandbox Notes
 

@@ -1792,8 +1792,8 @@ def test_flashrl_yaml_serving_debug_live_rollout_wires_events_artifacts_and_metr
     assert "  candidate " not in transcript
     assert "serve step=" not in transcript
     assert any(
-        "ttft_seconds" in candidate["rollout"]["metadata"]
-        and "tpot_seconds" in candidate["rollout"]["metadata"]
+        candidate["output"]["ttft_seconds"] == pytest.approx(0.1)
+        and candidate["output"]["tpot_seconds"] == pytest.approx(0.02)
         for record in rollout_records
         for candidate in record["candidates"]
     )
@@ -1968,8 +1968,11 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     assert any(value > 0.0 for value in reward_values)
     assert any(abs(loss) > 1e-6 for loss in losses)
     assert any(
-        "accuracy_pass" in candidate["reward"]["metadata"]
-        and "format_pass" in candidate["reward"]["metadata"]
+        candidate["reward"]["accuracy_pass"] is not None
+        and candidate["reward"]["format_pass"] is not None
+        and candidate["reward"]["pass_rate"] is not None
+        and candidate["output"]["finish_reason"] is not None
+        and candidate["output"]["avg_log_prob_per_token"] is not None
         for record in rollout_records
         for candidate in record["candidates"]
     )

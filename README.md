@@ -71,6 +71,11 @@ FlashRL writes machine-readable per-run artifacts under `logs/` by default:
 - `console.log`
 - `rollouts.jsonl`
 
+`rollouts.jsonl` is a grouped prompt-major artifact. It stores shared input
+messages once per prompt group, candidate completion messages separately, and
+promotes common quality/performance stats into first-class fields for easier
+inspection.
+
 TensorBoard is also enabled by default for framework runs:
 
 ```bash

@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import fcntl
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -36,6 +37,37 @@ PROMPT_MAX_CHARS = 320
 PROMPT_GIST_MAX_CHARS = 96
 SECTION_SEPARATOR = "  " + ("=" * 72)
 STEP_SEPARATOR = "  " + ("-" * 72)
+ROLLOUT_SCHEMA_VERSION = 2
+
+PROMOTED_PROMPT_METADATA_KEYS = (
+    "task_id",
+    "source",
+    "split",
+    "language",
+    "rating",
+    "verifier",
+)
+PROMOTED_REWARD_METADATA_KEYS = (
+    "pass_rate",
+    "passed_tests",
+    "total_tests",
+    "accuracy_pass",
+    "format_pass",
+    "truncated",
+    "execution_seconds",
+    "failure_reason",
+    "checker_used",
+    "execution_status",
+    "code_preview",
+)
+PROMOTED_OUTPUT_METADATA_KEYS = (
+    "finish_reason",
+    "stop_reason",
+    "ttft_seconds",
+    "tpot_seconds",
+    "generation_seconds",
+    "response_token_count",
+)
 
 ANSI_RESET = "\033[0m"
 ANSI_STYLES = {
@@ -80,6 +112,187 @@ def _allocate_run_index(log_dir: Path) -> int:
 def _format_run_index(run_index: int) -> str:
     """Format a run index with stable zero padding."""
     return f"{run_index:0{RUN_INDEX_WIDTH}d}"
+
+
+def _clone_json_mapping(value: Any) -> dict[str, Any]:
+    """Return a shallow dict copy for JSON-like mappings."""
+    if isinstance(value, dict):
+        return dict(value)
+    return {}
+
+
+def _clone_json_messages(messages: Any) -> list[dict[str, Any]]:
+    """Return a list of shallow-copied JSON-like messages."""
+    if not isinstance(messages, list):
+        return []
+    return [dict(message) for message in messages if isinstance(message, dict)]
+
+
+def _promote_metadata_fields(
+    metadata: dict[str, Any],
+    promoted_keys: tuple[str, ...],
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Split a metadata mapping into promoted and leftover fields."""
+    promoted: dict[str, Any] = {}
+    leftovers: dict[str, Any] = {}
+    for key, value in metadata.items():
+        if key in promoted_keys:
+            promoted[key] = value
+            continue
+        leftovers[key] = value
+    return promoted, leftovers
+
+
+def _factor_shared_messages(
+    message_groups: list[list[dict[str, Any]]],
+) -> tuple[list[dict[str, Any]], list[list[dict[str, Any]]]]:
+    """Extract the longest shared message prefix across candidate transcripts."""
+    if not message_groups:
+        return [], []
+
+    prefix_length = min(len(messages) for messages in message_groups)
+    shared_length = 0
+    while shared_length < prefix_length:
+        candidate = message_groups[0][shared_length]
+        if any(messages[shared_length] != candidate for messages in message_groups[1:]):
+            break
+        shared_length += 1
+
+    if shared_length == 0:
+        return [], [_clone_json_messages(messages) for messages in message_groups]
+
+    return (
+        _clone_json_messages(message_groups[0][:shared_length]),
+        [_clone_json_messages(messages[shared_length:]) for messages in message_groups],
+    )
+
+
+def _derive_log_prob_stats(
+    *,
+    log_prob: float,
+    response_token_count: int,
+    prompt_token_count: int,
+) -> dict[str, float | None]:
+    """Compute normalized rollout confidence and length ratios."""
+    avg_log_prob_per_token: float | None = None
+    avg_token_prob: float | None = None
+    if response_token_count > 0:
+        avg_log_prob_per_token = float(log_prob / response_token_count)
+        avg_token_prob = float(math.exp(avg_log_prob_per_token))
+
+    output_to_prompt_token_ratio: float | None = None
+    if prompt_token_count > 0:
+        output_to_prompt_token_ratio = float(response_token_count / prompt_token_count)
+
+    return {
+        "avg_log_prob_per_token": avg_log_prob_per_token,
+        "avg_token_prob": avg_token_prob,
+        "output_to_prompt_token_ratio": output_to_prompt_token_ratio,
+    }
+
+
+def _candidate_is_solved(reward: dict[str, Any]) -> bool:
+    """Infer whether one candidate solved the task from promoted reward fields."""
+    accuracy_pass = reward.get("accuracy_pass")
+    if accuracy_pass is not None:
+        return bool(accuracy_pass)
+
+    passed_tests = reward.get("passed_tests")
+    total_tests = reward.get("total_tests")
+    if isinstance(passed_tests, int) and isinstance(total_tests, int) and total_tests > 0:
+        return passed_tests == total_tests
+
+    pass_rate = reward.get("pass_rate")
+    if isinstance(pass_rate, (int, float)):
+        return float(pass_rate) >= 1.0
+
+    return False
+
+
+def _derive_rollout_summary(candidates: list[dict[str, Any]]) -> dict[str, Any]:
+    """Compute prompt-group summary stats from serialized candidates."""
+    if not candidates:
+        return {
+            "reward_mean": 0.0,
+            "reward_max": 0.0,
+            "reward_min": 0.0,
+            "reward_span": 0.0,
+            "best_candidate_index": None,
+            "fastest_candidate_index": None,
+            "longest_candidate_index": None,
+            "format_pass_count": 0,
+            "accuracy_pass_count": 0,
+            "truncated_count": 0,
+            "solved_count": 0,
+            "avg_pass_rate": None,
+            "avg_generation_seconds": None,
+            "avg_log_prob_per_token": None,
+        }
+
+    reward_values = [float(candidate["reward"]["value"]) for candidate in candidates]
+    generation_pairs = [
+        (float(candidate["output"]["generation_seconds"]), int(candidate["candidate_index"]))
+        for candidate in candidates
+        if isinstance(candidate["output"].get("generation_seconds"), (int, float))
+    ]
+    longest_pairs = [
+        (int(candidate["output"]["response_token_count"]), int(candidate["candidate_index"]))
+        for candidate in candidates
+    ]
+    avg_pass_rates = [
+        float(candidate["reward"]["pass_rate"])
+        for candidate in candidates
+        if isinstance(candidate["reward"].get("pass_rate"), (int, float))
+    ]
+    avg_generation_seconds = [
+        float(candidate["output"]["generation_seconds"])
+        for candidate in candidates
+        if isinstance(candidate["output"].get("generation_seconds"), (int, float))
+    ]
+    avg_log_probs = [
+        float(candidate["output"]["avg_log_prob_per_token"])
+        for candidate in candidates
+        if isinstance(candidate["output"].get("avg_log_prob_per_token"), (int, float))
+    ]
+
+    best_candidate = max(
+        (
+            (float(candidate["reward"]["value"]), -int(candidate["candidate_index"]))
+            for candidate in candidates
+        ),
+        default=(0.0, 0),
+    )
+
+    return {
+        "reward_mean": float(sum(reward_values) / len(reward_values)),
+        "reward_max": max(reward_values),
+        "reward_min": min(reward_values),
+        "reward_span": max(reward_values) - min(reward_values),
+        "best_candidate_index": int(-best_candidate[1]),
+        "fastest_candidate_index": (
+            min(generation_pairs)[1] if generation_pairs else None
+        ),
+        "longest_candidate_index": (
+            max(longest_pairs)[1] if longest_pairs else None
+        ),
+        "format_pass_count": sum(bool(candidate["reward"].get("format_pass")) for candidate in candidates),
+        "accuracy_pass_count": sum(
+            bool(candidate["reward"].get("accuracy_pass")) for candidate in candidates
+        ),
+        "truncated_count": sum(bool(candidate["reward"].get("truncated")) for candidate in candidates),
+        "solved_count": sum(_candidate_is_solved(candidate["reward"]) for candidate in candidates),
+        "avg_pass_rate": (
+            float(sum(avg_pass_rates) / len(avg_pass_rates)) if avg_pass_rates else None
+        ),
+        "avg_generation_seconds": (
+            float(sum(avg_generation_seconds) / len(avg_generation_seconds))
+            if avg_generation_seconds
+            else None
+        ),
+        "avg_log_prob_per_token": (
+            float(sum(avg_log_probs) / len(avg_log_probs)) if avg_log_probs else None
+        ),
+    }
 
 
 class RunLogger:
@@ -391,7 +604,7 @@ class RunLogger:
         prompt_count: int,
     ) -> None:
         """Persist one full-fidelity grouped rollout record per unique prompt."""
-        sample_count = len(prompts)
+        batch_candidate_count = len(prompts)
         grouped_records: dict[int, dict[str, Any]] = {}
         for prompt, rollout, reward, prompt_index, candidate_index in zip(
             prompts,
@@ -404,45 +617,197 @@ class RunLogger:
             record = grouped_records.setdefault(
                 prompt_index,
                 {
-                    "run_id": self.run_id,
-                    "run_index": self.run_index,
-                    "step": step,
-                    "epoch": epoch,
-                    "batch_index": batch_index,
-                    "batches_in_epoch": batches_in_epoch,
-                    "prompt_index": prompt_index,
-                    "group_size": group_size,
-                    "prompt_count": prompt_count,
-                    "sample_count": sample_count,
-                    "prompt": {
-                        "text": prompt.text,
-                        "metadata": self._serialize_for_json(prompt.metadata),
-                    },
+                    "prompt": prompt,
                     "candidates": [],
                 },
             )
             record["candidates"].append(
                 {
                     "candidate_index": candidate_index,
-                    "rollout": {
-                        "response_text": rollout.text,
-                        "log_prob": rollout.log_prob,
-                        "prompt_token_count": len(getattr(rollout, "prompt_token_ids", [])),
-                        "response_token_count": len(getattr(rollout, "response_token_ids", [])),
-                        "metadata": self._serialize_for_json(rollout.metadata),
-                    },
-                    "conversation": self._serialize_for_json(rollout.conversation),
-                    "reward": {
-                        "value": reward.reward,
-                        "metadata": self._serialize_for_json(reward.metadata),
-                    },
+                    "rollout": rollout,
+                    "reward": reward,
                 }
             )
 
         for prompt_index in sorted(grouped_records):
             record = grouped_records[prompt_index]
             record["candidates"].sort(key=lambda candidate: int(candidate["candidate_index"]))
-            self._emit_rollout_record(record)
+            self._emit_rollout_record(
+                self._build_rollout_record(
+                    step=step,
+                    epoch=epoch,
+                    batch_index=batch_index,
+                    batches_in_epoch=batches_in_epoch,
+                    prompt_index=prompt_index,
+                    prompt_count=prompt_count,
+                    group_size=group_size,
+                    batch_candidate_count=batch_candidate_count,
+                    prompt=record["prompt"],
+                    candidates=record["candidates"],
+                )
+            )
+
+    def _build_rollout_record(
+        self,
+        *,
+        step: int,
+        epoch: int,
+        batch_index: int,
+        batches_in_epoch: int,
+        prompt_index: int,
+        prompt_count: int,
+        group_size: int,
+        batch_candidate_count: int,
+        prompt: Any,
+        candidates: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Serialize one prompt-group rollout record in schema v2."""
+        prompt_text = str(getattr(prompt, "text", ""))
+        prompt_metadata = _clone_json_mapping(self._serialize_for_json(getattr(prompt, "metadata", {})))
+
+        message_groups: list[list[dict[str, Any]]] = []
+        for candidate in candidates:
+            rollout = candidate["rollout"]
+            conversation = _clone_json_mapping(
+                self._serialize_for_json(getattr(rollout, "conversation", {}))
+            )
+            messages = _clone_json_messages(conversation.get("messages"))
+            if not messages:
+                synthetic_messages = []
+                if prompt_text:
+                    synthetic_messages.append(
+                        {
+                            "role": "user",
+                            "content": prompt_text,
+                            "tool_calls": [],
+                            "metadata": {},
+                        }
+                    )
+                synthetic_messages.append(
+                    {
+                        "role": "assistant",
+                        "content": str(getattr(rollout, "text", "")),
+                        "tool_calls": [],
+                        "metadata": {},
+                    }
+                )
+                messages = synthetic_messages
+            message_groups.append(messages)
+
+        shared_messages, completion_message_groups = _factor_shared_messages(message_groups)
+
+        serialized_candidates: list[dict[str, Any]] = []
+        merged_prompt_metadata = dict(prompt_metadata)
+        for candidate, completion_messages in zip(
+            candidates,
+            completion_message_groups,
+            strict=True,
+        ):
+            rollout = candidate["rollout"]
+            reward = candidate["reward"]
+            response_text = str(getattr(rollout, "text", ""))
+            prompt_token_count = len(getattr(rollout, "prompt_token_ids", []))
+            response_token_count = len(getattr(rollout, "response_token_ids", []))
+
+            rollout_metadata = _clone_json_mapping(
+                self._serialize_for_json(getattr(rollout, "metadata", {}))
+            )
+            raw_prompt_metadata = _clone_json_mapping(rollout_metadata.pop("prompt_metadata", {}))
+            merged_prompt_metadata.update(
+                {
+                    key: value
+                    for key, value in raw_prompt_metadata.items()
+                    if key not in merged_prompt_metadata
+                }
+            )
+
+            promoted_output, _ = _promote_metadata_fields(
+                rollout_metadata,
+                PROMOTED_OUTPUT_METADATA_KEYS,
+            )
+            output_stats = _derive_log_prob_stats(
+                log_prob=float(getattr(rollout, "log_prob", 0.0)),
+                response_token_count=response_token_count,
+                prompt_token_count=prompt_token_count,
+            )
+            generation_seconds = promoted_output.get("generation_seconds")
+            tokens_per_second = 0.0
+            if isinstance(generation_seconds, (int, float)) and float(generation_seconds) > 0.0:
+                tokens_per_second = float(response_token_count / float(generation_seconds))
+
+            reward_metadata = _clone_json_mapping(
+                self._serialize_for_json(getattr(reward, "metadata", {}))
+            )
+            promoted_reward, remaining_reward_metadata = _promote_metadata_fields(
+                reward_metadata,
+                PROMOTED_REWARD_METADATA_KEYS,
+            )
+
+            serialized_candidates.append(
+                {
+                    "candidate_index": int(candidate["candidate_index"]),
+                    "completion_messages": completion_messages,
+                    "output": {
+                        "preview": self._truncate(response_text),
+                        "response_token_count": response_token_count,
+                        "response_char_count": len(response_text),
+                        "finish_reason": promoted_output.get("finish_reason"),
+                        "stop_reason": promoted_output.get("stop_reason"),
+                        "ttft_seconds": promoted_output.get("ttft_seconds"),
+                        "tpot_seconds": promoted_output.get("tpot_seconds"),
+                        "generation_seconds": generation_seconds,
+                        "tokens_per_second": tokens_per_second,
+                        "log_prob": float(getattr(rollout, "log_prob", 0.0)),
+                        **output_stats,
+                    },
+                    "reward": {
+                        "value": float(getattr(reward, "reward", 0.0)),
+                        "pass_rate": promoted_reward.get("pass_rate"),
+                        "passed_tests": promoted_reward.get("passed_tests"),
+                        "total_tests": promoted_reward.get("total_tests"),
+                        "accuracy_pass": promoted_reward.get("accuracy_pass"),
+                        "format_pass": promoted_reward.get("format_pass"),
+                        "truncated": promoted_reward.get("truncated"),
+                        "execution_seconds": promoted_reward.get("execution_seconds"),
+                        "failure_reason": promoted_reward.get("failure_reason"),
+                        "checker_used": promoted_reward.get("checker_used"),
+                        "execution_status": promoted_reward.get("execution_status"),
+                        "code_preview": promoted_reward.get("code_preview"),
+                        "metadata": remaining_reward_metadata,
+                    },
+                }
+            )
+
+        promoted_prompt_metadata, remaining_prompt_metadata = _promote_metadata_fields(
+            merged_prompt_metadata,
+            PROMOTED_PROMPT_METADATA_KEYS,
+        )
+        return {
+            "schema_version": ROLLOUT_SCHEMA_VERSION,
+            "run_id": self.run_id,
+            "run_index": self.run_index,
+            "step": step,
+            "epoch": epoch,
+            "batch_index": batch_index,
+            "batches_in_epoch": batches_in_epoch,
+            "prompt_index": prompt_index,
+            "prompt_count": prompt_count,
+            "group_size": group_size,
+            "candidate_count": len(serialized_candidates),
+            "batch_candidate_count": batch_candidate_count,
+            "input": {
+                "shared_messages": shared_messages,
+                "prompt_preview": self._truncate(prompt_text),
+                "prompt_token_count": (
+                    len(getattr(candidates[0]["rollout"], "prompt_token_ids", [])) if candidates else 0
+                ),
+                "prompt_char_count": len(prompt_text),
+                "metadata": remaining_prompt_metadata,
+                **promoted_prompt_metadata,
+            },
+            "summary": _derive_rollout_summary(serialized_candidates),
+            "candidates": serialized_candidates,
+        }
 
     def log_serving_debug_start(self, payload: dict[str, Any]) -> None:
         """Log the start of one live serving candidate stream."""

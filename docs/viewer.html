@@ -1603,6 +1603,136 @@
         .sort((left, right) => Number(left) - Number(right));
     }
 
+    function rolloutSchemaVersion(record) {
+      const version = Number(record?.schema_version || 1);
+      return Number.isFinite(version) && version > 0 ? version : 1;
+    }
+
+    function messageText(messages) {
+      const normalized = safeArray(messages).filter((message) => typeof message?.content === "string");
+      if (!normalized.length) {
+        return "";
+      }
+      if (normalized.length === 1 && (!normalized[0].role || normalized[0].role === "assistant")) {
+        return normalized[0].content;
+      }
+      return normalized
+        .map((message) => `${message.role || "message"}: ${message.content}`)
+        .join("\n\n");
+    }
+
+    function lastMessageContent(messages, role) {
+      const normalized = safeArray(messages).filter((message) => message?.role === role && typeof message?.content === "string");
+      if (!normalized.length) {
+        return "";
+      }
+      return normalized[normalized.length - 1].content;
+    }
+
+    function rolloutPromptText(record) {
+      if (rolloutSchemaVersion(record) >= 2) {
+        const sharedMessages = safeArray(record.input?.shared_messages);
+        return lastMessageContent(sharedMessages, "user") || messageText(sharedMessages) || record.input?.prompt_preview || "";
+      }
+      return record.prompt?.text || "";
+    }
+
+    function rolloutPromptLabels(record) {
+      if (rolloutSchemaVersion(record) < 2) {
+        return [];
+      }
+      const labels = [];
+      for (const key of ["task_id", "source", "split", "language", "rating", "verifier"]) {
+        const value = record.input?.[key];
+        if (value !== undefined && value !== null && value !== "") {
+          labels.push(`${key} ${value}`);
+        }
+      }
+      return labels;
+    }
+
+    function rolloutSummaryEntries(record) {
+      if (rolloutSchemaVersion(record) < 2) {
+        return [];
+      }
+      return [
+        ["Reward Mean", formatNumber(record.summary?.reward_mean, 4)],
+        ["Reward Span", formatNumber(record.summary?.reward_span, 4)],
+        ["Best Candidate", record.summary?.best_candidate_index ?? "n/a"],
+        ["Solved", record.summary?.solved_count ?? "n/a"],
+        ["Format Pass", record.summary?.format_pass_count ?? "n/a"],
+        ["Accuracy Pass", record.summary?.accuracy_pass_count ?? "n/a"],
+        ["Truncated", record.summary?.truncated_count ?? "n/a"],
+        ["Avg Pass Rate", formatNumber(record.summary?.avg_pass_rate, 2)],
+        ["Avg Generation", formatDuration(record.summary?.avg_generation_seconds)],
+        ["Avg Log Prob/Token", formatNumber(record.summary?.avg_log_prob_per_token, 4)],
+      ];
+    }
+
+    function rolloutInputDetails(record) {
+      if (rolloutSchemaVersion(record) < 2) {
+        return [];
+      }
+      return [
+        ["Shared Messages", record.input?.shared_messages || []],
+        ["Input Metadata", record.input?.metadata || {}],
+      ];
+    }
+
+    function rolloutCandidateResponse(record, candidate) {
+      if (rolloutSchemaVersion(record) >= 2) {
+        return messageText(candidate.completion_messages);
+      }
+      return candidate.rollout?.response_text || "";
+    }
+
+    function rolloutCandidateStats(record, candidate) {
+      if (rolloutSchemaVersion(record) >= 2) {
+        return [
+          ["Log Prob", formatNumber(candidate.output?.log_prob, 4)],
+          ["Avg Log Prob/Token", formatNumber(candidate.output?.avg_log_prob_per_token, 4)],
+          ["Avg Token Prob", formatNumber(candidate.output?.avg_token_prob, 4)],
+          ["Prompt Tokens", record.input?.prompt_token_count ?? "n/a"],
+          ["Response Tokens", candidate.output?.response_token_count ?? "n/a"],
+          ["Output/Prompt Ratio", formatNumber(candidate.output?.output_to_prompt_token_ratio, 3)],
+          ["TTFT", formatDuration(candidate.output?.ttft_seconds)],
+          ["TPOT", formatDuration(candidate.output?.tpot_seconds)],
+          ["Generation", formatDuration(candidate.output?.generation_seconds)],
+          ["Tok/s", formatNumber(candidate.output?.tokens_per_second, 2)],
+          ["Pass Rate", formatNumber(candidate.reward?.pass_rate, 2)],
+          [
+            "Tests",
+            candidate.reward?.passed_tests !== undefined && candidate.reward?.total_tests !== undefined
+              ? `${candidate.reward.passed_tests}/${candidate.reward.total_tests}`
+              : "n/a",
+          ],
+          ["Finish", candidate.output?.finish_reason || candidate.output?.stop_reason || "n/a"],
+          ["Failure", candidate.reward?.failure_reason || "n/a"],
+          ["Response Chars", candidate.output?.response_char_count ?? "n/a"],
+        ];
+      }
+      return [
+        ["Log Prob", candidate.rollout?.log_prob ?? "n/a"],
+        ["Prompt Tokens", candidate.rollout?.prompt_token_count ?? "n/a"],
+        ["Response Tokens", candidate.rollout?.response_token_count ?? "n/a"],
+        ["Response Length", candidate.rollout?.response_text?.length ?? 0],
+      ];
+    }
+
+    function rolloutCandidateDetails(record, candidate) {
+      if (rolloutSchemaVersion(record) >= 2) {
+        return [
+          ["Completion Messages", candidate.completion_messages || []],
+          ["Reward Metadata", candidate.reward?.metadata || {}],
+        ];
+      }
+      return [
+        ["Conversation", candidate.conversation],
+        ["Rollout Metadata", candidate.rollout?.metadata],
+        ["Reward Metadata", candidate.reward?.metadata],
+      ];
+    }
+
     function renderRollouts(details) {
       dom.panelRollouts.innerHTML = "";
 
@@ -1684,7 +1814,17 @@
             `batch ${record.batch_index}/${record.batches_in_epoch}`,
             `prompt_index ${record.prompt_index}`,
             `group_size ${record.group_size}`,
+            rolloutSchemaVersion(record) >= 2 ? `candidate_count ${record.candidate_count}` : null,
           ]) {
+            if (!value) {
+              continue;
+            }
+            const item = document.createElement("span");
+            item.textContent = value;
+            header.appendChild(item);
+          }
+
+          for (const value of rolloutPromptLabels(record)) {
             const item = document.createElement("span");
             item.textContent = value;
             header.appendChild(item);
@@ -1692,7 +1832,18 @@
 
           const promptText = document.createElement("div");
           promptText.className = "prompt-text";
-          promptText.textContent = record.prompt?.text || "";
+          promptText.textContent = rolloutPromptText(record);
+
+          let summaryGrid = null;
+          if (rolloutSchemaVersion(record) >= 2) {
+            summaryGrid = document.createElement("div");
+            summaryGrid.className = "candidate-stats";
+            for (const [label, value] of rolloutSummaryEntries(record)) {
+              const item = document.createElement("div");
+              item.textContent = `${label}: ${value}`;
+              summaryGrid.appendChild(item);
+            }
+          }
 
           const grid = document.createElement("div");
           grid.className = "candidate-grid";
@@ -1713,12 +1864,7 @@
 
             const stats = document.createElement("div");
             stats.className = "candidate-stats";
-            for (const [label, value] of [
-              ["Log Prob", candidate.rollout?.log_prob],
-              ["Prompt Tokens", candidate.rollout?.prompt_token_count],
-              ["Response Tokens", candidate.rollout?.response_token_count],
-              ["Response Length", candidate.rollout?.response_text?.length ?? 0],
-            ]) {
+            for (const [label, value] of rolloutCandidateStats(record, candidate)) {
               const item = document.createElement("div");
               item.textContent = `${label}: ${value ?? "n/a"}`;
               stats.appendChild(item);
@@ -1726,15 +1872,11 @@
 
             const response = document.createElement("div");
             response.className = "candidate-response";
-            response.textContent = candidate.rollout?.response_text || "";
+            response.textContent = rolloutCandidateResponse(record, candidate);
 
             card.append(candidateHeader, stats, response);
 
-            for (const [label, value] of [
-              ["Conversation", candidate.conversation],
-              ["Rollout Metadata", candidate.rollout?.metadata],
-              ["Reward Metadata", candidate.reward?.metadata],
-            ]) {
+            for (const [label, value] of rolloutCandidateDetails(record, candidate)) {
               const detailsEl = document.createElement("details");
               const summary = document.createElement("summary");
               summary.textContent = label;
@@ -1748,7 +1890,21 @@
             grid.appendChild(card);
           }
 
-          promptCard.append(header, promptText, grid);
+          promptCard.append(header, promptText);
+          if (summaryGrid) {
+            promptCard.appendChild(summaryGrid);
+          }
+          for (const [label, value] of rolloutInputDetails(record)) {
+            const detailsEl = document.createElement("details");
+            const summary = document.createElement("summary");
+            summary.textContent = label;
+            const pre = document.createElement("pre");
+            pre.className = "json-block";
+            pre.textContent = JSON.stringify(value ?? {}, null, 2);
+            detailsEl.append(summary, pre);
+            promptCard.appendChild(detailsEl);
+          }
+          promptCard.appendChild(grid);
           list.appendChild(promptCard);
         }
       }

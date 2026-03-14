@@ -298,6 +298,8 @@ The example does not fall back to parsing answers from free-form text.
   `--checkpoint-out` overrides it.
 - Run artifacts are written under `logs/` as `console.log`, `events.jsonl`, and
   `rollouts.jsonl`.
+- `rollouts.jsonl` keeps one row per prompt group, stores shared prompt messages
+  once, and promotes common reward/generation stats into first-class fields.
 
 ## Troubleshooting
 
