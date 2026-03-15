@@ -1,27 +1,28 @@
-"""Shared training backend abstraction and learner-side optimization flow."""
+"""Shared training backend abstractions and optimization result types."""
 
 from __future__ import annotations
 
 from abc import ABC
+import copy
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import torch
 
-from flashrl.framework.config import GrpoConfig, TrainingConfig
+from flashrl.framework.config import TrainingConfig
 from flashrl.framework.data_models import LearnerBatch
 from flashrl.framework.models.actor import ActorModel
-from flashrl.framework.models.reference import ReferenceModel
-from flashrl.framework.observability import StageResult, timed_call
+from flashrl.framework.observability import StageResult
 from flashrl.framework.serving.base import ServingBackend
 from flashrl.framework.training.optimization import (
     LossAssemblyResult,
-    assemble_grpo_loss,
     backward_step,
     compute_rollout_log_probs_from_actor,
     prepare_learner_inputs,
-    reference_logits,
 )
+
+
+BackendRole = Literal["actor", "reference"]
 
 
 @dataclass
@@ -46,7 +47,7 @@ class OptimizationResult:
         return None
 
     def __post_init__(self) -> None:
-        """Keep legacy dict views and the new stage list in sync."""
+        """Keep legacy dict views and the canonical stage list in sync."""
         if self.stages:
             self.refresh_stage_views()
             return
@@ -71,11 +72,11 @@ class OptimizationResult:
 
 
 class TrainingBackend(ABC):
-    """Shared training surface used by controller code."""
+    """Single-engine training backend used by controller code."""
 
     config: TrainingConfig
-    actor: ActorModel
-    optimizer: torch.optim.Optimizer
+    role: BackendRole
+    model_copy: ActorModel
     device: Any
     rank: int
     world_size: int
@@ -86,21 +87,14 @@ class TrainingBackend(ABC):
         self,
         config: TrainingConfig,
         *,
-        learning_rate: float,
-        grpo_config: GrpoConfig,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
+        role: BackendRole,
     ) -> None:
         self.config = config
-        self.learning_rate = learning_rate
-        self.grpo_config = grpo_config
-        self.reference_enabled = bool(reference_enabled)
-        self.reference_device = reference_device
-        self.reference: ReferenceModel | None = None
+        self.role = role
         self.rank = 0
         self.world_size = int(config.dp_size)
         self.is_primary = True
-        self.startup_events: list[dict[str, Any]] = []
+        self.startup_events = []
 
     @property
     def backend_name(self) -> str:
@@ -108,216 +102,43 @@ class TrainingBackend(ABC):
         return self.config.backend
 
     @property
-    def optimizer_name(self) -> str:
-        """Return the optimizer class name for admin/logging."""
-        return type(self.optimizer).__name__
+    def component_name(self) -> str:
+        """Return the stable component label used in logs and admin views."""
+        return f"{self.role}_backend"
 
     @property
-    def reference_loaded(self) -> bool:
-        """Return whether this backend owns a frozen reference model."""
-        return self.reference is not None
+    def model_name(self) -> str:
+        """Return the user-facing model name for this backend."""
+        return self.config.model_name
 
     @property
-    def resolved_reference_device(self) -> str:
-        """Return the user-facing reference device label."""
-        if self.reference is not None:
-            return str(self.reference.device)
-        return self.reference_device or self.config.device or "auto"
+    def model(self):
+        """Expose the wrapped causal LM module directly when needed."""
+        return self.model_copy.model
 
-    def optimize_batch(self, learner_batch: LearnerBatch) -> OptimizationResult:
-        """Run learner-side tensor prep, forward, loss, backward, and step."""
-        actor = self.actor
-        device = actor.device
-        (
-            input_ids,
-            attention_mask,
-            prompt_lengths,
-            full_lengths,
-            rollout_response_log_probs,
-        ), prepare_seconds = timed_call(
-            lambda: self._prepare_inputs(learner_batch, actor, device)
-        )
-        full_tokens_total = int(sum(full_lengths))
-        response_tokens_total = int(sum(len(tokens) for tokens in learner_batch.response_token_ids))
-
-        actor_logits, actor_forward_seconds = timed_call(
-            lambda: actor.model(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-            ).logits
-        )
-
-        reference_active = self.reference is not None and self.grpo_config.kl_coefficient > 0.0
-        if reference_active:
-            ref_logits, reference_forward_seconds = timed_call(
-                lambda: self._reference_logits(input_ids, attention_mask)
-            )
-        else:
-            ref_logits = None
-            reference_forward_seconds = 0.0
-
-        advantages = torch.tensor(
-            learner_batch.advantages,
-            dtype=torch.float32,
-            device=device,
-        )
-        loss_result, loss_seconds = timed_call(
-            lambda: self._assemble_loss(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                prompt_lengths=prompt_lengths,
-                actor_logits=actor_logits,
-                ref_logits=ref_logits,
-                rollout_response_log_probs=rollout_response_log_probs,
-                advantages=advantages,
-                kl_coefficient=self.grpo_config.kl_coefficient,
-                clip_ratio=self.grpo_config.clip_ratio,
-            )
-        )
-
-        _, backward_seconds = timed_call(self._backward_step(loss_result.loss))
-        _, optimizer_seconds = timed_call(self.optimizer.step)
-        learning_rate = float(self.optimizer.param_groups[0]["lr"])
-
-        stages = [
-            StageResult(
-                name="prepare_inputs",
-                seconds=prepare_seconds,
-                metrics={
-                    "full_tokens_mean": self._mean(full_lengths),
-                    "full_tokens_max": max(full_lengths, default=0),
-                    "response_tokens_total": response_tokens_total,
-                },
-            ),
-            StageResult(
-                name="actor_forward",
-                seconds=actor_forward_seconds,
-                metrics={"full_tokens_total": full_tokens_total},
-            ),
-        ]
-        if reference_active:
-            stages.append(
-                StageResult(
-                    name="reference_forward",
-                    seconds=reference_forward_seconds,
-                    metrics={"full_tokens_total": full_tokens_total},
-                )
-            )
-        stages.extend(
-            [
-                StageResult(
-                    name="loss_assembly",
-                    seconds=loss_seconds,
-                    metrics={
-                        "loss": float(loss_result.loss.item()),
-                        "policy_loss": float(loss_result.policy_loss.item()),
-                        "kl_divergence": float(loss_result.kl_divergence.item()),
-                        "response_tokens_total": loss_result.response_tokens_total,
-                        "importance_sampling_ratio_mean": (
-                            loss_result.importance_sampling_ratio_mean
-                        ),
-                        "importance_sampling_ratio_std": loss_result.importance_sampling_ratio_std,
-                        "importance_sampling_ratio_min": loss_result.importance_sampling_ratio_min,
-                        "importance_sampling_ratio_max": loss_result.importance_sampling_ratio_max,
-                        "clip_fraction": loss_result.clip_fraction,
-                    },
-                ),
-                StageResult(
-                    name="backward",
-                    seconds=backward_seconds,
-                    metrics={"loss": float(loss_result.loss.item())},
-                ),
-                StageResult(
-                    name="optimizer",
-                    seconds=optimizer_seconds,
-                    metrics={"learning_rate": learning_rate},
-                ),
-            ]
-        )
-
-        return OptimizationResult(
-            loss=float(loss_result.loss.item()),
-            policy_loss=float(loss_result.policy_loss.item()),
-            kl_divergence=float(loss_result.kl_divergence.item()),
-            learning_rate=learning_rate,
-            response_tokens_total=loss_result.response_tokens_total,
-            reference_active=reference_active,
-            stages=stages,
-        )
-
-    def sync_weights_to(self, serving_backend: ServingBackend) -> None:
-        """Sync the backend-owned actor weights into the serving backend."""
-        serving_backend.sync_from_training_actor(self.actor)
-
-    def save_checkpoint(
+    def forward_logits(
         self,
-        path: str,
-        controller_state: dict[str, Any] | None = None,
-        checkpoint_metadata: dict[str, Any] | None = None,
-    ) -> None:
-        """Save controller plus backend-owned training state into one envelope."""
-        payload = {
-            "controller_state": dict(controller_state or {}),
-            "backend_state": {
-                "actor_state_dict": self.actor.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "reference_state_dict": (
-                    self.reference.model.state_dict() if self.reference is not None else None
-                ),
-                "backend": self.backend_name,
-                "world_size": self.world_size,
-            },
-            "checkpoint_metadata": dict(checkpoint_metadata or {}),
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run one backend-owned forward pass and return logits."""
+        return self.model_copy.model(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+        ).logits
+
+    def export_state(self) -> dict[str, Any]:
+        """Return the backend-owned checkpoint payload for this role."""
+        return {
+            "role": self.role,
+            "backend": self.backend_name,
+            "world_size": self.world_size,
+            "model_state_dict": copy.deepcopy(self.model_copy.model.state_dict()),
         }
-        torch.save(payload, path)
 
-    def load_checkpoint(self, path: str) -> dict[str, Any]:
-        """Load a checkpoint envelope and return the controller-owned state."""
-        controller_state, _ = self.load_checkpoint_with_metadata(path)
-        return controller_state
-
-    def load_checkpoint_with_metadata(
-        self,
-        path: str,
-    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
-        """Load checkpoint weights and return controller state plus metadata."""
-        checkpoint = torch.load(path, weights_only=False)
-        backend_state, controller_state, checkpoint_metadata = self._split_checkpoint_payload(
-            checkpoint
-        )
-
-        self.actor.model.load_state_dict(backend_state["actor_state_dict"])
-        self.optimizer.load_state_dict(backend_state["optimizer_state_dict"])
-        reference_state = backend_state.get("reference_state_dict")
-        if reference_state is not None and self.reference is not None:
-            self.reference.model.load_state_dict(reference_state)
-        return dict(controller_state), checkpoint_metadata
-
-    def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:
-        """Return checkpoint metadata without mutating backend state."""
-        checkpoint = torch.load(path, weights_only=False)
-        _, _, checkpoint_metadata = self._split_checkpoint_payload(checkpoint)
-        return checkpoint_metadata
-
-    def _split_checkpoint_payload(
-        self,
-        checkpoint: dict[str, Any],
-    ) -> tuple[dict[str, Any], dict[str, Any], dict[str, Any] | None]:
-        """Normalize legacy and current checkpoint payloads into one shape."""
-        if "backend_state" in checkpoint:
-            backend_state = checkpoint["backend_state"]
-            controller_state = checkpoint.get("controller_state", {})
-            checkpoint_metadata = checkpoint.get("checkpoint_metadata")
-            if isinstance(checkpoint_metadata, dict):
-                return backend_state, controller_state, dict(checkpoint_metadata)
-            return backend_state, controller_state, None
-
-        backend_state = checkpoint
-        controller_state = {
-            "epoch": checkpoint.get("epoch", 0),
-            "total_steps": checkpoint.get("total_steps", 0),
-        }
-        return backend_state, controller_state, None
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Load backend-owned checkpoint state for this role."""
+        self.model_copy.model.load_state_dict(state["model_state_dict"])
 
     def barrier(self) -> None:
         """Backend-local barrier hook."""
@@ -332,72 +153,102 @@ class TrainingBackend(ABC):
         return []
 
     def close(self) -> None:
-        """Release any backend-owned resources."""
+        """Release backend-owned resources."""
         return None
 
-    def _reference_logits(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Run the frozen reference model without gradients."""
-        assert self.reference is not None
-        return reference_logits(self.reference, input_ids, attention_mask)
-
-    def _backward_step(self, loss: torch.Tensor):
-        """Return the backward closure used in timing."""
-        return backward_step(self.optimizer, loss)
-
-    def _prepare_inputs(
+    def prepare_inputs(
         self,
         learner_batch: LearnerBatch,
-        actor: Any,
-        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[float]]]:
         """Build padded learner tensors directly from rollout-provided token ids."""
-        return prepare_learner_inputs(learner_batch, actor, device)
+        return prepare_learner_inputs(learner_batch, self.model_copy, self.device)
 
-    def _compute_rollout_log_probs_from_actor(
+    def compute_rollout_log_probs(
         self,
-        actor: Any,
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor,
         prompt_lengths: list[int],
     ) -> list[list[float]]:
-        """Derive rollout-policy token logprobs from the synced training actor."""
+        """Derive rollout-policy token logprobs from the synced actor backend."""
         return compute_rollout_log_probs_from_actor(
-            actor=actor,
+            actor=self.model_copy,
             input_ids=input_ids,
             attention_mask=attention_mask,
             prompt_lengths=prompt_lengths,
         )
 
-    def _assemble_loss(
+
+class ActorTrainingBackend(TrainingBackend):
+    """Mutable learner backend for the actor role."""
+
+    optimizer: torch.optim.Optimizer
+
+    def __init__(
         self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_lengths: torch.Tensor,
-        actor_logits: torch.Tensor,
-        ref_logits: torch.Tensor | None,
-        rollout_response_log_probs: list[list[float]],
-        advantages: torch.Tensor,
-        kl_coefficient: float,
-        clip_ratio: float,
-    ) -> LossAssemblyResult:
-        """Assemble the response-only GRPO objective and count response tokens."""
-        return assemble_grpo_loss(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=prompt_lengths,
-            actor_logits=actor_logits,
-            ref_logits=ref_logits,
-            rollout_response_log_probs=rollout_response_log_probs,
-            advantages=advantages,
-            kl_coefficient=kl_coefficient,
-            clip_ratio=clip_ratio,
-        )
+        config: TrainingConfig,
+        *,
+        learning_rate: float,
+    ) -> None:
+        super().__init__(config, role="actor")
+        self.learning_rate = learning_rate
 
-    def _mean(self, values: list[float] | list[int]) -> float:
-        if not values:
-            return 0.0
-        return float(sum(values) / len(values))
+    @property
+    def optimizer_name(self) -> str:
+        """Return the optimizer class name for admin/logging."""
+        return type(self.optimizer).__name__
+
+    @property
+    def actor(self) -> ActorModel:
+        """Expose the actor model wrapper under the traditional actor name."""
+        return self.model_copy
+
+    def backward_step(self, loss: torch.Tensor):
+        """Return the timed backward closure for the actor backend."""
+        return backward_step(self.optimizer, loss)
+
+    def optimizer_step(self) -> None:
+        """Advance the actor optimizer once."""
+        self.optimizer.step()
+
+    def sync_weights_to(self, serving_backend: ServingBackend) -> None:
+        """Sync the backend-owned actor weights into the serving backend."""
+        serving_backend.sync_from_training_actor(self.model_copy)
+
+    def export_state(self) -> dict[str, Any]:
+        """Return the actor checkpoint payload including optimizer state."""
+        state = super().export_state()
+        state["optimizer_state_dict"] = copy.deepcopy(self.optimizer.state_dict())
+        return state
+
+    def load_state(self, state: dict[str, Any]) -> None:
+        """Load actor model weights plus optimizer state."""
+        super().load_state(state)
+        self.optimizer.load_state_dict(state["optimizer_state_dict"])
+
+
+def assemble_loss(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    actor_logits: torch.Tensor,
+    ref_logits: torch.Tensor | None,
+    rollout_response_log_probs: list[list[float]],
+    advantages: torch.Tensor,
+    kl_coefficient: float,
+    clip_ratio: float,
+) -> LossAssemblyResult:
+    """Compatibility wrapper for the shared GRPO loss helper."""
+    from flashrl.framework.training.optimization import assemble_grpo_loss
+
+    return assemble_grpo_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=ref_logits,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        kl_coefficient=kl_coefficient,
+        clip_ratio=clip_ratio,
+    )

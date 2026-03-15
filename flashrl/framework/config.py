@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Literal
+
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
@@ -34,6 +35,8 @@ def _expand_env_vars(value: Any) -> Any:
 
 class BaseConfig(BaseModel):
     """Base configuration class with common loading methods."""
+
+    model_config = ConfigDict(extra="forbid")
 
     @classmethod
     def from_yaml(cls, path: str | Path) -> "BaseConfig":
@@ -207,11 +210,11 @@ class CheckpointingConfig(BaseConfig):
         return self
 
 
-class RuntimeConfig(BaseConfig):
-    """Runtime options that sit outside the model/trainer sections."""
+class AdminConfig(BaseConfig):
+    """Admin server configuration."""
 
-    reference_enabled: bool = False
-    reference_device: str | None = None
+    model_config = ConfigDict(extra="forbid")
+
     admin_enabled: bool = True
     admin_host: str = "127.0.0.1"
     admin_port: int = Field(default=0, ge=0, le=65535)
@@ -225,56 +228,31 @@ class HookConfig(BaseConfig):
     dataset_fn: str
 
 
-class CommonConfig(BaseConfig):
-    """Optional shared model defaults for both training and serving."""
-
-    model_config = ConfigDict(extra="forbid")
-
-    model_name: str | None = None
-    device: str | None = None
-    dtype: str | None = None
-    max_length: int | None = None
-    load_in_8bit: bool | None = None
-    trust_remote_code: bool | None = None
-    metadata: dict[str, Any] | None = None
-
-
-class TrainingSectionConfig(CommonConfig):
-    """YAML training section: model-copy settings plus loop settings."""
-
-    num_threads: int | None = None
-    backend: Literal["huggingface", "fsdp2"] = "huggingface"
-    dp_size: int = Field(default=1, ge=1)
-    fsdp2: FSDP2Config = Field(default_factory=FSDP2Config)
-    learning_rate: float = 1e-5
-    batch_size: int = 32
-    max_epochs: int = 10
-    seed: int = 42
-    shuffle_each_epoch: bool = True
-
-
-class ServingSectionConfig(CommonConfig):
-    """YAML serving section: serving model-copy settings only."""
-
-    num_threads: int | None = None
-    backend: Literal["huggingface", "vllm"] = "huggingface"
-    runtime_python: str | None = None
-    num_replicas: int = Field(default=1, ge=1)
-    vllm_args: list[str] = Field(default_factory=list)
-    debug_live_rollout: bool = False
-
-
 class RunConfig(BaseConfig):
     """Top-level YAML config for one FlashRL run."""
 
     model_config = ConfigDict(extra="forbid")
 
-    common: CommonConfig | None = None
-    training: TrainingSectionConfig
-    serving: ServingSectionConfig
+    actor: TrainingConfig
+    reference: TrainingConfig | None = None
+    serving: ServingConfig
+    trainer: TrainerConfig
     grpo: GrpoConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     checkpointing: CheckpointingConfig = Field(default_factory=CheckpointingConfig)
-    runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
     hooks: HookConfig | None = None
+
+    @model_validator(mode="after")
+    def validate_reference_policy(self) -> "RunConfig":
+        """Require an explicit reference backend exactly when KL is enabled."""
+        if self.grpo.kl_coefficient > 0.0 and self.reference is None:
+            raise ValueError(
+                "run_config.reference is required when grpo.kl_coefficient > 0."
+            )
+        if self.grpo.kl_coefficient <= 0.0 and self.reference is not None:
+            raise ValueError(
+                "run_config.reference must be omitted when grpo.kl_coefficient <= 0."
+            )
+        return self

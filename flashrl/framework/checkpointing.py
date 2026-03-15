@@ -13,7 +13,7 @@ from flashrl.framework.config import CheckpointingConfig
 
 
 LATEST_CHECKPOINT = "latest"
-CHECKPOINT_SCHEMA_VERSION = 2
+CHECKPOINT_SCHEMA_VERSION = 3
 LOGGER_STATE_SCHEMA_VERSION = 1
 
 
@@ -139,7 +139,7 @@ class CheckpointManager:
         """Validate the metadata required for managed append-resume."""
         if not isinstance(checkpoint_metadata, dict):
             raise ValueError(
-                "Managed checkpoint resume requires checkpoint metadata, but the checkpoint is legacy."
+                "Managed checkpoint resume requires role-based checkpoint metadata."
             )
 
         run_info = checkpoint_metadata.get("run")
@@ -202,4 +202,3 @@ class CheckpointManager:
             "run_dir": str(run_dir),
         }
         _atomic_write_json(self.latest_manifest_path(run_dir=run_dir), payload)
-

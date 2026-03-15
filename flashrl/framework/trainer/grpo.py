@@ -22,6 +22,8 @@ from flashrl.framework.observability import (
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.training import OptimizationResult
+from flashrl.framework.training.base import assemble_loss
+from flashrl.framework.training.optimization import optimize_grpo_batch
 from flashrl.framework.trainer.step_support import (
     STAGE_ORDER,
     StepContext,
@@ -40,7 +42,7 @@ if TYPE_CHECKING:
     from flashrl.framework.metrics import MetricsSink
     from flashrl.framework.run_logger import RunLogger
     from flashrl.framework.serving import ServingBackend
-    from flashrl.framework.training import TrainingBackend
+    from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 
 
 class GRPOTrainer:
@@ -50,11 +52,11 @@ class GRPOTrainer:
         self,
         config: TrainerConfig,
         grpo_config: GrpoConfig,
-        training_backend: "TrainingBackend",
+        actor_backend: "ActorTrainingBackend",
+        reference_backend: "TrainingBackend | None",
         serving_backend: "ServingBackend",
         reward_fn: UserDefinedReward,
         rollout_generator: UserDefinedRollout,
-        reference: Any | None = None,
         run_logger: "RunLogger | None" = None,
         metrics_sink: "MetricsSink | None" = None,
         on_step_complete: Callable[[dict[str, Any]], None] | None = None,
@@ -65,16 +67,18 @@ class GRPOTrainer:
         self.metrics_sink = metrics_sink
         self.current_epoch = 0
         self.total_steps = 0
-        self.training_backend = training_backend
+        self.actor_backend = actor_backend
+        self.reference_backend = reference_backend
         self.serving_backend = serving_backend
         self.grpo_config = grpo_config
-        if reference is not None and getattr(self.training_backend, "reference", None) is None:
-            self.training_backend.reference = reference
-            self.training_backend.reference_enabled = True
-        self.reference = getattr(self.training_backend, "reference", reference)
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
         self.on_step_complete = on_step_complete
+
+    @property
+    def training_backend(self) -> "ActorTrainingBackend":
+        """Expose the actor backend under the traditional training-backend name."""
+        return self.actor_backend
 
     def attach_run_logger(self, run_logger: "RunLogger | None") -> None:
         """Attach or clear the current run-scoped logger."""
@@ -282,7 +286,7 @@ class GRPOTrainer:
             "step_duration_seconds": step_duration_seconds,
             "stage_timings": all_stage_timings,
             "stage_order": visible_stage_order,
-            "reference_enabled": bool(getattr(self.training_backend, "reference_loaded", False)),
+            "reference_configured": self.reference_backend is not None,
             "reference_active": result.reference_active,
             "dominant_stage": dominant_stage_name(result.stages),
             "candidate_count": len(grouped_prompts),
@@ -365,14 +369,19 @@ class GRPOTrainer:
         context: StepContext | None,
     ) -> OptimizationResult:
         """Delegate learner-side tensor work to the training backend."""
-        result = self.training_backend.optimize_batch(learner_batch)
+        result = optimize_grpo_batch(
+            actor_backend=self.actor_backend,
+            reference_backend=self.reference_backend,
+            grpo_config=self.grpo_config,
+            learner_batch=learner_batch,
+        )
         for stage in result.stages:
             if stage.name == "reference_forward" and not result.reference_active:
                 continue
             self._log_stage(context, stage)
 
         _, sync_seconds = timed_call(
-            lambda: self.training_backend.sync_weights_to(self.serving_backend)
+            lambda: self.actor_backend.sync_weights_to(self.serving_backend)
         )
         sync_stage = StageResult(
             name="sync",
@@ -394,29 +403,14 @@ class GRPOTrainer:
         result.refresh_stage_views()
         return result
 
-    def _reference_logits(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-    ) -> torch.Tensor:
-        """Compatibility wrapper around the backend-owned reference model."""
-        return self.training_backend._reference_logits(input_ids, attention_mask)
-
-    def _assemble_loss(self, **kwargs: Any):
-        """Compatibility wrapper around backend loss assembly helpers."""
-        return self.training_backend._assemble_loss(**kwargs)
-
-    def _backward_step(self, loss: torch.Tensor) -> Callable[[], None]:
-        """Compatibility wrapper around backend backward handling."""
-        return self.training_backend._backward_step(loss)
-
     def _prepare_inputs(
         self,
-        batch: TrainingBatch,
+        batch: TrainingBatch | Any,
         actor: Any,
         device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[float]]]:
-        """Compatibility wrapper around backend input preparation."""
+        """Compatibility wrapper around actor-backend input preparation."""
+        del actor, device
         learner_batch = LearnerBatch(
             prompt_token_ids=[
                 [int(token_id) for token_id in rollout.prompt_token_ids]
@@ -434,22 +428,11 @@ class GRPOTrainer:
             group_size=getattr(batch, "group_size", 1),
             prompt_count=getattr(batch, "prompt_count", len(batch.rollouts)),
         )
-        return self.training_backend._prepare_inputs(learner_batch, actor, device)
+        return self.actor_backend.prepare_inputs(learner_batch)
 
-    def _compute_rollout_log_probs_from_actor(
-        self,
-        actor: Any,
-        input_ids: torch.Tensor,
-        attention_mask: torch.Tensor,
-        prompt_lengths: list[int],
-    ) -> list[list[float]]:
-        """Compatibility wrapper around backend rollout-logprob recovery."""
-        return self.training_backend._compute_rollout_log_probs_from_actor(
-            actor=actor,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=prompt_lengths,
-        )
+    def _assemble_loss(self, **kwargs: Any):
+        """Compatibility wrapper around the shared GRPO loss helper."""
+        return assemble_loss(**kwargs)
 
     def _build_epoch_summary(
         self,
@@ -587,38 +570,74 @@ class GRPOTrainer:
         checkpoint_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save model checkpoint."""
-        self.training_backend.save_checkpoint(
-            path,
-            controller_state={
+        payload = {
+            "controller_state": {
                 "epoch": self.current_epoch,
                 "total_steps": self.total_steps,
             },
-            checkpoint_metadata=checkpoint_metadata,
-        )
+            "backend_states": {
+                "actor": self.actor_backend.export_state(),
+                "reference": (
+                    self.reference_backend.export_state() if self.reference_backend is not None else None
+                ),
+            },
+            "checkpoint_metadata": dict(checkpoint_metadata or {}),
+        }
+        torch.save(payload, path)
 
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
         controller_state, _ = self.load_checkpoint_with_metadata(path)
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
-        self.training_backend.sync_weights_to(self.serving_backend)
+        self.actor_backend.sync_weights_to(self.serving_backend)
 
     def load_checkpoint_with_metadata(
         self,
         path: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Load checkpoint state and expose any attached checkpoint metadata."""
-        controller_state, checkpoint_metadata = self.training_backend.load_checkpoint_with_metadata(
-            path
-        )
+        checkpoint = torch.load(path, weights_only=False)
+        backend_states = checkpoint.get("backend_states")
+        if not isinstance(backend_states, dict):
+            raise ValueError(
+                "Checkpoint is incompatible with the role-based runtime. Recreate it with the current FlashRL version."
+            )
+
+        actor_state = backend_states.get("actor")
+        if not isinstance(actor_state, dict):
+            raise ValueError("Checkpoint is missing backend_states.actor.")
+        self.actor_backend.load_state(actor_state)
+
+        reference_state = backend_states.get("reference")
+        if self.reference_backend is None:
+            if reference_state is not None:
+                raise ValueError(
+                    "Checkpoint contains reference backend state, but this trainer was created without a reference backend."
+                )
+        else:
+            if not isinstance(reference_state, dict):
+                raise ValueError(
+                    "Checkpoint is missing backend_states.reference for a trainer with a reference backend."
+                )
+            self.reference_backend.load_state(reference_state)
+
+        controller_state = dict(checkpoint.get("controller_state", {}))
+        checkpoint_metadata = checkpoint.get("checkpoint_metadata")
+        if not isinstance(checkpoint_metadata, dict):
+            checkpoint_metadata = None
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
-        self.training_backend.sync_weights_to(self.serving_backend)
+        self.actor_backend.sync_weights_to(self.serving_backend)
         return controller_state, checkpoint_metadata
 
     def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:
         """Return checkpoint metadata without mutating trainer state."""
-        return self.training_backend.read_checkpoint_metadata(path)
+        checkpoint = torch.load(path, weights_only=False)
+        checkpoint_metadata = checkpoint.get("checkpoint_metadata")
+        if isinstance(checkpoint_metadata, dict):
+            return dict(checkpoint_metadata)
+        return None
 
 
 def current_time() -> float:

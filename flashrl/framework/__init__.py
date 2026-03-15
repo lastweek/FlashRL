@@ -1,8 +1,8 @@
 """Framework layer: Core RL training APIs."""
 
 from flashrl.framework.config import (
+    AdminConfig,
     CheckpointingConfig,
-    CommonConfig,
     FSDP2Config,
     GrpoConfig,
     HookConfig,
@@ -12,13 +12,10 @@ from flashrl.framework.config import (
     PushgatewayMetricsConfig,
     RewardConfig,
     RunConfig,
-    RuntimeConfig,
     RolloutConfig,
     ServingConfig,
-    ServingSectionConfig,
     TrainingConfig,
     TensorBoardMetricsConfig,
-    TrainingSectionConfig,
     TrainerConfig,
 )
 from flashrl.framework.data_models import (
@@ -49,7 +46,7 @@ from flashrl.framework.training import (
 __all__ = [
     "FlashRL",
     # Config
-    "CommonConfig",
+    "AdminConfig",
     "CheckpointingConfig",
     "GrpoConfig",
     "TrainerConfig",
@@ -57,15 +54,12 @@ __all__ = [
     "TrainingConfig",
     "ServingConfig",
     "FSDP2Config",
-    "TrainingSectionConfig",
-    "ServingSectionConfig",
     "RolloutConfig",
     "RewardConfig",
     "LoggingConfig",
     "MetricsConfig",
     "TensorBoardMetricsConfig",
     "PushgatewayMetricsConfig",
-    "RuntimeConfig",
     "HookConfig",
     "RunConfig",
     # Data models

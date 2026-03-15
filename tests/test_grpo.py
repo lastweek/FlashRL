@@ -12,7 +12,7 @@ import torch
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
-from flashrl.framework.config import TrainerConfig
+from flashrl.framework.config import ServingConfig, TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
@@ -64,7 +64,6 @@ def build_trainer(
     training_backend = TinyTrainingBackend(
         learning_rate=1e-2,
         group_size=group_size,
-        reference=reference,
     )
     serving_backend = serving_backend or TinyServingBackend()
     rollout = UserDefinedRollout(
@@ -85,9 +84,9 @@ def build_trainer(
             clip_ratio=0.2,
             kl_coefficient=kl_coefficient,
         ),
-        training_backend=training_backend,
+        actor_backend=training_backend,
+        reference_backend=reference,
         serving_backend=serving_backend,
-        reference=reference,
         reward_fn=reward,
         rollout_generator=rollout,
         run_logger=None,
@@ -191,9 +190,9 @@ def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None
             super().__init__(learning_rate=1e-2, group_size=2)
             self.recorded_batches: list[LearnerBatch] = []
 
-        def optimize_batch(self, learner_batch: LearnerBatch):
+        def prepare_inputs(self, learner_batch: LearnerBatch):
             self.recorded_batches.append(learner_batch)
-            return super().optimize_batch(learner_batch)
+            return super().prepare_inputs(learner_batch)
 
     training_backend = RecordingTrainingBackend()
     serving_backend = TinyServingBackend()
@@ -206,9 +205,9 @@ def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None
     trainer = GRPOTrainer(
         config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, clip_ratio=0.2, kl_coefficient=0.0),
-        training_backend=training_backend,
+        actor_backend=training_backend,
+        reference_backend=None,
         serving_backend=serving_backend,
-        reference=None,
         reward_fn=reward,
         rollout_generator=rollout,
         run_logger=None,
@@ -544,12 +543,12 @@ def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> Non
     """FlashRL should fail fast when grouped GRPO cannot form full prompt groups."""
     with pytest.raises(ValueError, match="divisible by grpo.group_size"):
         FlashRL(
-            model="fake/model",
+            actor_config=TrainingConfig(model_name="fake/model"),
+            serving_config=ServingConfig(model_name="fake/model"),
+            trainer_config=TrainerConfig(batch_size=3, max_epochs=1),
+            grpo_config=GrpoConfig(group_size=2),
             rollout_fn=make_rollout_fn(response_suffix="invalid", repeat=1),
             reward_fn=reward_fn,
-            batch_size=3,
-            max_epochs=1,
-            grpo_config=GrpoConfig(group_size=2),
             logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
             metrics_config=MetricsConfig(enabled=False),
         )

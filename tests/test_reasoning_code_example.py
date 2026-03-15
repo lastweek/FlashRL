@@ -410,8 +410,8 @@ def test_reasoning_code_cli_help_uses_explicit_flag_surface() -> None:
     train_help = reasoning_code.build_argument_parser().format_help()
     assert "--config" in train_help
     assert "--train-limit" in train_help
-    assert "--checkpoint" in train_help
-    assert "--checkpoint-out" in train_help
+    assert "--checkpoint" not in train_help
+    assert "--checkpoint-out" not in train_help
     assert "--rating-min" in train_help
     assert "--rating-max" in train_help
     assert "--run-timeout-seconds" in train_help
@@ -450,7 +450,6 @@ def test_prepare_reasoning_code_environment_sets_default_vllm_runtime(
 
 def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
     monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
 ) -> None:
     """The code example should pass config_path into FlashRL instead of parsing YAML locally."""
     captured: dict[str, object] = {}
@@ -461,9 +460,6 @@ def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
 
         def train(self, dataset) -> None:
             captured["dataset"] = dataset
-
-        def save_checkpoint(self, path: str) -> None:
-            captured["checkpoint_out"] = path
 
         def close(self) -> None:
             return None
@@ -479,8 +475,6 @@ def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
             "2.5",
             "--memory-limit-mb",
             "123",
-            "--checkpoint-out",
-            str(tmp_path / "reasoning-code.pt"),
         ]
     )
 
@@ -488,7 +482,21 @@ def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
     assert captured["config_path"] == "flashrl/framework/examples/reasoning-code/config.yaml"
     assert callable(captured["rollout_fn"])
     assert callable(captured["reward_fn"])
-    assert captured["checkpoint_out"] == str(tmp_path / "reasoning-code.pt")
+    assert "checkpoint_out" not in captured
+
+
+def test_reasoning_code_train_is_the_real_example_module() -> None:
+    """train.py should hold the actual code example logic without workflow indirection."""
+    train_source = Path("flashrl/framework/examples/reasoning-code/train.py").read_text(
+        encoding="utf-8"
+    )
+    eval_source = Path("flashrl/framework/examples/reasoning-code/eval.py").read_text(
+        encoding="utf-8"
+    )
+    assert "WORKFLOW_PATH" not in train_source
+    assert "exec(compile(" not in train_source
+    assert "import train as code_example" in eval_source
+    assert not Path("flashrl/framework/examples/reasoning-code/workflow.py").exists()
 
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(

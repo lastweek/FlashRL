@@ -1,19 +1,20 @@
 # FlashRL runtime/training profile for the reasoning-code example.
-common:
+actor:
   model_name: Qwen/Qwen2.5-Coder-1.5B
-
-training:
   num_threads: 1
-  learning_rate: 1.0e-5
-  batch_size: 2
-  max_epochs: 1
 
 serving:
+  model_name: Qwen/Qwen2.5-Coder-1.5B
   backend: vllm
   runtime_python: ${FLASHRL_VLLM_PYTHON}
   num_replicas: 1
   num_threads: 1
   debug_live_rollout: false
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
 
 grpo:
   group_size: 2
@@ -39,5 +40,9 @@ metrics:
     url: http://localhost:9091
     job_name: flashrl
 
-runtime:
-  reference_enabled: false
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_reasoning_code_checkpoint.pt
+
+admin:
+  admin_enabled: true

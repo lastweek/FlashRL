@@ -410,16 +410,18 @@ class RunLogger:
         dtype: str,
         cpu_threads: int,
         runtime_shape: str,
-        reference_enabled: bool,
-        reference_device: str,
+        reference_configured: bool,
         group_size: int | None = None,
         clip_ratio: float | None = None,
         prompts_per_step: int | None = None,
         steps_per_epoch: int | None = None,
         total_planned_steps: int | None = None,
-        training_backend: str | None = None,
-        training_device: str | None = None,
-        training_dp_size: int | None = None,
+        actor_backend: str | None = None,
+        actor_device: str | None = None,
+        actor_dp_size: int | None = None,
+        reference_backend: str | None = None,
+        reference_device: str | None = None,
+        reference_dp_size: int | None = None,
         serving_backend: str | None = None,
         serving_device: str | None = None,
         serving_num_replicas: int | None = None,
@@ -439,16 +441,18 @@ class RunLogger:
             dtype=dtype,
             cpu_threads=cpu_threads,
             runtime_shape=runtime_shape,
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
+            reference_configured=reference_configured,
             group_size=group_size,
             clip_ratio=clip_ratio,
             prompts_per_step=prompts_per_step,
             steps_per_epoch=steps_per_epoch,
             total_planned_steps=total_planned_steps,
-            training_backend=training_backend,
-            training_device=training_device,
-            training_dp_size=training_dp_size,
+            actor_backend=actor_backend,
+            actor_device=actor_device,
+            actor_dp_size=actor_dp_size,
+            reference_backend=reference_backend,
+            reference_device=reference_device,
+            reference_dp_size=reference_dp_size,
             serving_backend=serving_backend,
             serving_device=serving_device,
             serving_num_replicas=serving_num_replicas,
@@ -469,16 +473,18 @@ class RunLogger:
         dtype: str,
         cpu_threads: int,
         runtime_shape: str,
-        reference_enabled: bool,
-        reference_device: str,
+        reference_configured: bool,
         group_size: int | None = None,
         clip_ratio: float | None = None,
         prompts_per_step: int | None = None,
         steps_per_epoch: int | None = None,
         total_planned_steps: int | None = None,
-        training_backend: str | None = None,
-        training_device: str | None = None,
-        training_dp_size: int | None = None,
+        actor_backend: str | None = None,
+        actor_device: str | None = None,
+        actor_dp_size: int | None = None,
+        reference_backend: str | None = None,
+        reference_device: str | None = None,
+        reference_dp_size: int | None = None,
         serving_backend: str | None = None,
         serving_device: str | None = None,
         serving_num_replicas: int | None = None,
@@ -498,16 +504,18 @@ class RunLogger:
             dtype=dtype,
             cpu_threads=cpu_threads,
             runtime_shape=runtime_shape,
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
+            reference_configured=reference_configured,
             group_size=group_size,
             clip_ratio=clip_ratio,
             prompts_per_step=prompts_per_step,
             steps_per_epoch=steps_per_epoch,
             total_planned_steps=total_planned_steps,
-            training_backend=training_backend,
-            training_device=training_device,
-            training_dp_size=training_dp_size,
+            actor_backend=actor_backend,
+            actor_device=actor_device,
+            actor_dp_size=actor_dp_size,
+            reference_backend=reference_backend,
+            reference_device=reference_device,
+            reference_dp_size=reference_dp_size,
             serving_backend=serving_backend,
             serving_device=serving_device,
             serving_num_replicas=serving_num_replicas,
@@ -529,16 +537,18 @@ class RunLogger:
         dtype: str,
         cpu_threads: int,
         runtime_shape: str,
-        reference_enabled: bool,
-        reference_device: str,
+        reference_configured: bool,
         group_size: int | None = None,
         clip_ratio: float | None = None,
         prompts_per_step: int | None = None,
         steps_per_epoch: int | None = None,
         total_planned_steps: int | None = None,
-        training_backend: str | None = None,
-        training_device: str | None = None,
-        training_dp_size: int | None = None,
+        actor_backend: str | None = None,
+        actor_device: str | None = None,
+        actor_dp_size: int | None = None,
+        reference_backend: str | None = None,
+        reference_device: str | None = None,
+        reference_dp_size: int | None = None,
         serving_backend: str | None = None,
         serving_device: str | None = None,
         serving_num_replicas: int | None = None,
@@ -564,8 +574,7 @@ class RunLogger:
             "dtype": dtype,
             "cpu_threads": cpu_threads,
             "runtime_shape": runtime_shape,
-            "reference_enabled": reference_enabled,
-            "reference_device": reference_device,
+            "reference_configured": reference_configured,
             "group_size": group_size,
             "clip_ratio": clip_ratio,
             "dataset_prompt_count": dataset_size,
@@ -575,9 +584,12 @@ class RunLogger:
             "planned_completions_per_step": batch_size,
             "steps_per_epoch": steps_per_epoch,
             "total_planned_steps": total_planned_steps,
-            "training_backend": training_backend,
-            "training_device": training_device,
-            "training_dp_size": training_dp_size,
+            "actor_backend": actor_backend,
+            "actor_device": actor_device,
+            "actor_dp_size": actor_dp_size,
+            "reference_backend": reference_backend,
+            "reference_device": reference_device,
+            "reference_dp_size": reference_dp_size,
             "serving_backend": serving_backend,
             "serving_device": serving_device,
             "serving_num_replicas": serving_num_replicas,
@@ -597,16 +609,18 @@ class RunLogger:
             max_epochs=max_epochs,
             total_batches=total_batches,
             runtime_shape=runtime_shape,
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
+            reference_configured=reference_configured,
             group_size=group_size,
             clip_ratio=clip_ratio,
             prompts_per_step=prompts_per_step,
             steps_per_epoch=steps_per_epoch,
             total_planned_steps=total_planned_steps,
-            training_backend=training_backend,
-            training_device=training_device,
-            training_dp_size=training_dp_size,
+            actor_backend=actor_backend,
+            actor_device=actor_device,
+            actor_dp_size=actor_dp_size,
+            reference_backend=reference_backend,
+            reference_device=reference_device,
+            reference_dp_size=reference_dp_size,
             serving_backend=serving_backend,
             serving_device=serving_device,
             serving_num_replicas=serving_num_replicas,
@@ -1097,37 +1111,46 @@ class RunLogger:
         max_epochs: int,
         total_batches: int,
         runtime_shape: str,
-        reference_enabled: bool,
-        reference_device: str,
+        reference_configured: bool,
         group_size: int | None,
         clip_ratio: float | None,
         prompts_per_step: int | None,
         steps_per_epoch: int | None,
         total_planned_steps: int | None,
-        training_backend: str | None,
-        training_device: str | None,
-        training_dp_size: int | None,
+        actor_backend: str | None,
+        actor_device: str | None,
+        actor_dp_size: int | None,
+        reference_backend: str | None,
+        reference_device: str | None,
+        reference_dp_size: int | None,
         serving_backend: str | None,
         serving_device: str | None,
         serving_num_replicas: int | None,
         admin_base_url: str | None,
         max_new_tokens: int | None,
     ) -> list[str]:
-        reference_state = "enabled" if reference_enabled else "disabled"
+        reference_state = "configured" if reference_configured else "disabled"
         lines = [
             "FlashRL training run",
             f"  run      #{_format_run_index(self.run_index)}  {self.run_id}",
             f"  model    {self.model_name}  device={device} dtype={dtype} cpu={cpu_threads}",
             f"  data     dataset_prompts={dataset_size} epochs={max_epochs} total_batches={total_batches}",
-            f"  runtime  {runtime_shape}  reference={reference_state} ref_device={reference_device}",
+            f"  runtime  {runtime_shape}  reference={reference_state}",
         ]
-        training_line = self._format_compact_training_line(
-            training_backend=training_backend,
-            training_device=training_device,
-            training_dp_size=training_dp_size,
+        actor_line = self._format_compact_actor_line(
+            actor_backend=actor_backend,
+            actor_device=actor_device,
+            actor_dp_size=actor_dp_size,
         )
-        if training_line is not None:
-            lines.append(training_line)
+        if actor_line is not None:
+            lines.append(actor_line)
+        reference_line = self._format_compact_reference_line(
+            reference_backend=reference_backend,
+            reference_device=reference_device,
+            reference_dp_size=reference_dp_size,
+        )
+        if reference_line is not None:
+            lines.append(reference_line)
         serving_line = self._format_compact_serving_line(
             serving_backend=serving_backend,
             serving_device=serving_device,
@@ -1159,18 +1182,32 @@ class RunLogger:
         lines.append(f"  logs     {self.run_dir}")
         return lines
 
-    def _format_compact_training_line(
+    def _format_compact_actor_line(
         self,
         *,
-        training_backend: str | None,
-        training_device: str | None,
-        training_dp_size: int | None,
+        actor_backend: str | None,
+        actor_device: str | None,
+        actor_dp_size: int | None,
     ) -> str | None:
-        if training_backend is None or training_device is None:
+        if actor_backend is None or actor_device is None:
             return None
-        line = f"  training backend={training_backend}  device={training_device}"
-        if training_dp_size is not None:
-            line += f"  dp_size={training_dp_size}"
+        line = f"  actor    backend={actor_backend}  device={actor_device}"
+        if actor_dp_size is not None:
+            line += f"  dp_size={actor_dp_size}"
+        return line
+
+    def _format_compact_reference_line(
+        self,
+        *,
+        reference_backend: str | None,
+        reference_device: str | None,
+        reference_dp_size: int | None,
+    ) -> str | None:
+        if reference_backend is None or reference_device is None:
+            return None
+        line = f"  reference backend={reference_backend}  device={reference_device}"
+        if reference_dp_size is not None:
+            line += f"  dp_size={reference_dp_size}"
         return line
 
     def _format_compact_serving_line(
@@ -1201,18 +1238,18 @@ class RunLogger:
             line += f" replicas={serving_num_replicas}"
         return line
 
-    def _format_verbose_training_line(
+    def _format_verbose_actor_line(
         self,
         *,
-        training_backend: str | None,
-        training_device: str | None,
-        training_dp_size: int | None,
+        actor_backend: str | None,
+        actor_device: str | None,
+        actor_dp_size: int | None,
     ) -> str | None:
-        if training_backend is None or training_device is None:
+        if actor_backend is None or actor_device is None:
             return None
-        line = f"  training backend={training_backend} device={training_device}"
-        if training_dp_size is not None:
-            line += f" dp_size={training_dp_size}"
+        line = f"  actor backend={actor_backend} device={actor_device}"
+        if actor_dp_size is not None:
+            line += f" dp_size={actor_dp_size}"
         return line
 
     def _format_compact_step_header(self, payload: dict[str, Any]) -> str:
@@ -1361,9 +1398,9 @@ class RunLogger:
 
     def _format_compact_lifecycle(self, lifecycle_totals: dict[str, float]) -> str:
         label_map = {
-            "startup_training_backend_seconds": "train_init",
+            "startup_actor_backend_seconds": "actor_init",
             "startup_serving_backend_seconds": "serve_init",
-            "startup_reference_model_seconds": "ref_init",
+            "startup_reference_backend_seconds": "ref_init",
             "startup_total_seconds": "startup",
             "training_loop_seconds": "train_loop",
             "checkpoint_save_seconds": "ckpt_save",

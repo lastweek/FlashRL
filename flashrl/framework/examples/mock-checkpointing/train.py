@@ -11,10 +11,10 @@ from typing import Iterator
 import torch
 import torch.nn.functional as F
 
-from flashrl.framework import FlashRL, GrpoConfig, TrainingConfig
+from flashrl.framework import FlashRL, TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.serving.base import ServingBackend
-from flashrl.framework.training import TrainingBackend
+from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 
 
 DEFAULT_LOG_DIR = Path("logs/mock-checkpointing")
@@ -103,32 +103,49 @@ class MockActor:
         self.model.eval()
 
 
-class MockTrainingBackend(TrainingBackend):
+class MockTrainingBackend(ActorTrainingBackend):
     """Tiny local training backend for the checkpointing demo."""
 
     def __init__(
         self,
         config,
         learning_rate: float = 1e-5,
-        grpo_config: GrpoConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
     ) -> None:
         resolved_config = config or TrainingConfig(model_name="mock/model", device="cpu")
         super().__init__(
             resolved_config,
             learning_rate=learning_rate,
-            grpo_config=grpo_config or GrpoConfig(group_size=2),
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
         )
-        self.actor = MockActor(bias_shift=0.2)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.model_copy = MockActor(bias_shift=0.2)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
+
+
+class MockReferenceBackend(TrainingBackend):
+    """Tiny frozen reference backend for the checkpointing demo."""
+
+    def __init__(self, config) -> None:
+        resolved_config = config or TrainingConfig(model_name="mock/model", device="cpu")
+        super().__init__(resolved_config, role="reference")
+        self.model_copy = MockActor(bias_shift=0.0)
+        self.model_copy.eval()
+        self.model_copy.model.requires_grad_(False)
+        self.device = self.model_copy.device
+        self.startup_events = [
+            {
+                "component": "reference_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -241,14 +258,10 @@ def install_mock_backends() -> Iterator[None]:
     original_training_factory = flashrl_module.create_training_backend
     original_serving_factory = flashrl_module.create_serving_backend
     flashrl_module.create_training_backend = (
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            MockTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
+        lambda config, role, learning_rate=None: (
+            MockTrainingBackend(config, learning_rate=float(learning_rate or 1e-5))
+            if role == "actor"
+            else MockReferenceBackend(config)
         )
     )
     flashrl_module.create_serving_backend = lambda config, startup_logger=None: MockServingBackend(
@@ -273,18 +286,21 @@ def build_run_config(args: argparse.Namespace) -> dict[str, object]:
         checkpointing["save_on_run_end"] = True
 
     return {
-        "training": {
+        "actor": {
             "model_name": "mock/checkpoint-model",
             "backend": "huggingface",
             "device": "cpu",
-            "batch_size": 2,
-            "max_epochs": int(args.max_epochs),
-            "shuffle_each_epoch": False,
         },
         "serving": {
             "model_name": "mock/checkpoint-model",
             "backend": "huggingface",
             "device": "cpu",
+        },
+        "trainer": {
+            "learning_rate": 1.0e-5,
+            "batch_size": 2,
+            "max_epochs": int(args.max_epochs),
+            "shuffle_each_epoch": False,
         },
         "grpo": {
             "group_size": 2,
@@ -298,7 +314,7 @@ def build_run_config(args: argparse.Namespace) -> dict[str, object]:
             "enabled": False,
         },
         "checkpointing": checkpointing,
-        "runtime": {
+        "admin": {
             "admin_enabled": False,
         },
     }

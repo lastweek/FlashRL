@@ -1,4 +1,4 @@
-"""In-process Hugging Face training backend."""
+"""In-process Hugging Face training backends."""
 
 from __future__ import annotations
 
@@ -6,46 +6,36 @@ import time
 
 import torch
 
-from flashrl.framework.config import GrpoConfig, TrainingConfig
+from flashrl.framework.config import TrainingConfig
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.models.device import set_num_threads
-from flashrl.framework.models.reference import ReferenceModel
-from flashrl.framework.training.base import TrainingBackend
+from flashrl.framework.training.base import ActorTrainingBackend, TrainingBackend
 
 
-class HuggingFaceTrainingBackend(TrainingBackend):
-    """Single-process training backend backed by a local Hugging Face model."""
+class HuggingFaceTrainingBackend(ActorTrainingBackend):
+    """Single-process trainable actor backend backed by a local Hugging Face model."""
 
     def __init__(
         self,
         config: TrainingConfig,
         *,
         learning_rate: float,
-        grpo_config: GrpoConfig,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
     ) -> None:
-        super().__init__(
-            config,
-            learning_rate=learning_rate,
-            grpo_config=grpo_config,
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
-        )
+        super().__init__(config, learning_rate=learning_rate)
 
         set_num_threads(config.num_threads)
 
         started_at = time.perf_counter()
-        self.actor = ActorModel(config)
-        self.actor.train()
-        self.device = self.actor.device
+        self.model_copy = ActorModel(config)
+        self.model_copy.train()
+        self.device = self.model_copy.device
         self.optimizer = torch.optim.Adam(
-            self.actor.model.parameters(),
+            self.model_copy.model.parameters(),
             lr=learning_rate,
         )
         self.startup_events.append(
             {
-                "component": "training_backend",
+                "component": self.component_name,
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -55,21 +45,27 @@ class HuggingFaceTrainingBackend(TrainingBackend):
             }
         )
 
-        if not reference_enabled:
-            return
+
+class HuggingFaceReferenceBackend(TrainingBackend):
+    """Single-process frozen reference backend backed by a local Hugging Face model."""
+
+    def __init__(self, config: TrainingConfig) -> None:
+        super().__init__(config, role="reference")
+
+        set_num_threads(config.num_threads)
 
         started_at = time.perf_counter()
-        reference_config = config.model_copy(
-            update={"device": reference_device or config.device}
-        )
-        self.reference = ReferenceModel(reference_config)
+        self.model_copy = ActorModel(config)
+        self.model_copy.eval()
+        self.model_copy.model.requires_grad_(False)
+        self.device = self.model_copy.device
         self.startup_events.append(
             {
-                "component": "reference_model",
+                "component": self.component_name,
                 "status": "completed",
                 "metadata": {
-                    "device": str(self.reference.device),
-                    "cpu_threads": reference_config.num_threads,
+                    "device": str(self.device),
+                    "cpu_threads": config.num_threads,
                     "duration_seconds": time.perf_counter() - started_at,
                 },
             }

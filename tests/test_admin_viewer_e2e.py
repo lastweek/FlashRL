@@ -11,7 +11,14 @@ from typing import TYPE_CHECKING
 import pytest
 
 import flashrl.framework.flashrl as flashrl_module
-from flashrl.framework.config import LoggingConfig, MetricsConfig, ServingConfig
+from flashrl.framework.config import (
+    GrpoConfig,
+    LoggingConfig,
+    MetricsConfig,
+    ServingConfig,
+    TrainerConfig,
+    TrainingConfig,
+)
 from flashrl.framework.flashrl import FlashRL
 from tests.test_admin import AdminServingBackend, StubTrainingBackend, build_rollout_fn, reward_fn
 
@@ -49,14 +56,9 @@ def test_viewer_renders_live_runtime_and_run_history_workspaces(
     monkeypatch.setattr(
         flashrl_module,
         "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
+        lambda config, role, learning_rate=None: StubTrainingBackend(
+            config,
+            learning_rate=float(learning_rate or 1e-5),
         ),
     )
     monkeypatch.setattr(
@@ -65,10 +67,12 @@ def test_viewer_renders_live_runtime_and_run_history_workspaces(
         lambda config, startup_logger=None: AdminServingBackend(config),
     )
     trainer = FlashRL(
-        model="fake/model",
+        actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
+        serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=GrpoConfig(group_size=2),
         rollout_fn=build_rollout_fn,
         reward_fn=reward_fn,
-        serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
         logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
         metrics_config=MetricsConfig(enabled=False),
     )

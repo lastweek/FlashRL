@@ -562,8 +562,8 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
     assert "--config" in train_help
     assert "--dataset" in train_help
     assert "--train-limit" in train_help
-    assert "--checkpoint" in train_help
-    assert "--checkpoint-out" in train_help
+    assert "--checkpoint" not in train_help
+    assert "--checkpoint-out" not in train_help
     assert "--task-config" not in train_help
 
     eval_help = reasoning_eval.build_argument_parser().format_help()
@@ -619,3 +619,13 @@ def test_eval_module_imports_only_public_helpers_from_train() -> None:
         for node in ast.walk(tree)
     )
     assert "flashrl.framework.examples.reasoning" not in source
+
+
+def test_reasoning_math_train_is_the_real_example_module() -> None:
+    """train.py should hold the actual example logic without workflow indirection."""
+    train_source = Path("flashrl/framework/examples/reasoning-math/train.py").read_text(
+        encoding="utf-8"
+    )
+    assert "WORKFLOW_PATH" not in train_source
+    assert "exec(compile(" not in train_source
+    assert not Path("flashrl/framework/examples/reasoning-math/workflow.py").exists()

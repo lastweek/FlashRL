@@ -31,12 +31,12 @@ Use the files for different jobs:
 
 - `config.yaml` / `config_vllm.yaml`
   These are FlashRL profiles. They own things like:
-  `common.model_name`, `training.batch_size`, `training.max_epochs`,
-  `serving.backend`, `runtime.reference_enabled`, and `grpo.group_size`.
+  `actor.model_name`, `trainer.batch_size`, `trainer.max_epochs`,
+  `serving.backend`, `reference`, `grpo.group_size`, and
+  training checkpoint policy under `checkpointing`.
 
 - `train.py` / `eval.py` CLI flags
-  These own math-example details such as dataset limits, checkpoint paths, and
-  eval batch size.
+  These own math-example details such as dataset limits and eval batch size.
 
 That keeps the example-specific knobs visible in `--help` instead of hidden in a
 second YAML file.
@@ -171,8 +171,7 @@ Useful flags:
 python3 flashrl/framework/examples/reasoning-math/train.py \
   --config flashrl/framework/examples/reasoning-math/config.yaml \
   --dataset aime25 \
-  --train-limit 64 \
-  --checkpoint-out /tmp/flashrl_reasoning_checkpoint.pt
+  --train-limit 64
 ```
 
 Available flags:
@@ -180,11 +179,22 @@ Available flags:
 - `--config`: FlashRL runtime/training profile.
 - `--dataset`: choose `gsm8k` or `aime25`.
 - `--train-limit`: cap the number of training questions from the selected dataset.
-- `--checkpoint`: load a checkpoint before training.
-- `--checkpoint-out`: save the final checkpoint to a specific path.
 
-These explicit checkpoint flags are the manual operator path. For production
-training runs, prefer managed checkpointing in `RunConfig` / YAML.
+Training checkpointing is configured in YAML. The shipped example configs already
+write a final checkpoint to `/tmp/flashrl_reasoning_checkpoint.pt`.
+
+Example:
+
+```yaml
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_reasoning_checkpoint.pt
+  # Optional explicit resume:
+  # resume_from: /tmp/flashrl_reasoning_checkpoint.pt
+  # Optional managed latest resume:
+  # directory: logs/reasoning-math-checkpoints
+  # resume_from: latest
+```
 
 ### Evaluation
 
@@ -226,14 +236,14 @@ python3 flashrl/framework/examples/reasoning-math/eval.py --eval-limit 50
 
 Related FlashRL profile knobs:
 
-- `training.batch_size` changes total sampled completions per optimizer step.
+- `trainer.batch_size` changes total sampled completions per optimizer step.
 - `grpo.group_size` changes how many completions are sampled per prompt.
-- `training.max_epochs` changes how many times the loaded training questions are
+- `trainer.max_epochs` changes how many times the loaded training questions are
   reused.
 
 So the number of distinct questions comes from `--train-limit` or
 `--eval-limit`, while total training exposure depends on both that limit and
-`training.max_epochs`.
+`trainer.max_epochs`.
 
 In the printed dataset summary:
 
@@ -258,9 +268,9 @@ Dataset-specific defaults:
 
 Important batch semantics:
 
-- `training.batch_size` is the total number of sampled completions per optimizer
+- `trainer.batch_size` is the total number of sampled completions per optimizer
   step.
-- Prompts per step are `training.batch_size / grpo.group_size`.
+- Prompts per step are `trainer.batch_size / grpo.group_size`.
 - Example: `batch_size: 8` with `group_size: 4` means 2 prompts per optimizer
   step, each with 4 sampled completions.
 
@@ -279,14 +289,15 @@ The example does not fall back to parsing answers from free-form text.
 
 ## What To Edit First
 
-- `common.model_name`: switch to a different local or remote base model.
-- `training.batch_size`: raise or lower total sampled completions per step.
-- `training.max_epochs`: control how long the run lasts.
+- `actor.model_name`: switch to a different local or remote actor model.
+- `serving.model_name`: keep serving aligned with the actor model source.
+- `trainer.batch_size`: raise or lower total sampled completions per step.
+- `trainer.max_epochs`: control how long the run lasts.
 - `grpo.group_size`: change how many completions are sampled per prompt.
 - `grpo.max_new_tokens`: increase or cap reasoning length.
 - `serving.backend`: choose between local Hugging Face and managed vLLM.
 - `serving.runtime_python`: point vLLM mode at a prepared Python runtime.
-- `runtime.reference_enabled`: turn on the frozen reference model.
+- `reference`: add a frozen learner-side reference backend when using KL.
 - `grpo.kl_coefficient`: add KL regularization.
 
 ## What To Expect
@@ -297,8 +308,8 @@ The example does not fall back to parsing answers from free-form text.
   `debug_live_rollout`.
 - Default configs are prototype-scale and meant for local experimentation, not
   benchmark reproduction.
-- Training saves a checkpoint to `/tmp/flashrl_reasoning_checkpoint.pt` unless
-  `--checkpoint-out` overrides it.
+- The shipped configs save a final checkpoint to
+  `/tmp/flashrl_reasoning_checkpoint.pt` via `checkpointing.final_path`.
 - Run artifacts are written under `logs/` as `console.log`, `events.jsonl`, and
   `rollouts.jsonl`.
 - `rollouts.jsonl` keeps one row per prompt group, stores shared prompt messages

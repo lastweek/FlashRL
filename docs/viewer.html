@@ -1279,7 +1279,9 @@
         maxEpochs: startedPayload.max_epochs ?? null,
         totalBatches: startedPayload.total_batches ?? null,
         runtimeShape: startedPayload.runtime_shape || "unknown",
-        referenceEnabled: Boolean(startedPayload.reference_enabled),
+        referenceConfigured: Boolean(
+          startedPayload.reference_configured ?? startedPayload.reference_enabled
+        ),
         checkpointCount: checkpoints.length,
         exceptionCount: exceptions.length,
         modelLoadCount: modelLoads.length,
@@ -1462,7 +1464,7 @@
         ["Epochs", String(run.maxEpochs ?? "n/a")],
         ["Total Batches", String(run.totalBatches ?? "n/a")],
         ["Runtime", run.runtimeShape],
-        ["Reference", run.referenceEnabled ? "enabled" : "disabled"],
+        ["Reference", run.referenceConfigured ? "configured" : "disabled"],
       ]) {
         metadataList.appendChild(createDetailRow(label, value));
       }

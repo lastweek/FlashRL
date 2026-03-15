@@ -1,16 +1,17 @@
 # FlashRL runtime/training profile for the reasoning-math example.
-common:
+actor:
   model_name: Qwen/Qwen2.5-0.5B
-
-training:
   num_threads: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
   learning_rate: 1.0e-5
   batch_size: 2
   max_epochs: 1
-
-serving:
-  num_threads: 1
-  debug_live_rollout: true
 
 grpo:
   group_size: 2
@@ -36,5 +37,9 @@ metrics:
     url: http://localhost:9091
     job_name: flashrl
 
-runtime:
-  reference_enabled: false
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_reasoning_checkpoint.pt
+
+admin:
+  admin_enabled: true

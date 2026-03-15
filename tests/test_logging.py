@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
-from flashrl.framework.config import RunConfig, TrainerConfig, TrainingConfig
+from flashrl.framework.config import AdminConfig, RunConfig, ServingConfig, TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
     Message,
@@ -26,7 +26,7 @@ from flashrl.framework.data_models import (
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.run_logger import RunLogger, _factor_shared_messages
-from flashrl.framework.training import TrainingBackend
+from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 from flashrl.framework.trainer.grpo import GRPOTrainer
 
 
@@ -186,7 +186,7 @@ class FakeActor:
         return None
 
 
-class FakeTrainingBackend(TrainingBackend):
+class FakeTrainingBackend(ActorTrainingBackend):
     """Training backend used for logging tests."""
 
     init_count = 0
@@ -195,26 +195,20 @@ class FakeTrainingBackend(TrainingBackend):
         self,
         config,
         learning_rate: float = 1e-5,
-        grpo_config: GrpoConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
     ) -> None:
         type(self).init_count += 1
         resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
         super().__init__(
             resolved_config,
             learning_rate=learning_rate,
-            grpo_config=grpo_config or GrpoConfig(group_size=2),
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
         )
-        self.actor = FakeActor(bias_shift=0.25)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.model_copy = FakeActor(bias_shift=0.25)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -223,35 +217,6 @@ class FakeTrainingBackend(TrainingBackend):
                 },
             }
         ]
-        if reference_enabled:
-            self.reference = FakeReferenceModel(
-                config=resolved_config.model_copy(
-                    update={"device": reference_device or resolved_config.device}
-                )
-            )
-            self.startup_events.append(
-                {
-                    "component": "reference_model",
-                    "status": "completed",
-                    "metadata": {
-                        "device": str(self.reference.device),
-                        "cpu_threads": resolved_config.num_threads,
-                        "duration_seconds": 0.0,
-                    },
-                }
-            )
-
-    def save_checkpoint(
-        self,
-        path: str,
-        controller_state: dict | None = None,
-        checkpoint_metadata: dict | None = None,
-    ) -> None:
-        super().save_checkpoint(
-            path,
-            controller_state=controller_state,
-            checkpoint_metadata=checkpoint_metadata,
-        )
 
 
 def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
@@ -301,16 +266,30 @@ class FakeServingBackend:
         return None
 
 
-class FakeReferenceModel:
-    """Reference model used for KL computation in tests."""
+class FakeReferenceModel(TrainingBackend):
+    """Reference backend used for KL computation in tests."""
 
     init_count = 0
 
     def __init__(self, config) -> None:
-        del config
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
         type(self).init_count += 1
+        super().__init__(resolved_config, role="reference")
         self.device = torch.device("cpu")
-        self.model = FakeCausalLM(bias_shift=0.0)
+        self.model_copy = FakeActor(bias_shift=0.0)
+        self.model_copy.eval()
+        self.model_copy.model.requires_grad_(False)
+        self.startup_events = [
+            {
+                "component": "reference_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
 
 
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):
@@ -369,20 +348,47 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+        lambda config, role, learning_rate=None: (
             FakeTrainingBackend(
                 config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
+                learning_rate=float(learning_rate or 1e-5),
             )
+            if role == "actor"
+            else FakeReferenceModel(config)
         ),
     )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
         lambda config, startup_logger=None: FakeServingBackend(config),
+    )
+
+
+def build_flashrl(
+    tmp_path: Path,
+    *,
+    rollout_callback,
+    reward_callback,
+    reference_config: TrainingConfig | None = None,
+    serving_config: ServingConfig | None = None,
+    trainer_config: TrainerConfig | None = None,
+    grpo_config: GrpoConfig | None = None,
+    logging_config: LoggingConfig | None = None,
+    metrics_config: MetricsConfig | None = None,
+) -> FlashRL:
+    """Create a FlashRL instance through the explicit role-based config API."""
+    return FlashRL(
+        actor_config=TrainingConfig(model_name="fake/model", backend="huggingface", device="cpu"),
+        reference_config=reference_config,
+        serving_config=serving_config
+        or ServingConfig(model_name="fake/model", backend="huggingface", device="cpu"),
+        trainer_config=trainer_config or TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=grpo_config or GrpoConfig(group_size=2),
+        rollout_fn=rollout_callback,
+        reward_fn=reward_callback,
+        logging_config=logging_config or LoggingConfig(log_dir=tmp_path, console=False, file=True),
+        metrics_config=metrics_config or MetricsConfig(enabled=False),
+        admin_config=AdminConfig(admin_enabled=True),
     )
 
 
@@ -425,18 +431,21 @@ def build_managed_run_config(
         checkpointing["resume_from"] = resume_from
 
     return {
-        "training": {
+        "actor": {
             "model_name": "fake/model",
             "backend": "huggingface",
             "device": "cpu",
-            "batch_size": 2,
-            "max_epochs": max_epochs,
-            "shuffle_each_epoch": False,
         },
         "serving": {
             "model_name": "fake/model",
             "backend": "huggingface",
             "device": "cpu",
+        },
+        "trainer": {
+            "learning_rate": 1.0e-5,
+            "batch_size": 2,
+            "max_epochs": max_epochs,
+            "shuffle_each_epoch": False,
         },
         "grpo": {
             "group_size": 2,
@@ -450,7 +459,7 @@ def build_managed_run_config(
             "enabled": False,
         },
         "checkpointing": checkpointing,
-        "runtime": {
+        "admin": {
             "admin_enabled": False,
         },
     }
@@ -684,8 +693,7 @@ def test_run_logger_start_run_creates_run_artifacts(tmp_path: Path) -> None:
         dtype="float32",
         cpu_threads=1,
         runtime_shape="single-device-per-backend",
-        reference_enabled=False,
-        reference_device="auto",
+        reference_configured=False,
         group_size=2,
         clip_ratio=0.2,
         prompts_per_step=2,
@@ -766,13 +774,11 @@ def test_flashrl_constructor_emits_bootstrap_stage_lines(
     """Constructor startup should emit immediate stage lines before training begins."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         serving_config=flashrl_module.ServingConfig(
             model_name="fake/model",
             backend="vllm",
@@ -787,10 +793,10 @@ def test_flashrl_constructor_emits_bootstrap_stage_lines(
     )
 
     output = capsys.readouterr().out
-    assert "FlashRL startup\n  startup  model=fake/model  training=huggingface  dp_size=1" in output
+    assert "FlashRL startup\n  startup  model=fake/model  actor=huggingface  dp_size=1" in output
     assert "serving=vllm replicas=2  reference=disabled" in output
-    assert "  startup  training_backend  starting backend=huggingface dp_size=1" in output
-    assert "  ready    training_backend  backend=huggingface device=cpu dp_size=1 cpu=1" in output
+    assert "  startup  actor_backend     starting backend=huggingface dp_size=1" in output
+    assert "  ready    actor_backend     backend=huggingface device=cpu dp_size=1 cpu=1" in output
     assert "  startup  serving_backend   starting backend=vllm replicas=2" in output
     assert "  ready    serving_backend   backend=vllm device=cpu replicas=2" in output
     assert re.search(r"  ready\s+admin\s+url=http://127\.0\.0\.1:\d+", output)
@@ -807,13 +813,11 @@ def test_flashrl_constructor_keeps_console_silent_when_disabled(
     """Constructor startup should stay silent when console logging is disabled."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -853,13 +857,15 @@ def test_run_logger_compact_console_groups_step_output(
         dtype="float32",
         cpu_threads=1,
         runtime_shape="single-device-per-backend",
-        reference_enabled=False,
-        reference_device="auto",
+        reference_configured=False,
         group_size=2,
         clip_ratio=0.2,
         prompts_per_step=2,
         steps_per_epoch=2,
         total_planned_steps=2,
+        actor_backend="huggingface",
+        actor_device="cpu",
+        actor_dp_size=1,
         serving_backend="vllm",
         serving_device="auto",
         serving_num_replicas=2,
@@ -867,7 +873,7 @@ def test_run_logger_compact_console_groups_step_output(
         max_new_tokens=256,
     )
     logger.log_model_load(
-        "training_backend",
+        "actor_backend",
         "completed",
         {
             "device": "cpu",
@@ -955,7 +961,7 @@ def test_run_logger_compact_console_groups_step_output(
                 "reference_forward": 0.0,
             },
             "stage_order": ["rollout", "reward"],
-            "reference_enabled": False,
+            "reference_configured": False,
             "reference_active": False,
             "dominant_stage": "rollout",
         }
@@ -1019,7 +1025,7 @@ def test_run_logger_compact_console_groups_step_output(
                 "reference_forward": 0.0,
             },
             "stage_order": ["rollout"],
-            "reference_enabled": False,
+            "reference_configured": False,
             "reference_active": False,
             "dominant_stage": "rollout",
         }
@@ -1062,7 +1068,7 @@ def test_run_logger_compact_console_groups_step_output(
     assert "  grpo     completions_per_prompt=2  clip=0.2000  max_new_tokens=256" in transcript
     assert "  mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in transcript
     assert "  progress steps_per_epoch=2  total_steps=2" in transcript
-    assert "load training_backend" not in transcript
+    assert "load actor_backend" not in transcript
     assert (
         "step 1/2  epoch 1/1  batch 1/2  prompt_window=1-2/4  "
         "prompts_this_step=2/2  completions_per_prompt=2  completions_this_step=4/4"
@@ -1161,7 +1167,7 @@ def test_run_logger_verbose_console_separates_step_blocks(tmp_path: Path) -> Non
             "step_duration_seconds": 0.5,
             "stage_timings": {"rollout": 0.25},
             "stage_order": ["rollout"],
-            "reference_enabled": False,
+            "reference_configured": False,
             "reference_active": False,
             "dominant_stage": "rollout",
         }
@@ -1300,7 +1306,7 @@ def test_run_logger_serving_debug_uses_compact_terminal_status_and_keeps_file_tr
             "step_duration_seconds": 0.5,
             "stage_timings": {"rollout": 0.25},
             "stage_order": ["rollout"],
-            "reference_enabled": False,
+            "reference_configured": False,
             "reference_active": False,
             "dominant_stage": "rollout",
         }
@@ -1455,13 +1461,11 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     monkeypatch.setattr(flashrl_module, "UserDefinedReward", CountingReward)
     monkeypatch.setattr(flashrl_module, "GRPOTrainer", CountingTrainer)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="reuse", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="reuse", repeat=2),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1478,7 +1482,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     }
 
     component_ids = {
-        "training_backend": id(trainer._training_backend),
+        "actor_backend": id(trainer._actor_backend),
         "serving_backend": id(trainer._serving_backend),
         "rollout": id(trainer._rollout_generator),
         "reward": id(trainer._reward),
@@ -1493,7 +1497,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
 
     assert first_run_dir != second_run_dir
     assert component_ids == {
-        "training_backend": id(trainer._training_backend),
+        "actor_backend": id(trainer._actor_backend),
         "serving_backend": id(trainer._serving_backend),
         "rollout": id(trainer._rollout_generator),
         "reward": id(trainer._reward),
@@ -1511,7 +1515,7 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     events = read_events(second_run_dir)
     assert any(
         event["event"] == "model_load"
-        and event["payload"].get("component") == "training_backend"
+        and event["payload"].get("component") == "actor_backend"
         and event["payload"].get("status") == "completed"
         for event in events
     )
@@ -1526,13 +1530,11 @@ def test_flashrl_train_orchestrates_private_run_helpers_in_order(
     """FlashRL.train() should read as one ordered run lifecycle."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="order", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="order", repeat=2),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1602,9 +1604,9 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     trainer = GRPOTrainer(
         config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.0),
-        training_backend=training_backend,
+        actor_backend=training_backend,
         serving_backend=serving_backend,
-        reference=None,
+        reference_backend=None,
         reward_fn=reward,
         rollout_generator=rollout,
         run_logger=logger,
@@ -1620,16 +1622,15 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         dtype="float32",
         cpu_threads=1,
         runtime_shape="single-device-per-backend",
-        reference_enabled=False,
-        reference_device="auto",
+        reference_configured=False,
         group_size=2,
         clip_ratio=0.2,
         prompts_per_step=2,
         steps_per_epoch=3,
         total_planned_steps=3,
-        training_backend="huggingface",
-        training_device="cpu",
-        training_dp_size=1,
+        actor_backend="huggingface",
+        actor_device="cpu",
+        actor_dp_size=1,
         serving_backend="huggingface",
         serving_device="cpu",
         admin_base_url="http://127.0.0.1:43123/admin",
@@ -1676,7 +1677,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert "reward_std" in reward_event["payload"]
 
     step_done = next(event for event in events if event["event"] == "step_done")
-    assert step_done["payload"]["reference_enabled"] is False
+    assert step_done["payload"]["reference_configured"] is False
     assert step_done["payload"]["stage_timings"]["reference_forward"] == 0.0
     assert step_done["payload"]["stage_order"] == [
         "rollout",
@@ -1702,8 +1703,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert "phase_group_totals" not in epoch_summary["payload"]
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
-    assert "  runtime  single-device-per-backend  reference=disabled ref_device=auto" in transcript
-    assert "  training backend=huggingface  device=cpu  dp_size=1" in transcript
+    assert "  runtime  single-device-per-backend  reference=disabled" in transcript
+    assert "  actor    backend=huggingface  device=cpu  dp_size=1" in transcript
     assert "  serving  backend=huggingface  device=cpu" in transcript
     assert "  admin    http://127.0.0.1:43123/admin" in transcript
     assert "cpu=1" in transcript
@@ -1787,9 +1788,9 @@ def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
     trainer = GRPOTrainer(
         config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.0),
-        training_backend=training_backend,
+        actor_backend=training_backend,
         serving_backend=serving_backend,
-        reference=None,
+        reference_backend=None,
         reward_fn=UserDefinedReward(reward_fn=reward_with_metadata, config=SimpleNamespace()),
         rollout_generator=rollout,
         run_logger=logger,
@@ -1805,16 +1806,15 @@ def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
         dtype="float32",
         cpu_threads=1,
         runtime_shape="single-device-per-backend",
-        reference_enabled=False,
-        reference_device="auto",
+        reference_configured=False,
         group_size=2,
         clip_ratio=0.2,
         prompts_per_step=2,
         steps_per_epoch=1,
         total_planned_steps=1,
-        training_backend="huggingface",
-        training_device="cpu",
-        training_dp_size=1,
+        actor_backend="huggingface",
+        actor_device="cpu",
+        actor_dp_size=1,
         serving_backend="huggingface",
         serving_device="cpu",
     )
@@ -1856,9 +1856,9 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
             clip_ratio=0.2,
             kl_coefficient=0.3,
         ),
-        training_backend=training_backend,
+        actor_backend=training_backend,
         serving_backend=serving_backend,
-        reference=reference,
+        reference_backend=reference,
         reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
         rollout_generator=UserDefinedRollout(
             rollout_fn=make_rollout_fn(response_suffix="loss", repeat=2),
@@ -2013,9 +2013,9 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
     trainer = GRPOTrainer(
         config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2),
-        training_backend=FakeTrainingBackend(config=None, learning_rate=1e-2),
+        actor_backend=FakeTrainingBackend(config=None, learning_rate=1e-2),
         serving_backend=trainer_serving_backend,
-        reference=None,
+        reference_backend=None,
         reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
         rollout_generator=UserDefinedRollout(
             rollout_fn=make_rollout_fn(response_suffix="adv", repeat=1),
@@ -2046,13 +2046,11 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     """FlashRL should skip the reference model by default."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="console", repeat=8),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="console", repeat=8),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=True,
@@ -2068,10 +2066,10 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     trainer.load_checkpoint(str(checkpoint_path))
 
     output = capsys.readouterr().out
-    assert "FlashRL startup\n  startup  model=fake/model  training=huggingface  dp_size=1" in output
+    assert "FlashRL startup\n  startup  model=fake/model  actor=huggingface  dp_size=1" in output
     assert "serving=huggingface  reference=disabled" in output
-    assert "  startup  training_backend  starting backend=huggingface dp_size=1" in output
-    assert "  ready    training_backend  backend=huggingface device=cpu dp_size=1 cpu=1" in output
+    assert "  startup  actor_backend     starting backend=huggingface dp_size=1" in output
+    assert "  ready    actor_backend     backend=huggingface device=cpu dp_size=1 cpu=1" in output
     assert "  startup  serving_backend   starting backend=huggingface" in output
     assert re.search(r"  ready\s+admin\s+url=http://127\.0\.0\.1:\d+", output)
     assert "  ========================================================================" in output
@@ -2079,13 +2077,13 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "  run      " in output
     assert "cpu=1" in output
     assert "reference=disabled" in output
-    assert "  training backend=huggingface  device=cpu  dp_size=1" in output
+    assert "  actor    backend=huggingface  device=cpu  dp_size=1" in output
     assert "  serving  backend=huggingface  device=cpu" in output
     assert re.search(r"  admin    http://127\.0\.0\.1:\d+", output)
     assert "completions_per_prompt=2  clip=0.2000  max_new_tokens=512" in output
-    assert "load training_backend" not in output
+    assert "load actor_backend" not in output
     assert "load serving_backend" not in output
-    assert "loaded reference_model" not in output
+    assert "loaded reference_backend" not in output
     assert "mapping  dataset_prompts=4  prompts_per_step=2  completions_per_step=4" in output
     assert "progress steps_per_epoch=2  total_steps=2" in output
     assert (
@@ -2111,7 +2109,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
 
     events = read_events(trainer._run_logger.run_dir)
     assert all(
-        event["payload"].get("component") != "reference_model"
+        event["payload"].get("component") != "reference_backend"
         for event in events
         if event["event"] == "model_load"
     )
@@ -2137,22 +2135,20 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     trainer._run_logger.close()
 
 
-def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
+def test_flashrl_reference_backend_loads_and_logs_kl(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Enabling the reference should load it and expose KL-related metrics."""
+    """Configuring the reference backend should load it and expose KL-related metrics."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="kl", repeat=8),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="kl", repeat=8),
+        reward_callback=reward_fn,
+        reference_config=TrainingConfig(model_name="fake/model", backend="huggingface", device="cpu"),
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, kl_coefficient=0.1),
-        reference_enabled=True,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -2166,12 +2162,12 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
     events = read_events(trainer._run_logger.run_dir)
     assert any(
         event["event"] == "model_load"
-        and event["payload"].get("component") == "reference_model"
+        and event["payload"].get("component") == "reference_backend"
         and event["payload"].get("status") == "completed"
         for event in events
     )
     step_event = next(event for event in events if event["event"] == "step_done")
-    assert step_event["payload"]["reference_enabled"] is True
+    assert step_event["payload"]["reference_configured"] is True
     assert step_event["payload"]["reference_active"] is True
     assert step_event["payload"]["stage_timings"]["reference_forward"] > 0
     assert "reference_forward" in step_event["payload"]["stage_order"]
@@ -2182,7 +2178,7 @@ def test_flashrl_reference_enabled_loads_reference_and_logs_kl(
     )
 
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
-    assert "reference=enabled" in transcript
+    assert "reference=configured" in transcript
     assert "  reference_forward" in transcript
     assert "full_tok_total" in transcript
 
@@ -2196,13 +2192,11 @@ def test_flashrl_checkpoint_works_before_train_and_resume_skips_reset(
     """Checkpoint load/save should work before train and preserve resume state."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="resume", repeat=3),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=3,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="resume", repeat=3),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=3, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -2407,13 +2401,11 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
     """If the run fails before any training step finishes, the summary should say so."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="broken", repeat=4),
-        reward_fn=failing_reward_fn,
-        batch_size=2,
-        max_epochs=1,
-        shuffle_each_epoch=False,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="broken", repeat=4),
+        reward_callback=failing_reward_fn,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,

@@ -14,42 +14,37 @@ from fastapi.testclient import TestClient
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework.admin import AdminRegistry, build_admin_object, create_admin_app
-from flashrl.framework.config import GrpoConfig, LoggingConfig, MetricsConfig, RuntimeConfig, ServingConfig, TrainingConfig
+from flashrl.framework.config import (
+    AdminConfig,
+    GrpoConfig,
+    LoggingConfig,
+    MetricsConfig,
+    ServingConfig,
+    TrainerConfig,
+    TrainingConfig,
+)
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.flashrl import FlashRL
+from flashrl.framework.training import ActorTrainingBackend
 from tests.conftest import TinyActor
-from flashrl.framework.training import OptimizationResult, TrainingBackend
 
 
 pytestmark = pytest.mark.unit
 
 
-class StubTrainingBackend(TrainingBackend):
-    """Training backend stub for admin API tests."""
+class StubTrainingBackend(ActorTrainingBackend):
+    """Actor backend stub for admin API tests."""
 
-    def __init__(
-        self,
-        config,
-        learning_rate: float = 1e-5,
-        grpo_config: GrpoConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
-    ) -> None:
+    def __init__(self, config, learning_rate: float = 1e-5) -> None:
         resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
-        super().__init__(
-            resolved_config,
-            learning_rate=learning_rate,
-            grpo_config=grpo_config or GrpoConfig(group_size=2),
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
-        )
-        self.actor = TinyActor(bias_shift=0.25)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        super().__init__(resolved_config, learning_rate=learning_rate)
+        self.model_copy = TinyActor(bias_shift=0.25)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -58,43 +53,6 @@ class StubTrainingBackend(TrainingBackend):
                 },
             }
         ]
-
-    def optimize_batch(self, learner_batch) -> OptimizationResult:
-        return OptimizationResult(
-            loss=0.0,
-            policy_loss=0.0,
-            kl_divergence=0.0,
-            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
-            stage_timings={
-                "prepare_inputs": 0.0,
-                "actor_forward": 0.0,
-                "reference_forward": 0.0,
-                "loss_assembly": 0.0,
-                "backward": 0.0,
-                "optimizer": 0.0,
-            },
-            response_tokens_total=sum(len(tokens) for tokens in learner_batch.response_token_ids),
-            reference_active=False,
-            stage_metrics={
-                "prepare_inputs": {},
-                "actor_forward": {},
-                "loss_assembly": {
-                    "loss": 0.0,
-                    "policy_loss": 0.0,
-                    "kl_divergence": 0.0,
-                    "response_tokens_total": sum(
-                        len(tokens) for tokens in learner_batch.response_token_ids
-                    ),
-                    "importance_sampling_ratio_mean": 1.0,
-                    "importance_sampling_ratio_std": 0.0,
-                    "importance_sampling_ratio_min": 1.0,
-                    "importance_sampling_ratio_max": 1.0,
-                    "clip_fraction": 0.0,
-                },
-                "backward": {"loss": 0.0},
-                "optimizer": {"learning_rate": float(self.optimizer.param_groups[0]["lr"])},
-            },
-        )
 
 
 class AdminServingBackend:
@@ -227,7 +185,7 @@ def _build_test_registry() -> AdminRegistry:
                 labels={"flashrl.dev/runtime": "flashrl"},
                 spec={
                     "modelName": "fake/model",
-                    "referenceEnabled": False,
+                    "referenceConfigured": False,
                     "adminBaseUrl": "http://127.0.0.1:9999",
                 },
                 status={
@@ -270,8 +228,8 @@ def _build_test_registry() -> AdminRegistry:
 
 
 def test_runtime_config_parses_admin_fields() -> None:
-    """Runtime config should parse the admin endpoint fields."""
-    config = RuntimeConfig(
+    """Admin config should parse the admin endpoint fields."""
+    config = AdminConfig(
         admin_enabled=False,
         admin_host="127.0.0.2",
         admin_port=12345,
@@ -329,22 +287,12 @@ def test_create_admin_app_disables_docs_and_enables_cors() -> None:
     assert "GET" in preflight.headers["access-control-allow-methods"]
 
 
-def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """FlashRL should expose live runtime and VLLM admin objects over HTTP."""
+def _patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
+        lambda config, role, learning_rate=None: (
+            StubTrainingBackend(config, learning_rate=float(learning_rate or 1e-5))
         ),
     )
     monkeypatch.setattr(
@@ -353,14 +301,27 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
         lambda config, startup_logger=None: AdminServingBackend(config),
     )
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=build_rollout_fn,
-        reward_fn=reward_fn,
+
+def _build_trainer(tmp_path: Path, *, reward_callback=reward_fn) -> FlashRL:
+    return FlashRL(
+        actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
         serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=GrpoConfig(group_size=2),
+        rollout_fn=build_rollout_fn,
+        reward_fn=reward_callback,
         logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
         metrics_config=MetricsConfig(enabled=False),
     )
+
+
+def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FlashRL should expose live runtime and VLLM admin objects over HTTP."""
+    _patch_backends(monkeypatch)
+    trainer = _build_trainer(tmp_path)
     assert trainer.admin_base_url is not None
 
     try:
@@ -376,7 +337,7 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
     kinds = {item["kind"] for item in object_list["items"]}
     assert health == {"status": "ok"}
     assert "FlashRLRuntime" in kinds
-    assert "TrainingBackend" in kinds
+    assert "ActorBackend" in kinds
     assert "ServingBackend" in kinds
     assert "VLLMInstance" in kinds
     assert runtime_object["spec"]["adminBaseUrl"] == trainer.admin_base_url
@@ -392,35 +353,8 @@ def test_flashrl_admin_server_keeps_failed_state_visible_until_close(
     tmp_path: Path,
 ) -> None:
     """Training failures should remain visible through the admin API until close."""
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_serving_backend",
-        lambda config, startup_logger=None: AdminServingBackend(config),
-    )
-
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=build_rollout_fn,
-        reward_fn=failing_reward_fn,
-        batch_size=2,
-        max_epochs=1,
-        serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
-        logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
-        metrics_config=MetricsConfig(enabled=False),
-    )
+    _patch_backends(monkeypatch)
+    trainer = _build_trainer(tmp_path, reward_callback=failing_reward_fn)
     assert trainer.admin_base_url is not None
 
     with pytest.raises(ValueError, match="reward failure"):

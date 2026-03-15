@@ -8,9 +8,9 @@ from typing import Any
 import torch
 import torch.nn.functional as F
 
-from flashrl.framework.config import GrpoConfig, TrainingConfig
+from flashrl.framework.config import TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
-from flashrl.framework.training import TrainingBackend
+from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 
 
 class TinyTokenizer:
@@ -257,7 +257,7 @@ class TinyActor:
         return None
 
 
-class TinyTrainingBackend(TrainingBackend):
+class TinyTrainingBackend(ActorTrainingBackend):
     """Local training backend fake for GRPO tests."""
 
     def __init__(
@@ -265,22 +265,19 @@ class TinyTrainingBackend(TrainingBackend):
         learning_rate: float = 1e-3,
         *,
         group_size: int = 2,
-        reference: TinyReferenceModel | None = None,
     ) -> None:
+        del group_size
         super().__init__(
             TrainingConfig(model_name="fake/model", device="cpu", dtype="float32"),
             learning_rate=learning_rate,
-            grpo_config=GrpoConfig(group_size=group_size),
-            reference_enabled=reference is not None,
         )
-        self.actor = TinyActor(bias_shift=0.25)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
-        self.reference = reference
+        self.model_copy = TinyActor(bias_shift=0.25)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -289,18 +286,6 @@ class TinyTrainingBackend(TrainingBackend):
                 },
             }
         ]
-        if self.reference is not None:
-            self.startup_events.append(
-                {
-                    "component": "reference_model",
-                    "status": "completed",
-                    "metadata": {
-                        "device": str(self.reference.device),
-                        "cpu_threads": 1,
-                        "duration_seconds": 0.0,
-                    },
-                }
-            )
 
     def sync_weights_to(self, serving_backend: "TinyServingBackend") -> None:
         serving_backend.sync_from_training_actor(self.actor)
@@ -359,12 +344,32 @@ class TinyServingBackend:
         return None
 
 
-class TinyReferenceModel:
-    """Reference model fake for GRPO tests."""
+class TinyReferenceBackend(TrainingBackend):
+    """Reference backend fake for GRPO tests."""
 
     def __init__(self) -> None:
+        super().__init__(
+            TrainingConfig(model_name="fake/model", device="cpu", dtype="float32"),
+            role="reference",
+        )
         self.device = torch.device("cpu")
-        self.model = TinyCausalLM(bias_shift=0.0)
+        self.model_copy = TinyActor(bias_shift=0.0)
+        self.model_copy.eval()
+        self.model_copy.model.requires_grad_(False)
+        self.startup_events = [
+            {
+                "component": "reference_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": 1,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
+
+
+TinyReferenceModel = TinyReferenceBackend
 
 
 def make_rollout_fn(response_suffix: str = "response", repeat: int = 1):

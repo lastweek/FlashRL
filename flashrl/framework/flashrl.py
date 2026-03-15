@@ -21,6 +21,7 @@ from .checkpointing import (
     RestoredCheckpoint,
 )
 from .config import (
+    AdminConfig,
     CheckpointingConfig,
     GrpoConfig,
     LoggingConfig,
@@ -38,7 +39,7 @@ from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
-from .training import TrainingBackend, create_training_backend
+from .training import ActorTrainingBackend, TrainingBackend, create_training_backend
 from .trainer.grpo import GRPOTrainer
 
 
@@ -59,161 +60,103 @@ class FlashRL:
 
     def __init__(
         self,
-        model: str | None = None,
+        *,
+        actor_config: TrainingConfig | None = None,
+        reference_config: TrainingConfig | None = None,
+        serving_config: ServingConfig | None = None,
+        trainer_config: TrainerConfig | None = None,
+        grpo_config: GrpoConfig | None = None,
         rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]] | None = None,
         reward_fn: Callable[[RolloutOutput], RewardOutput] | None = None,
-        learning_rate: float = 1e-5,
-        batch_size: int = 32,
-        max_epochs: int = 10,
-        seed: int = 42,
-        shuffle_each_epoch: bool = True,
-        clip_ratio: float = 0.2,
-        kl_coefficient: float = 0.0,
-        gamma: float = 1.0,
-        device: str | None = None,
-        dtype: str = "float32",
-        max_length: int = 2048,
-        load_in_8bit: bool = False,
-        trust_remote_code: bool = False,
-        num_threads: int = 1,
-        training_config: TrainingConfig | None = None,
-        grpo_config: GrpoConfig | None = None,
-        serving_config: ServingConfig | None = None,
         logging_config: LoggingConfig | None = None,
         metrics_config: MetricsConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
-        admin_enabled: bool = True,
-        admin_host: str = "127.0.0.1",
-        admin_port: int = 0,
+        checkpointing_config: CheckpointingConfig | None = None,
+        admin_config: AdminConfig | None = None,
         config_path: str | Path | None = None,
         run_config: RunConfig | dict[str, Any] | None = None,
         dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None,
     ) -> None:
         """Initialize FlashRL trainer.
 
-        The local path keeps separate training and serving model copies, each on
-        exactly one device. A frozen reference model is optional and is only
-        needed when the user wants KL-regularized GRPO.
+        The runtime keeps separate actor, optional reference, and serving model
+        copies with explicit role assignment.
         """
         resolved_run_config = runtime_support.load_run_config(
             config_path=config_path,
             run_config=run_config,
         )
-        checkpointing_config: CheckpointingConfig | None = None
         if resolved_run_config is not None:
             if rollout_fn is None or reward_fn is None:
                 raise ValueError(
                     "FlashRL profile construction requires explicit rollout_fn and reward_fn."
                 )
             if (
-                learning_rate != 1e-5
-                or batch_size != 32
-                or max_epochs != 10
-                or seed != 42
-                or shuffle_each_epoch is not True
-                or clip_ratio != 0.2
-                or kl_coefficient != 0.0
-                or gamma != 1.0
-                or device is not None
-                or dtype != "float32"
-                or max_length != 2048
-                or load_in_8bit is not False
-                or trust_remote_code is not False
-                or num_threads != 1
-                or reference_enabled is not False
-                or reference_device is not None
-                or admin_enabled is not True
-                or admin_host != "127.0.0.1"
-                or admin_port != 0
+                actor_config is not None
+                or reference_config is not None
+                or serving_config is not None
+                or trainer_config is not None
+                or grpo_config is not None
+                or logging_config is not None
+                or metrics_config is not None
+                or checkpointing_config is not None
+                or admin_config is not None
             ):
                 raise ValueError(
-                    "FlashRL profile construction cannot be combined with low-level "
-                    "training/runtime overrides."
-                )
-            if model is not None or training_config is not None or serving_config is not None:
-                raise ValueError(
-                    "FlashRL profile construction cannot be combined with model, "
-                    "training_config, or serving_config overrides."
-                )
-            if grpo_config is not None:
-                raise ValueError(
-                    "FlashRL profile construction cannot be combined with an explicit grpo_config."
+                    "FlashRL profile construction cannot be combined with explicit "
+                    "actor/reference/serving/trainer/admin/checkpointing overrides."
                 )
 
-            training_config, serving_config, trainer_config = runtime_support.build_runtime_profile(
-                resolved_run_config
-            )
-            model = training_config.model_name
-            learning_rate = trainer_config.learning_rate
-            batch_size = trainer_config.batch_size
-            max_epochs = trainer_config.max_epochs
-            seed = trainer_config.seed
-            shuffle_each_epoch = trainer_config.shuffle_each_epoch
+            (
+                actor_config,
+                reference_config,
+                serving_config,
+                trainer_config,
+                admin_config,
+            ) = runtime_support.build_runtime_profile(resolved_run_config)
             grpo_config = resolved_run_config.grpo
             logging_config = resolved_run_config.logging
             metrics_config = resolved_run_config.metrics
             checkpointing_config = resolved_run_config.checkpointing
-            reference_enabled = resolved_run_config.runtime.reference_enabled
-            reference_device = resolved_run_config.runtime.reference_device
-            admin_enabled = resolved_run_config.runtime.admin_enabled
-            admin_host = resolved_run_config.runtime.admin_host
-            admin_port = resolved_run_config.runtime.admin_port
 
-        if model is None:
+        if actor_config is None:
             raise ValueError(
-                "FlashRL(...) requires model unless config_path or run_config is provided."
+                "FlashRL(...) requires actor_config unless config_path or run_config is provided."
+            )
+        if serving_config is None:
+            raise ValueError(
+                "FlashRL(...) requires serving_config unless config_path or run_config is provided."
+            )
+        if trainer_config is None:
+            raise ValueError(
+                "FlashRL(...) requires trainer_config unless config_path or run_config is provided."
+            )
+        if grpo_config is None:
+            raise ValueError(
+                "FlashRL(...) requires grpo_config unless config_path or run_config is provided."
             )
         if rollout_fn is None or reward_fn is None:
             raise ValueError("FlashRL(...) requires explicit rollout_fn and reward_fn.")
+        if grpo_config.kl_coefficient > 0.0 and reference_config is None:
+            raise ValueError("reference_config is required when grpo_config.kl_coefficient > 0.")
+        if grpo_config.kl_coefficient <= 0.0 and reference_config is not None:
+            raise ValueError("reference_config must be omitted when grpo_config.kl_coefficient <= 0.")
 
         self.rollout_fn = rollout_fn
         self.reward_fn = reward_fn
-        self.reference_enabled = reference_enabled
-        self.reference_device = reference_device
-        self.admin_enabled = admin_enabled
-        self.admin_host = admin_host
-        self.admin_port = admin_port
+        self.admin_config = admin_config or AdminConfig()
+        self.admin_enabled = self.admin_config.admin_enabled
+        self.admin_host = self.admin_config.admin_host
+        self.admin_port = self.admin_config.admin_port
         self.admin_base_url: str | None = None
 
-        self.training_config = (
-            training_config
-            if training_config is not None
-            else TrainingConfig(
-                model_name=model,
-                device=device,
-                dtype=dtype,
-                max_length=max_length,
-                load_in_8bit=load_in_8bit,
-                trust_remote_code=trust_remote_code,
-                num_threads=num_threads,
-            )
-        )
-        self.training_model_config = self.training_config
-        self.serving_config = (
-            serving_config
-            if serving_config is not None
-            else ServingConfig(
-                **self.training_config.model_dump(
-                    include=runtime_support.COMMON_MODEL_SECTION_FIELDS
-                )
-            )
-        )
-        self.trainer_config = TrainerConfig(
-            learning_rate=learning_rate,
-            batch_size=batch_size,
-            max_epochs=max_epochs,
-            seed=seed,
-            shuffle_each_epoch=shuffle_each_epoch,
-        )
-        self.grpo_config = grpo_config or GrpoConfig(
-            clip_ratio=clip_ratio,
-            kl_coefficient=kl_coefficient,
-            metadata={"gamma": gamma},
-        )
+        self.actor_config = actor_config
+        self.reference_config = reference_config
+        self.serving_config = serving_config
+        self.trainer_config = trainer_config
+        self.grpo_config = grpo_config
         if self.trainer_config.batch_size % self.grpo_config.group_size != 0:
             raise ValueError(
-                "training.batch_size must be divisible by grpo.group_size "
+                "trainer.batch_size must be divisible by grpo.group_size "
                 f"(got batch_size={self.trainer_config.batch_size}, "
                 f"group_size={self.grpo_config.group_size})."
             )
@@ -223,7 +166,8 @@ class FlashRL:
         self.metrics_config = metrics_config or MetricsConfig()
         self.checkpointing_config = checkpointing_config or CheckpointingConfig()
 
-        self._training_backend: TrainingBackend | None = None
+        self._actor_backend: ActorTrainingBackend | None = None
+        self._reference_backend: TrainingBackend | None = None
         self._serving_backend: ServingBackend | None = None
         self._rollout_generator: UserDefinedRollout | None = None
         self._reward: UserDefinedReward | None = None
@@ -249,7 +193,7 @@ class FlashRL:
 
         self._metrics_sink = build_metrics_sink(
             self.metrics_config,
-            model_name=self.training_config.model_name,
+            model_name=self.actor_config.model_name,
         )
 
         self._initialize_runtime()
@@ -291,13 +235,15 @@ class FlashRL:
 
     def _emit_bootstrap_banner(self) -> None:
         """Print the immediate startup banner before any long-running work."""
-        reference_state = "enabled" if self.reference_enabled else "disabled"
+        reference_state = (
+            self.reference_config.backend if self.reference_config is not None else "disabled"
+        )
         self._emit_bootstrap_console("FlashRL startup")
         self._emit_bootstrap_console(
             "  startup  "
-            f"model={self.training_config.model_name}  "
-            f"training={self.training_config.backend}  "
-            f"dp_size={self.training_config.dp_size}  "
+            f"model={self.actor_config.model_name}  "
+            f"actor={self.actor_config.backend}  "
+            f"dp_size={self.actor_config.dp_size}  "
             f"serving={self.serving_config.backend}"
             f"{self._serving_replica_summary()}  "
             f"reference={reference_state}"
@@ -340,40 +286,29 @@ class FlashRL:
 
         self._emit_bootstrap_stage(
             "startup",
-            "training_backend",
-            f"starting backend={self.training_config.backend} dp_size={self.training_config.dp_size}",
+            "actor_backend",
+            f"starting backend={self.actor_config.backend} dp_size={self.actor_config.dp_size}",
         )
-        self._training_backend = create_training_backend(
-            self.training_config,
+        self._actor_backend = create_training_backend(
+            self.actor_config,
             learning_rate=self.trainer_config.learning_rate,
-            grpo_config=self.grpo_config,
-            reference_enabled=self.reference_enabled,
-            reference_device=self.reference_device,
+            role="actor",
         )
-        for event in self._training_backend.startup_events:
+        for event in self._actor_backend.startup_events:
             duration_seconds = float(event["metadata"]["duration_seconds"])
             startup_total_seconds += duration_seconds
             component = str(event["component"])
-            if component == "training_backend":
+            if component == "actor_backend":
                 self._emit_bootstrap_stage(
                     "ready",
-                    "training_backend",
-                    f"backend={self.training_config.backend} "
-                    f"device={self._training_backend.device} "
-                    f"dp_size={self.training_config.dp_size} "
-                    f"cpu={self.training_config.num_threads} "
+                    "actor_backend",
+                    f"backend={self.actor_config.backend} "
+                    f"device={self._actor_backend.device} "
+                    f"dp_size={self.actor_config.dp_size} "
+                    f"cpu={self.actor_config.num_threads} "
                     f"{self._format_bootstrap_duration(duration_seconds)}",
                 )
-                self._runtime_bootstrap_totals["startup_training_backend_seconds"] = duration_seconds
-            elif component == "reference_model":
-                self._emit_bootstrap_stage(
-                    "ready",
-                    "reference_model",
-                    f"device={self._training_backend.resolved_reference_device} "
-                    f"cpu={self.training_config.num_threads} "
-                    f"{self._format_bootstrap_duration(duration_seconds)}",
-                )
-                self._runtime_bootstrap_totals["startup_reference_model_seconds"] = duration_seconds
+                self._runtime_bootstrap_totals["startup_actor_backend_seconds"] = duration_seconds
             self._runtime_bootstrap_events.append(
                 self._make_model_load_event(
                     component=component,
@@ -382,6 +317,43 @@ class FlashRL:
                     cpu_threads=event["metadata"]["cpu_threads"],
                 )
             )
+
+        if self.reference_config is not None:
+            self._emit_bootstrap_stage(
+                "startup",
+                "reference_backend",
+                f"starting backend={self.reference_config.backend} dp_size={self.reference_config.dp_size}",
+            )
+            self._reference_backend = create_training_backend(
+                self.reference_config,
+                role="reference",
+            )
+            for event in self._reference_backend.startup_events:
+                duration_seconds = float(event["metadata"]["duration_seconds"])
+                startup_total_seconds += duration_seconds
+                component = str(event["component"])
+                self._emit_bootstrap_stage(
+                    "ready",
+                    "reference_backend",
+                    f"backend={self.reference_config.backend} "
+                    f"device={self._reference_backend.device} "
+                    f"dp_size={self.reference_config.dp_size} "
+                    f"cpu={self.reference_config.num_threads} "
+                    f"{self._format_bootstrap_duration(duration_seconds)}",
+                )
+                self._runtime_bootstrap_totals["startup_reference_backend_seconds"] = (
+                    duration_seconds
+                )
+                self._runtime_bootstrap_events.append(
+                    self._make_model_load_event(
+                        component=component,
+                        duration_seconds=duration_seconds,
+                        device=event["metadata"]["device"],
+                        cpu_threads=event["metadata"]["cpu_threads"],
+                    )
+                )
+        else:
+            self._reference_backend = None
 
         self._emit_bootstrap_stage(
             "startup",
@@ -429,7 +401,8 @@ class FlashRL:
         self._trainer = GRPOTrainer(
             config=self.trainer_config,
             grpo_config=self.grpo_config,
-            training_backend=self._training_backend,
+            actor_backend=self._actor_backend,
+            reference_backend=self._reference_backend,
             serving_backend=self._serving_backend,
             reward_fn=self._reward,
             rollout_generator=self._rollout_generator,
@@ -460,10 +433,11 @@ class FlashRL:
         """Start the runtime-owned admin registry and HTTP server when enabled."""
         self._admin_registry = AdminRegistry()
         self._admin_registry.register(self._runtime_admin_objects)
-        self._admin_registry.register(self._training_backend_admin_objects)
-        self._admin_registry.register(self._training_child_admin_objects)
+        self._admin_registry.register(self._actor_backend_admin_objects)
+        self._admin_registry.register(self._actor_child_admin_objects)
+        self._admin_registry.register(self._reference_backend_admin_objects)
+        self._admin_registry.register(self._reference_child_admin_objects)
         self._admin_registry.register(self._serving_backend_admin_objects)
-        self._admin_registry.register(self._reference_admin_objects)
         self._admin_registry.register(self._serving_child_admin_objects)
 
         if not self.admin_enabled:
@@ -479,12 +453,15 @@ class FlashRL:
 
     def _runtime_labels(self) -> dict[str, str]:
         """Build shared labels for all runtime-owned admin objects."""
-        return {
+        labels = {
             "flashrl.dev/runtime": "flashrl",
-            "flashrl.dev/model-name": self.training_config.model_name,
-            "flashrl.dev/training-backend": self.training_config.backend,
+            "flashrl.dev/model-name": self.actor_config.model_name,
+            "flashrl.dev/actor-backend": self.actor_config.backend,
             "flashrl.dev/serving-backend": self.serving_config.backend,
         }
+        if self.reference_config is not None:
+            labels["flashrl.dev/reference-backend"] = self.reference_config.backend
+        return labels
 
     def _runtime_object_uid(self, suffix: str) -> str:
         """Build one stable UID string for a runtime-owned object."""
@@ -500,8 +477,8 @@ class FlashRL:
                 created_at=self._runtime_created_at,
                 labels=self._runtime_labels(),
                 spec={
-                    "modelName": self.training_config.model_name,
-                    "referenceEnabled": self.reference_enabled,
+                    "modelName": self.actor_config.model_name,
+                    "referenceConfigured": self.reference_config is not None,
                     "adminBaseUrl": self.admin_base_url,
                 },
                 status={
@@ -514,40 +491,74 @@ class FlashRL:
             )
         ]
 
-    def _training_backend_admin_objects(self) -> list[dict[str, Any]]:
-        """Return the training backend admin object."""
-        if self._training_backend is None:
+    def _actor_backend_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the actor backend admin object."""
+        if self._actor_backend is None:
             return []
         return [
             build_admin_object(
-                "TrainingBackend",
-                "training-backend",
-                uid=self._runtime_object_uid("training-backend"),
+                "ActorBackend",
+                "actor-backend",
+                uid=self._runtime_object_uid("actor-backend"),
                 created_at=self._runtime_created_at,
                 labels=self._runtime_labels(),
                 spec={
-                    "backend": self.training_config.backend,
-                    "modelName": self.training_config.model_name,
-                    "device": self.training_config.device or "auto",
-                    "dtype": self.training_config.dtype,
-                    "numThreads": self.training_config.num_threads,
-                    "dpSize": self.training_config.dp_size,
+                    "backend": self.actor_config.backend,
+                    "modelName": self.actor_config.model_name,
+                    "device": self.actor_config.device or "auto",
+                    "dtype": self.actor_config.dtype,
+                    "numThreads": self.actor_config.num_threads,
+                    "dpSize": self.actor_config.dp_size,
                 },
                 status={
                     "phase": self._component_phase(),
-                    "device": str(self._training_backend.device),
-                    "optimizer": self._training_backend.optimizer_name,
+                    "device": str(self._actor_backend.device),
+                    "optimizer": self._actor_backend.optimizer_name,
                     "loaded": True,
-                    "worldSize": self._training_backend.world_size,
+                    "worldSize": self._actor_backend.world_size,
                 },
             )
         ]
 
-    def _training_child_admin_objects(self) -> list[dict[str, Any]]:
-        """Return backend-owned training child objects."""
-        if self._training_backend is None:
+    def _actor_child_admin_objects(self) -> list[dict[str, Any]]:
+        """Return backend-owned actor child objects."""
+        if self._actor_backend is None:
             return []
-        return self._training_backend.list_admin_objects()
+        return self._actor_backend.list_admin_objects()
+
+    def _reference_backend_admin_objects(self) -> list[dict[str, Any]]:
+        """Return the optional reference backend admin object."""
+        if self._reference_backend is None or self.reference_config is None:
+            return []
+        return [
+            build_admin_object(
+                "ReferenceBackend",
+                "reference-backend",
+                uid=self._runtime_object_uid("reference-backend"),
+                created_at=self._runtime_created_at,
+                labels=self._runtime_labels(),
+                spec={
+                    "backend": self.reference_config.backend,
+                    "modelName": self.reference_config.model_name,
+                    "device": self.reference_config.device or "auto",
+                    "dtype": self.reference_config.dtype,
+                    "numThreads": self.reference_config.num_threads,
+                    "dpSize": self.reference_config.dp_size,
+                },
+                status={
+                    "phase": self._component_phase(),
+                    "device": str(self._reference_backend.device),
+                    "loaded": True,
+                    "worldSize": self._reference_backend.world_size,
+                },
+            )
+        ]
+
+    def _reference_child_admin_objects(self) -> list[dict[str, Any]]:
+        """Return backend-owned reference child objects."""
+        if self._reference_backend is None:
+            return []
+        return self._reference_backend.list_admin_objects()
 
     def _serving_backend_admin_objects(self) -> list[dict[str, Any]]:
         """Return the serving backend admin object."""
@@ -592,28 +603,6 @@ class FlashRL:
             )
         ]
 
-    def _reference_admin_objects(self) -> list[dict[str, Any]]:
-        """Return the optional reference model admin object."""
-        if self._training_backend is None or not self._training_backend.reference_loaded:
-            return []
-        return [
-            build_admin_object(
-                "ReferenceModel",
-                "reference-model",
-                uid=self._runtime_object_uid("reference-model"),
-                created_at=self._runtime_created_at,
-                labels=self._runtime_labels(),
-                spec={
-                    "modelName": self.training_config.model_name,
-                    "device": self._training_backend.resolved_reference_device,
-                },
-                status={
-                    "phase": self._component_phase(),
-                    "loaded": True,
-                },
-            )
-        ]
-
     def _serving_child_admin_objects(self) -> list[dict[str, Any]]:
         """Return backend-owned child admin objects."""
         if self._serving_backend is None:
@@ -643,6 +632,15 @@ class FlashRL:
             return 0
         return self._trainer.total_steps
 
+    def _learner_backends(self) -> list[TrainingBackend]:
+        """Return the initialized learner backends in stable actor/reference order."""
+        backends: list[TrainingBackend] = []
+        if self._actor_backend is not None:
+            backends.append(self._actor_backend)
+        if self._reference_backend is not None:
+            backends.append(self._reference_backend)
+        return backends
+
     def close(self) -> None:
         """Release runtime-owned resources."""
         if self._closed:
@@ -657,15 +655,16 @@ class FlashRL:
         try:
             if self._serving_backend is not None:
                 self._serving_backend.close()
-            if self._training_backend is not None:
-                self._training_backend.close()
+            for backend in reversed(self._learner_backends()):
+                backend.close()
         finally:
             self._runtime_phase = "Closed"
             if self._admin_server is not None:
                 self._admin_server.close()
                 self._admin_server = None
         self._serving_backend = None
-        self._training_backend = None
+        self._actor_backend = None
+        self._reference_backend = None
 
     def _resolve_train_dataset(
         self,
@@ -722,27 +721,35 @@ class FlashRL:
         if self._run_logger is not None:
             self._run_logger.close()
 
-        assert self._training_backend is not None
+        assert self._actor_backend is not None
         assert self._serving_backend is not None
         run_open_kwargs = {
             "dataset_size": run_state.dataset_size,
             "batch_size": self.trainer_config.batch_size,
             "max_epochs": self.trainer_config.max_epochs,
             "total_batches": run_state.total_planned_steps,
-            "device": self.training_config.device or "auto",
-            "dtype": self.training_config.dtype,
-            "cpu_threads": self.training_config.num_threads,
+            "device": self.actor_config.device or "auto",
+            "dtype": self.actor_config.dtype,
+            "cpu_threads": self.actor_config.num_threads,
             "runtime_shape": "single-device-per-backend",
-            "reference_enabled": self.reference_enabled,
-            "reference_device": self._training_backend.resolved_reference_device,
             "group_size": self.grpo_config.group_size,
             "clip_ratio": self.grpo_config.clip_ratio,
             "prompts_per_step": run_state.prompts_per_step,
             "steps_per_epoch": run_state.steps_per_epoch,
             "total_planned_steps": run_state.total_planned_steps,
-            "training_backend": self.training_config.backend,
-            "training_device": str(self._training_backend.device),
-            "training_dp_size": self.training_config.dp_size,
+            "actor_backend": self.actor_config.backend,
+            "actor_device": str(self._actor_backend.device),
+            "actor_dp_size": self.actor_config.dp_size,
+            "reference_configured": self.reference_config is not None,
+            "reference_backend": (
+                self.reference_config.backend if self.reference_config is not None else None
+            ),
+            "reference_device": (
+                str(self._reference_backend.device) if self._reference_backend is not None else None
+            ),
+            "reference_dp_size": (
+                self.reference_config.dp_size if self.reference_config is not None else None
+            ),
             "serving_backend": self.serving_config.backend,
             "serving_device": str(self._serving_backend.device),
             "serving_num_replicas": self.serving_config.num_replicas,
@@ -753,7 +760,7 @@ class FlashRL:
         if self._managed_resume is not None:
             run_logger = RunLogger.open_existing_run(
                 self.logging_config,
-                model_name=self.training_model_config.model_name,
+                model_name=self.actor_config.model_name,
                 run_id=self._managed_resume.run_id,
                 run_index=self._managed_resume.run_index,
                 run_dir=self._managed_resume.run_dir,
@@ -762,7 +769,7 @@ class FlashRL:
         else:
             run_logger = RunLogger(
                 self.logging_config,
-                model_name=self.training_model_config.model_name,
+                model_name=self.actor_config.model_name,
             )
         run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
         if self._managed_resume is not None:
@@ -802,7 +809,7 @@ class FlashRL:
     def _prepare_managed_resume(self) -> RestoredCheckpoint | None:
         """Load one configured managed checkpoint before opening the run logger."""
         assert self._trainer is not None
-        assert self._training_backend is not None
+        assert self._actor_backend is not None
         checkpoint_path = self._checkpoint_manager.resolve_resume_path()
         if checkpoint_path is None:
             self._managed_resume = None
@@ -813,11 +820,13 @@ class FlashRL:
             raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
         def load_managed_checkpoint():
-            self._training_backend.barrier()
+            for backend in self._learner_backends():
+                backend.barrier()
             try:
                 return self._trainer.load_checkpoint_with_metadata(str(checkpoint_path))
             finally:
-                self._training_backend.barrier()
+                for backend in reversed(self._learner_backends()):
+                    backend.barrier()
 
         (_, checkpoint_metadata), duration_seconds = timed_call(load_managed_checkpoint)
         managed_resume = self._checkpoint_manager.build_restored_checkpoint(
@@ -866,21 +875,23 @@ class FlashRL:
     ) -> float:
         """Save one checkpoint, optionally updating the managed latest manifest."""
         assert self._trainer is not None
-        assert self._training_backend is not None
+        assert self._actor_backend is not None
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         temp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.{uuid4().hex}.tmp")
 
         def save_checkpoint_file() -> None:
-            self._training_backend.barrier()
+            for backend in self._learner_backends():
+                backend.barrier()
             try:
-                if self._training_backend.is_primary:
+                if self._actor_backend.is_primary:
                     self._trainer.save_checkpoint(
                         str(temp_path),
                         checkpoint_metadata=self._build_checkpoint_metadata(trigger=trigger),
                     )
                     os.replace(temp_path, checkpoint_path)
-                self._training_backend.barrier()
+                for backend in reversed(self._learner_backends()):
+                    backend.barrier()
             finally:
                 temp_path.unlink(missing_ok=True)
 
@@ -1029,14 +1040,16 @@ class FlashRL:
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
         assert self._trainer is not None
-        assert self._training_backend is not None
+        assert self._actor_backend is not None
 
         def load_manual_checkpoint() -> None:
-            self._training_backend.barrier()
+            for backend in self._learner_backends():
+                backend.barrier()
             try:
                 self._trainer.load_checkpoint(path)
             finally:
-                self._training_backend.barrier()
+                for backend in reversed(self._learner_backends()):
+                    backend.barrier()
 
         _, duration_seconds = timed_call(load_manual_checkpoint)
         self._resume_from_checkpoint = True

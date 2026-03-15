@@ -29,14 +29,14 @@ from flashrl.framework import (
     PushgatewayMetricsConfig,
     TensorBoardMetricsConfig,
 )
-from flashrl.framework.config import TrainingConfig
+from flashrl.framework.config import AdminConfig, ServingConfig, TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.metrics import (
     CompositeMetricsSink,
     PrometheusMetricsSink,
     TensorBoardMetricsSink,
 )
-from flashrl.framework.training import TrainingBackend
+from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 
 
 def load_script_module(
@@ -251,7 +251,7 @@ class FakeActor:
         self._live_rollout_candidate_index = None
 
 
-class FakeTrainingBackend(TrainingBackend):
+class FakeTrainingBackend(ActorTrainingBackend):
     """Training backend used for metrics tests."""
 
     last_config = None
@@ -261,9 +261,6 @@ class FakeTrainingBackend(TrainingBackend):
         self,
         config,
         learning_rate: float = 1e-5,
-        grpo_config: GrpoConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
     ) -> None:
         resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
         type(self).last_config = resolved_config
@@ -271,17 +268,14 @@ class FakeTrainingBackend(TrainingBackend):
         super().__init__(
             resolved_config,
             learning_rate=learning_rate,
-            grpo_config=grpo_config or GrpoConfig(group_size=2),
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
         )
-        self.actor = FakeActor(bias_shift=0.25)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        self.model_copy = FakeActor(bias_shift=0.25)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -290,23 +284,6 @@ class FakeTrainingBackend(TrainingBackend):
                 },
             }
         ]
-        if reference_enabled:
-            reference_config = resolved_config.model_copy(
-                update={"device": reference_device or resolved_config.device}
-            )
-            type(self).last_reference_config = reference_config
-            self.reference = FakeReferenceModel(reference_config)
-            self.startup_events.append(
-                {
-                    "component": "reference_model",
-                    "status": "completed",
-                    "metadata": {
-                        "device": str(self.reference.device),
-                        "cpu_threads": reference_config.num_threads,
-                        "duration_seconds": 0.0,
-                    },
-                }
-            )
 
 
 def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
@@ -360,15 +337,30 @@ class FakeServingBackend:
         return None
 
 
-class FakeReferenceModel:
-    """Reference model used for KL computation in tests."""
+class FakeReferenceModel(TrainingBackend):
+    """Reference backend used for KL computation in tests."""
 
     last_config = None
 
     def __init__(self, config) -> None:
-        type(self).last_config = config
+        resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
+        type(self).last_config = resolved_config
+        super().__init__(resolved_config, role="reference")
         self.device = torch.device("cpu")
-        self.model = FakeCausalLM(bias_shift=0.0)
+        self.model_copy = FakeActor(bias_shift=0.0)
+        self.model_copy.eval()
+        self.model_copy.model.requires_grad_(False)
+        self.startup_events = [
+            {
+                "component": "reference_backend",
+                "status": "completed",
+                "metadata": {
+                    "device": str(self.device),
+                    "cpu_threads": resolved_config.num_threads,
+                    "duration_seconds": 0.0,
+                },
+            }
+        ]
 
 
 class FakeSummaryWriter:
@@ -462,20 +454,48 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
+        lambda config, role, learning_rate=None: (
             FakeTrainingBackend(
                 config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
+                learning_rate=float(learning_rate or 1e-5),
             )
+            if role == "actor"
+            else FakeReferenceModel(config)
         ),
     )
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
         lambda config, startup_logger=None: FakeServingBackend(config),
+    )
+
+
+def build_flashrl(
+    tmp_path: Path,
+    *,
+    rollout_callback,
+    reward_callback,
+    actor_config: TrainingConfig | None = None,
+    reference_config: TrainingConfig | None = None,
+    serving_config: ServingConfig | None = None,
+    trainer_config: TrainerConfig | None = None,
+    grpo_config: GrpoConfig | None = None,
+    logging_config: LoggingConfig | None = None,
+    metrics_config: MetricsConfig | None = None,
+    admin_config: AdminConfig | None = None,
+) -> FlashRL:
+    """Create a FlashRL instance through the new explicit-config constructor."""
+    return FlashRL(
+        actor_config=actor_config or TrainingConfig(model_name="fake/model", device="cpu"),
+        reference_config=reference_config,
+        serving_config=serving_config or ServingConfig(model_name="fake/model", device="cpu"),
+        trainer_config=trainer_config or TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=grpo_config or GrpoConfig(group_size=2),
+        rollout_fn=rollout_callback,
+        reward_fn=reward_callback,
+        logging_config=logging_config or LoggingConfig(log_dir=tmp_path, console=False, file=True),
+        metrics_config=metrics_config or MetricsConfig(),
+        admin_config=admin_config or AdminConfig(admin_enabled=False),
     )
 
 
@@ -638,29 +658,34 @@ def write_yaml_run_config(
     config_path = tmp_path / "run.yaml"
     if tensorboard_enabled is None:
         tensorboard_enabled = metrics_enabled
-    training_section = {
-        "learning_rate": 1.0e-5,
-        "batch_size": 2,
-        "max_epochs": 1,
+    actor_section: dict[str, object] = {
+        "model_name": "fake/model",
+        "device": "cpu",
     }
+    if common_dtype is not None:
+        actor_section["dtype"] = common_dtype
     if training_num_threads is not None:
-        training_section["num_threads"] = training_num_threads
+        actor_section["num_threads"] = training_num_threads
 
-    serving_section: dict[str, object] = {}
+    serving_section: dict[str, object] = {
+        "model_name": "fake/model",
+    }
+    if common_dtype is not None:
+        serving_section["dtype"] = common_dtype
     if serving_num_threads is not None:
         serving_section["num_threads"] = serving_num_threads
     serving_section["debug_live_rollout"] = serving_debug_live_rollout
 
-    common_section: dict[str, object] = {"model_name": "fake/model"}
-    if common_dtype is not None:
-        common_section["dtype"] = common_dtype
-
     config_path.write_text(
         yaml.safe_dump(
             {
-                "common": common_section,
-                "training": training_section,
+                "actor": actor_section,
                 "serving": serving_section,
+                "trainer": {
+                    "learning_rate": 1.0e-5,
+                    "batch_size": 2,
+                    "max_epochs": 1,
+                },
                 "grpo": {
                     "group_size": group_size,
                     "clip_ratio": clip_ratio,
@@ -687,9 +712,7 @@ def write_yaml_run_config(
                         "job_name": "flashrl-test",
                     },
                 },
-                "runtime": {
-                    "reference_enabled": False,
-                },
+                "admin": {"admin_enabled": False},
                 "hooks": {
                     "rollout_fn": f"{hook_module}:rollout_fn",
                     "reward_fn": f"{hook_module}:reward_fn",
@@ -722,33 +745,37 @@ def write_profile_run_config(
     if tensorboard_enabled is None:
         tensorboard_enabled = metrics_enabled
 
-    training_section = {
-        "learning_rate": 1.0e-5,
-        "batch_size": 2,
-        "max_epochs": 1,
+    actor_section: dict[str, object] = {
+        "model_name": "fake/model",
+        "device": "cpu",
     }
+    if common_dtype is not None:
+        actor_section["dtype"] = common_dtype
     if training_num_threads is not None:
-        training_section["num_threads"] = training_num_threads
+        actor_section["num_threads"] = training_num_threads
 
     serving_section: dict[str, object] = {
+        "model_name": "fake/model",
         "backend": serving_backend,
         "debug_live_rollout": serving_debug_live_rollout,
     }
+    if common_dtype is not None:
+        serving_section["dtype"] = common_dtype
     if serving_num_threads is not None:
         serving_section["num_threads"] = serving_num_threads
     if runtime_python is not None:
         serving_section["runtime_python"] = runtime_python
 
-    common_section: dict[str, object] = {"model_name": "fake/model"}
-    if common_dtype is not None:
-        common_section["dtype"] = common_dtype
-
     config_path.write_text(
         yaml.safe_dump(
             {
-                "common": common_section,
-                "training": training_section,
+                "actor": actor_section,
                 "serving": serving_section,
+                "trainer": {
+                    "learning_rate": 1.0e-5,
+                    "batch_size": 2,
+                    "max_epochs": 1,
+                },
                 "grpo": {
                     "group_size": 2,
                     "clip_ratio": 0.2,
@@ -775,9 +802,7 @@ def write_profile_run_config(
                         "job_name": "flashrl-test",
                     },
                 },
-                "runtime": {
-                    "reference_enabled": False,
-                },
+                "admin": {"admin_enabled": False},
             },
             sort_keys=False,
         ),
@@ -1058,12 +1083,11 @@ def test_flashrl_pushgateway_metrics_process_lifetime_across_runs(
     monkeypatch.setattr(metrics_module, "push_to_gateway", fake_push)
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="metrics", repeat=4),
-        reward_fn=reward_fn,
-        batch_size=4,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="metrics", repeat=4),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=4, max_epochs=1),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1122,12 +1146,10 @@ def test_flashrl_default_metrics_push_failure_does_not_fail_training(
     monkeypatch.setattr(metrics_module, "push_to_gateway", failing_push)
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="warn", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="warn", repeat=2),
+        reward_callback=reward_fn,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1160,12 +1182,10 @@ def test_flashrl_default_metrics_create_tensorboard_events(
     install_fake_tensorboard_writer(monkeypatch)
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="tensorboard", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="tensorboard", repeat=2),
+        reward_callback=reward_fn,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1192,12 +1212,10 @@ def test_flashrl_disabled_metrics_skip_tensorboard_events(
     install_fake_tensorboard_writer(monkeypatch)
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="disabled", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="disabled", repeat=2),
+        reward_callback=reward_fn,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1219,12 +1237,10 @@ def test_flashrl_tensorboard_writer_reopens_cleanly_across_runs(
     install_fake_tensorboard_writer(monkeypatch)
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="tb-reuse", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="tb-reuse", repeat=2),
+        reward_callback=reward_fn,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1255,12 +1271,11 @@ def test_flashrl_rejects_batch_size_not_divisible_by_group_size(
     patch_backends(monkeypatch)
 
     with pytest.raises(ValueError, match="divisible by grpo.group_size"):
-        FlashRL(
-            model="fake/model",
-            rollout_fn=make_rollout_fn(response_suffix="invalid", repeat=2),
-            reward_fn=reward_fn,
-            batch_size=3,
-            max_epochs=1,
+        build_flashrl(
+            tmp_path,
+            rollout_callback=make_rollout_fn(response_suffix="invalid", repeat=2),
+            reward_callback=reward_fn,
+            trainer_config=TrainerConfig(batch_size=3, max_epochs=1),
             grpo_config=GrpoConfig(group_size=2),
             logging_config=LoggingConfig(
                 log_dir=tmp_path,
@@ -1291,8 +1306,8 @@ def test_flashrl_from_yaml_loads_hooks_and_supports_dataset_loader(
     assert trainer._dataset_loader is not None
     assert trainer.metrics_config.enabled is False
     assert trainer.serving_config.num_threads == 3
-    assert trainer.training_model_config.num_threads == 1
-    assert trainer.training_model_config.model_name == "fake/model"
+    assert trainer.actor_config.num_threads == 1
+    assert trainer.actor_config.model_name == "fake/model"
     assert trainer.grpo_config.group_size == 2
     assert trainer.grpo_config.clip_ratio == pytest.approx(0.2)
     assert trainer._run_logger.run_dir.exists()
@@ -1320,9 +1335,9 @@ def test_flashrl_profile_constructor_loads_hookless_config_path(
     trainer.train(["prompt 0", "prompt 1"])
 
     assert trainer._dataset_loader is None
-    assert trainer.training_model_config.model_name == "fake/model"
-    assert trainer.training_model_config.dtype == "float16"
-    assert trainer.training_model_config.num_threads == 5
+    assert trainer.actor_config.model_name == "fake/model"
+    assert trainer.actor_config.dtype == "float16"
+    assert trainer.actor_config.num_threads == 5
     assert trainer.serving_config.model_name == "fake/model"
     assert trainer.serving_config.num_threads == 3
     assert trainer.grpo_config.max_new_tokens == 32
@@ -1337,18 +1352,22 @@ def test_flashrl_profile_constructor_accepts_run_config_dict_and_expands_env_var
     patch_backends(monkeypatch)
     monkeypatch.setenv("FLASHRL_TEST_RUNTIME_PYTHON", "/tmp/fake-vllm-python")
     run_config = {
-        "common": {"model_name": "fake/model"},
-        "training": {
-            "batch_size": 2,
-            "max_epochs": 1,
+        "actor": {
+            "model_name": "fake/model",
+            "device": "cpu",
             "num_threads": 1,
         },
         "serving": {
+            "model_name": "fake/model",
             "backend": "vllm",
             "runtime_python": "${FLASHRL_TEST_RUNTIME_PYTHON}",
             "num_replicas": 2,
             "num_threads": 3,
             "debug_live_rollout": False,
+        },
+        "trainer": {
+            "batch_size": 2,
+            "max_epochs": 1,
         },
         "grpo": {
             "group_size": 2,
@@ -1366,7 +1385,7 @@ def test_flashrl_profile_constructor_accepts_run_config_dict_and_expands_env_var
             "file": True,
         },
         "metrics": {"enabled": False},
-        "runtime": {"reference_enabled": False},
+        "admin": {"admin_enabled": False},
     }
 
     trainer = FlashRL(
@@ -1393,7 +1412,7 @@ def test_flashrl_profile_constructor_rejects_mixed_low_level_overrides(
 
     with pytest.raises(ValueError, match="cannot be combined"):
         FlashRL(
-            model="fake/model",
+            actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
             config_path=config_path,
             rollout_fn=make_rollout_fn(response_suffix="mixed", repeat=2),
             reward_fn=reward_fn,
@@ -1411,12 +1430,12 @@ def test_flashrl_profile_constructor_rejects_scalar_training_overrides(
         log_dir=tmp_path / "mixed-scalars-logs",
     )
 
-    with pytest.raises(ValueError, match="low-level training/runtime overrides"):
+    with pytest.raises(ValueError, match="cannot be combined"):
         FlashRL(
             config_path=config_path,
             rollout_fn=make_rollout_fn(response_suffix="mixed-scalars", repeat=2),
             reward_fn=reward_fn,
-            batch_size=8,
+            trainer_config=TrainerConfig(batch_size=8, max_epochs=1),
         )
 
 
@@ -1435,11 +1454,11 @@ def test_flashrl_from_yaml_requires_hooks_for_hook_driven_runs(
         FlashRL.from_yaml(config_path)
 
 
-def test_flashrl_from_yaml_common_defaults_flow_into_training_and_serving(
+def test_flashrl_from_yaml_role_config_values_flow_into_actor_and_serving(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """common model defaults should flow into both resolved model copies."""
+    """Explicit role config values should flow into both resolved model copies."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1454,9 +1473,9 @@ def test_flashrl_from_yaml_common_defaults_flow_into_training_and_serving(
 
     trainer = FlashRL.from_yaml(config_path)
 
-    assert trainer.training_model_config.model_name == "fake/model"
-    assert trainer.training_model_config.dtype == "float16"
-    assert trainer.training_model_config.num_threads == 5
+    assert trainer.actor_config.model_name == "fake/model"
+    assert trainer.actor_config.dtype == "float16"
+    assert trainer.actor_config.num_threads == 5
     assert trainer.serving_config.model_name == "fake/model"
     assert trainer.serving_config.dtype == "float16"
     assert trainer.serving_config.num_threads == 3
@@ -1474,19 +1493,19 @@ def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
     config_path.write_text(
         yaml.safe_dump(
             {
-                "common": {
+                "actor": {
                     "model_name": "fake/model",
-                    "dtype": "float16",
-                },
-                "training": {
                     "dtype": "bfloat16",
                     "num_threads": 5,
-                    "batch_size": 2,
-                    "max_epochs": 1,
                 },
                 "serving": {
+                    "model_name": "fake/model",
                     "dtype": "float32",
                     "num_threads": 3,
+                },
+                "trainer": {
+                    "batch_size": 2,
+                    "max_epochs": 1,
                 },
                 "grpo": {
                     "group_size": 2,
@@ -1506,9 +1525,7 @@ def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
                 "metrics": {
                     "enabled": False,
                 },
-                "runtime": {
-                    "reference_enabled": False,
-                },
+                "admin": {"admin_enabled": False},
                 "hooks": {
                     "rollout_fn": f"{hook_module}:rollout_fn",
                     "reward_fn": f"{hook_module}:reward_fn",
@@ -1522,8 +1539,8 @@ def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
 
     trainer = FlashRL.from_yaml(config_path)
 
-    assert trainer.training_model_config.dtype == "bfloat16"
-    assert trainer.training_model_config.num_threads == 5
+    assert trainer.actor_config.dtype == "bfloat16"
+    assert trainer.actor_config.num_threads == 5
     assert trainer.serving_config.dtype == "float32"
     assert trainer.serving_config.num_threads == 3
     assert FakeTrainingBackend.last_config.dtype == "bfloat16"
@@ -1532,11 +1549,11 @@ def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
     assert FakeServingBackend.last_config.num_threads == 3
 
 
-def test_flashrl_from_yaml_reference_model_uses_resolved_training_config(
+def test_flashrl_from_yaml_reference_backend_uses_resolved_training_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The reference model should derive from training-side config plus runtime override."""
+    """The reference backend should use its explicit config block."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1544,27 +1561,31 @@ def test_flashrl_from_yaml_reference_model_uses_resolved_training_config(
     config_path.write_text(
         textwrap.dedent(
             f"""
-            common:
+            actor:
               model_name: fake/model
-            training:
               device: cpu
               num_threads: 5
+            reference:
+              model_name: fake/model
+              device: reference-device
+              num_threads: 5
+            trainer:
               batch_size: 2
               max_epochs: 1
-            serving: {{}}
+            serving:
+              model_name: fake/model
             grpo:
               group_size: 2
               clip_ratio: 0.2
-              kl_coefficient: 0.0
+              kl_coefficient: 0.1
             logging:
               log_dir: {tmp_path / "reference-logs"}
               console: false
               file: true
             metrics:
               enabled: false
-            runtime:
-              reference_enabled: true
-              reference_device: reference-device
+            admin:
+              admin_enabled: false
             hooks:
               rollout_fn: {hook_module}:rollout_fn
               reward_fn: {hook_module}:reward_fn
@@ -1577,7 +1598,7 @@ def test_flashrl_from_yaml_reference_model_uses_resolved_training_config(
 
     trainer = FlashRL.from_yaml(config_path)
 
-    assert trainer.reference_enabled is True
+    assert trainer.reference_config is not None
     assert FakeReferenceModel.last_config is not None
     assert FakeReferenceModel.last_config.model_name == "fake/model"
     assert FakeReferenceModel.last_config.num_threads == 5
@@ -1588,7 +1609,7 @@ def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Both training and serving must resolve a model name after merge."""
+    """Both actor and serving configs must provide a model name."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1596,10 +1617,13 @@ def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
     config_path.write_text(
         textwrap.dedent(
             f"""
-            training:
+            actor:
+              device: cpu
+            trainer:
               batch_size: 2
               max_epochs: 1
-            serving: {{}}
+            serving:
+              model_name: fake/model
             grpo:
               group_size: 2
               clip_ratio: 0.2
@@ -1610,8 +1634,8 @@ def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
               file: true
             metrics:
               enabled: false
-            runtime:
-              reference_enabled: false
+            admin:
+              admin_enabled: false
             hooks:
               rollout_fn: {hook_module}:rollout_fn
               reward_fn: {hook_module}:reward_fn
@@ -1622,7 +1646,7 @@ def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="common.model_name"):
+    with pytest.raises(ValidationError, match="actor"):
         FlashRL.from_yaml(config_path)
 
 
@@ -1630,7 +1654,7 @@ def test_flashrl_from_yaml_rejects_loop_fields_under_common(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """common should only allow shared model defaults, not training loop fields."""
+    """Actor config should reject trainer-only fields."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1638,13 +1662,14 @@ def test_flashrl_from_yaml_rejects_loop_fields_under_common(
     config_path.write_text(
         textwrap.dedent(
             f"""
-            common:
+            actor:
               model_name: fake/model
               batch_size: 4
-            training:
+            trainer:
               batch_size: 2
               max_epochs: 1
-            serving: {{}}
+            serving:
+              model_name: fake/model
             grpo:
               group_size: 2
               clip_ratio: 0.2
@@ -1655,8 +1680,8 @@ def test_flashrl_from_yaml_rejects_loop_fields_under_common(
               file: true
             metrics:
               enabled: false
-            runtime:
-              reference_enabled: false
+            admin:
+              admin_enabled: false
             hooks:
               rollout_fn: {hook_module}:rollout_fn
               reward_fn: {hook_module}:reward_fn
@@ -1675,7 +1700,7 @@ def test_flashrl_from_yaml_rejects_num_threads_under_common(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """num_threads is runtime-local and must live under training or serving, not common."""
+    """Trainer config should reject model-only fields such as num_threads."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1683,14 +1708,15 @@ def test_flashrl_from_yaml_rejects_num_threads_under_common(
     config_path.write_text(
         textwrap.dedent(
             f"""
-            common:
+            actor:
               model_name: fake/model
-              num_threads: 4
-            training:
+              num_threads: 2
+            trainer:
               batch_size: 2
               max_epochs: 1
-              num_threads: 2
+              num_threads: 4
             serving:
+              model_name: fake/model
               num_threads: 1
             grpo:
               group_size: 2
@@ -1702,8 +1728,8 @@ def test_flashrl_from_yaml_rejects_num_threads_under_common(
               file: true
             metrics:
               enabled: false
-            runtime:
-              reference_enabled: false
+            admin:
+              admin_enabled: false
             hooks:
               rollout_fn: {hook_module}:rollout_fn
               reward_fn: {hook_module}:reward_fn
@@ -1725,12 +1751,10 @@ def test_flashrl_train_requires_dataset_without_yaml_loader(
     """Plain Python construction should still require an explicit dataset."""
     patch_backends(monkeypatch)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=make_rollout_fn(response_suffix="python", repeat=2),
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="python", repeat=2),
+        reward_callback=reward_fn,
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1935,7 +1959,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     )
     trainer._metrics_sink = PrometheusMetricsSink(
         trainer.metrics_config.pushgateway,
-        model_name=trainer.training_model_config.model_name,
+        model_name=trainer.actor_config.model_name,
     )
     assert trainer._trainer is not None
     trainer._trainer.metrics_sink = trainer._metrics_sink
@@ -1994,10 +2018,12 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("flashrl/framework/examples/__init__.py").exists()
     assert not Path("flashrl/framework/examples/reasoning").exists()
     assert Path("flashrl/framework/examples/reasoning-math/train.py").exists()
+    assert not Path("flashrl/framework/examples/reasoning-math/workflow.py").exists()
     assert Path("flashrl/framework/examples/reasoning-math/eval.py").exists()
     assert Path("flashrl/framework/examples/reasoning-math/config.yaml").exists()
     assert Path("flashrl/framework/examples/reasoning-math/config_vllm.yaml").exists()
     assert Path("flashrl/framework/examples/reasoning-code/train.py").exists()
+    assert not Path("flashrl/framework/examples/reasoning-code/workflow.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/eval.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/executor.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/config.yaml").exists()
@@ -2033,16 +2059,17 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "aime25" in reasoning_docs
     assert "--train-limit" in reasoning_docs
     assert "--eval-limit" in reasoning_docs
-    assert "--checkpoint-out" in reasoning_docs
+    assert "checkpointing:" in reasoning_docs
     assert "available` is the full size" in reasoning_docs
     assert "selected` is the number of rows actually used" in reasoning_docs
     assert "not copied into `console.log`" in reasoning_docs
     assert "math.yaml" not in reasoning_docs
     assert "model:" not in reasoning_docs
     assert "trainer:" not in reasoning_docs
-    assert "common.model_name" in reasoning_docs
-    assert "training.batch_size" in reasoning_docs
+    assert "actor.model_name" in reasoning_docs
+    assert "trainer.batch_size" in reasoning_docs
     assert "serving.backend" in reasoning_docs
+    assert "reference" in reasoning_docs
     assert "grpo.group_size" in reasoning_docs
     assert "python3 flashrl/framework/examples/reasoning-code/train.py" in reasoning_code_docs
     assert "python3 flashrl/framework/examples/reasoning-code/eval.py" in reasoning_code_docs
@@ -2056,6 +2083,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "not copied into `console.log`" in reasoning_code_docs
     assert "execution_status" in reasoning_code_docs
     assert "code_preview" in reasoning_code_docs
+    assert "checkpointing:" in reasoning_code_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
@@ -2084,26 +2112,39 @@ def test_observability_stack_files_and_docs_exist() -> None:
     )
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert "model:" not in example_yaml
-    assert "trainer:" not in example_yaml
-    assert "common:" in example_yaml
-    assert "training:" in example_yaml
+    assert "actor:" in example_yaml
+    assert "trainer:" in example_yaml
     assert "serving:" in example_yaml
     assert "grpo:" in example_yaml
     assert "metrics:" in example_yaml
-    assert "runtime:" in example_yaml
+    assert "checkpointing:" in example_yaml
+    assert "admin:" in example_yaml
     assert "hooks:" not in example_yaml
     assert "tensorboard:" in example_yaml
     assert "pushgateway:" in example_yaml
     assert "pushgateway_url:" not in example_yaml
-    assert "common:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct\n  num_threads:" not in example_yaml
-    assert "training:\n  num_threads: 1" in example_yaml
-    assert "serving:\n  num_threads: 1\n  debug_live_rollout:" in example_yaml
+    assert "common:" not in example_yaml
+    assert "training:" not in example_yaml
+    assert "runtime:" not in example_yaml
+    assert "actor:\n  model_name: Qwen/Qwen2.5-0.5B" in example_yaml
+    assert "num_threads: 1" in example_yaml
+    assert "serving:\n  model_name: Qwen/Qwen2.5-0.5B" in example_yaml
+    assert "  num_threads: 1" in example_yaml
+    assert "  debug_live_rollout: true" in example_yaml
+    assert "save_on_run_end: true" in example_yaml
+    assert "final_path: /tmp/flashrl_reasoning_checkpoint.pt" in example_yaml
     assert "debug_live_rollout:" in docs
     assert "backend: vllm" in vllm_example_yaml
     assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
+    assert "checkpointing:" in vllm_example_yaml
+    assert "final_path: /tmp/flashrl_reasoning_checkpoint.pt" in vllm_example_yaml
     assert "hooks:" not in vllm_example_yaml
     assert "hooks:" not in code_example_yaml
     assert "hooks:" not in code_vllm_example_yaml
+    assert "checkpointing:" in code_example_yaml
+    assert "final_path: /tmp/flashrl_reasoning_code_checkpoint.pt" in code_example_yaml
+    assert "checkpointing:" in code_vllm_example_yaml
+    assert "final_path: /tmp/flashrl_reasoning_code_checkpoint.pt" in code_vllm_example_yaml
     assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
     assert "Qwen/Qwen2.5-Coder-1.5B" in code_vllm_example_yaml
     assert "~/.venv-vllm" not in vllm_example_yaml

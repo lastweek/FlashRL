@@ -9,10 +9,8 @@ import pytest
 import torch
 
 import flashrl.framework.models.actor as actor_module
-import flashrl.framework.models.reference as reference_module
 from flashrl.framework.config import ModelConfig, ServingConfig
 from flashrl.framework.models.actor import ActorModel
-from flashrl.framework.models.reference import ReferenceModel
 from tests.conftest import TinyCausalLM, TinyTokenizer
 
 pytestmark = pytest.mark.unit
@@ -224,26 +222,3 @@ def test_actor_model_compute_log_probs_returns_logits_on_target_device(
     assert tiny_model.last_input_ids.device.type == "cpu"
     assert tiny_model.last_labels is not None
     assert tiny_model.last_labels.device.type == "cpu"
-
-
-def test_reference_model_compute_log_probs_runs_without_grad(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """Reference logits should be computed under no_grad regardless of outer grad state."""
-    tiny_model, tiny_tokenizer = patch_hf_loaders(
-        monkeypatch,
-        reference_module,
-        tokenizer=TinyTokenizer(pad_token=None),
-    )
-    reference = ReferenceModel(ModelConfig(model_name="fake/model", device="cpu"))
-
-    with torch.enable_grad():
-        logits = reference.compute_log_probs(
-            input_ids=torch.tensor([[1, 2]], dtype=torch.long),
-            attention_mask=torch.tensor([[1, 1]], dtype=torch.long),
-            labels=torch.tensor([[1, 2]], dtype=torch.long),
-        )
-
-    assert logits.shape == (1, 2, 32)
-    assert tiny_model.grad_enabled_during_forward is False
-    assert tiny_tokenizer.pad_token == tiny_tokenizer.eos_token

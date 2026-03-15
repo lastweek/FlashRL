@@ -7,9 +7,8 @@ from pathlib import Path
 from typing import Any
 
 from flashrl.framework.config import (
-    CommonConfig,
+    AdminConfig,
     GrpoConfig,
-    ModelConfig,
     RolloutConfig,
     RunConfig,
     ServingConfig,
@@ -17,32 +16,6 @@ from flashrl.framework.config import (
     TrainingConfig,
 )
 from flashrl.framework.data_models import Prompt
-
-
-COMMON_MODEL_SECTION_FIELDS = {
-    "model_name",
-    "device",
-    "dtype",
-    "max_length",
-    "load_in_8bit",
-    "trust_remote_code",
-    "num_threads",
-    "metadata",
-}
-
-SERVING_MODEL_FIELDS = {
-    "backend",
-    "runtime_python",
-    "num_replicas",
-    "vllm_args",
-    "debug_live_rollout",
-}
-
-TRAINING_MODEL_FIELDS = {
-    "backend",
-    "dp_size",
-    "fsdp2",
-}
 
 
 def resolve_import(import_string: str) -> Any:
@@ -90,31 +63,6 @@ def load_run_config(
     raise TypeError("run_config must be a RunConfig, dict, or None.")
 
 
-def build_model_config(
-    *,
-    common: CommonConfig | None,
-    section: CommonConfig,
-    config_cls: type[ModelConfig] | type[ServingConfig] | type[TrainingConfig],
-    section_name: str,
-) -> ModelConfig | ServingConfig | TrainingConfig:
-    """Merge optional common defaults with one model-copy section."""
-    merged = {}
-    if common is not None:
-        merged.update(common.model_dump(exclude_none=True))
-    include_fields = set(COMMON_MODEL_SECTION_FIELDS)
-    if config_cls is ServingConfig:
-        include_fields.update(SERVING_MODEL_FIELDS)
-    if config_cls is TrainingConfig:
-        include_fields.update(TRAINING_MODEL_FIELDS)
-    merged.update(section.model_dump(include=include_fields, exclude_none=True))
-
-    if not merged.get("model_name"):
-        raise ValueError(
-            f"Run config requires '{section_name}.model_name' or 'common.model_name' after merge."
-        )
-    return config_cls(**merged)
-
-
 def build_rollout_config(grpo_config: GrpoConfig) -> RolloutConfig:
     """Build the internal rollout config from GRPO sampling knobs."""
     return RolloutConfig(
@@ -128,33 +76,20 @@ def build_rollout_config(grpo_config: GrpoConfig) -> RolloutConfig:
 
 def build_trainer_config(run_config: RunConfig) -> TrainerConfig:
     """Extract trainer loop settings from one top-level RunConfig."""
-    return TrainerConfig(
-        learning_rate=run_config.training.learning_rate,
-        batch_size=run_config.training.batch_size,
-        max_epochs=run_config.training.max_epochs,
-        seed=run_config.training.seed,
-        shuffle_each_epoch=run_config.training.shuffle_each_epoch,
-    )
+    return run_config.trainer.model_copy(deep=True)
 
 
 def build_runtime_profile(
     run_config: RunConfig,
-) -> tuple[TrainingConfig, ServingConfig, TrainerConfig]:
-    """Resolve the merged training/serving configs from one RunConfig."""
-    training_config = build_model_config(
-        common=run_config.common,
-        section=run_config.training,
-        config_cls=TrainingConfig,
-        section_name="training",
+) -> tuple[TrainingConfig, TrainingConfig | None, ServingConfig, TrainerConfig, AdminConfig]:
+    """Resolve the runtime profile directly from the explicit role config."""
+    return (
+        run_config.actor.model_copy(deep=True),
+        run_config.reference.model_copy(deep=True) if run_config.reference is not None else None,
+        run_config.serving.model_copy(deep=True),
+        build_trainer_config(run_config),
+        run_config.admin.model_copy(deep=True),
     )
-    serving_config = build_model_config(
-        common=run_config.common,
-        section=run_config.serving,
-        config_cls=ServingConfig,
-        section_name="serving",
-    )
-    trainer_config = build_trainer_config(run_config)
-    return training_config, serving_config, trainer_config
 
 
 def build_model_load_event(

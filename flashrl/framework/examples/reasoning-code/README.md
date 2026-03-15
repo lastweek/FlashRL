@@ -66,12 +66,13 @@ python3 flashrl/framework/examples/reasoning-code/eval.py \
 
 - `config.yaml` / `config_vllm.yaml`
   These are FlashRL runtime/training profiles. They own things like
-  `common.model_name`, `training.batch_size`, `training.max_epochs`,
-  `serving.backend`, `runtime.reference_enabled`, and `grpo.group_size`.
+  `actor.model_name`, `trainer.batch_size`, `trainer.max_epochs`,
+  `serving.backend`, `reference`, `grpo.group_size`, and
+  training checkpoint policy under `checkpointing`.
 
 - `train.py` / `eval.py` CLI flags
   These own Codeforces-specific knobs such as limits, rating filters, execution
-  limits, and checkpoint paths.
+  limits, and evaluation checkpoint paths.
 
 The scripts load these profiles directly and construct `FlashRL(...)` in code.
 Because this folder is intentionally named `reasoning-code`, it does not use
@@ -122,16 +123,27 @@ Available flags:
 
 - `--config`
 - `--train-limit`
-- `--checkpoint`
-- `--checkpoint-out`
 - `--rating-min`
 - `--rating-max`
 - `--run-timeout-seconds`
 - `--memory-limit-mb`
 - `--max-tests-per-problem`
 
-These explicit checkpoint flags are the manual operator path. For production
-training runs, prefer managed checkpointing in `RunConfig` / YAML.
+Training checkpointing is configured in YAML. The shipped example configs already
+write a final checkpoint to `/tmp/flashrl_reasoning_code_checkpoint.pt`.
+
+Example:
+
+```yaml
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_reasoning_code_checkpoint.pt
+  # Optional explicit resume:
+  # resume_from: /tmp/flashrl_reasoning_code_checkpoint.pt
+  # Optional managed latest resume:
+  # directory: logs/reasoning-code-checkpoints
+  # resume_from: latest
+```
 
 ### Evaluation
 

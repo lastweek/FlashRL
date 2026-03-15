@@ -15,7 +15,14 @@ import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.serving as serving_module
 import flashrl.framework.serving.huggingface as huggingface_module
 import flashrl.framework.serving.vllm as vllm_module
-from flashrl.framework.config import GrpoConfig, LoggingConfig, MetricsConfig, ServingConfig, TrainingConfig
+from flashrl.framework.config import (
+    GrpoConfig,
+    LoggingConfig,
+    MetricsConfig,
+    ServingConfig,
+    TrainerConfig,
+    TrainingConfig,
+)
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.serving import (
@@ -24,7 +31,7 @@ from flashrl.framework.serving import (
     VLLMServingBackend,
     create_serving_backend,
 )
-from flashrl.framework.training import OptimizationResult, TrainingBackend
+from flashrl.framework.training import ActorTrainingBackend
 from tests.conftest import TinyActor
 
 pytestmark = pytest.mark.unit
@@ -121,32 +128,19 @@ class FakeProcess:
         self._returncode = 0
 
 
-class StubTrainingBackend(TrainingBackend):
-    """Training backend stub for FlashRL lifecycle tests."""
+class StubTrainingBackend(ActorTrainingBackend):
+    """Actor backend stub for FlashRL lifecycle tests."""
 
-    def __init__(
-        self,
-        config,
-        learning_rate: float = 1e-5,
-        grpo_config: GrpoConfig | None = None,
-        reference_enabled: bool = False,
-        reference_device: str | None = None,
-    ) -> None:
+    def __init__(self, config, learning_rate: float = 1e-5) -> None:
         resolved_config = config or TrainingConfig(model_name="fake/model", device="cpu")
-        super().__init__(
-            resolved_config,
-            learning_rate=learning_rate,
-            grpo_config=grpo_config or GrpoConfig(group_size=2),
-            reference_enabled=reference_enabled,
-            reference_device=reference_device,
-        )
-        self.actor = TinyActor(bias_shift=0.25)
-        self.actor.train()
-        self.device = self.actor.device
-        self.optimizer = torch.optim.SGD(self.actor.model.parameters(), lr=learning_rate)
+        super().__init__(resolved_config, learning_rate=learning_rate)
+        self.model_copy = TinyActor(bias_shift=0.25)
+        self.model_copy.train()
+        self.device = self.model_copy.device
+        self.optimizer = torch.optim.SGD(self.model_copy.model.parameters(), lr=learning_rate)
         self.startup_events = [
             {
-                "component": "training_backend",
+                "component": "actor_backend",
                 "status": "completed",
                 "metadata": {
                     "device": str(self.device),
@@ -155,54 +149,6 @@ class StubTrainingBackend(TrainingBackend):
                 },
             }
         ]
-
-    def optimize_batch(self, learner_batch) -> OptimizationResult:
-        response_tokens_total = sum(len(tokens) for tokens in learner_batch.response_token_ids)
-        full_lengths = [
-            len(prompt_tokens) + len(response_tokens)
-            for prompt_tokens, response_tokens in zip(
-                learner_batch.prompt_token_ids,
-                learner_batch.response_token_ids,
-                strict=True,
-            )
-        ]
-        return OptimizationResult(
-            loss=0.0,
-            policy_loss=0.0,
-            kl_divergence=0.0,
-            learning_rate=float(self.optimizer.param_groups[0]["lr"]),
-            stage_timings={
-                "prepare_inputs": 0.0,
-                "actor_forward": 0.0,
-                "reference_forward": 0.0,
-                "loss_assembly": 0.0,
-                "backward": 0.0,
-                "optimizer": 0.0,
-            },
-            response_tokens_total=response_tokens_total,
-            reference_active=False,
-            stage_metrics={
-                "prepare_inputs": {
-                    "full_tokens_mean": float(sum(full_lengths) / len(full_lengths)) if full_lengths else 0.0,
-                    "full_tokens_max": max(full_lengths, default=0),
-                    "response_tokens_total": response_tokens_total,
-                },
-                "actor_forward": {"full_tokens_total": sum(full_lengths)},
-                "loss_assembly": {
-                    "loss": 0.0,
-                    "policy_loss": 0.0,
-                    "kl_divergence": 0.0,
-                    "response_tokens_total": response_tokens_total,
-                    "importance_sampling_ratio_mean": 1.0,
-                    "importance_sampling_ratio_std": 0.0,
-                    "importance_sampling_ratio_min": 1.0,
-                    "importance_sampling_ratio_max": 1.0,
-                    "clip_fraction": 0.0,
-                },
-                "backward": {"loss": 0.0},
-                "optimizer": {"learning_rate": float(self.optimizer.param_groups[0]["lr"])},
-            },
-        )
 
 
 class ClosableServingBackend:
@@ -298,6 +244,48 @@ def dataset_fn() -> list[Prompt]:
 def reward_fn(rollout: RolloutOutput) -> RewardOutput:
     """Deterministic non-failing reward for training smoke tests."""
     return RewardOutput(reward=float(len(rollout.text)))
+
+
+def patch_backends(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    serving_backend=None,
+) -> None:
+    """Patch FlashRL to use local actor and serving stubs."""
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_training_backend",
+        lambda config, role, learning_rate=None: StubTrainingBackend(
+            config,
+            learning_rate=float(learning_rate or 1e-5),
+        ),
+    )
+    monkeypatch.setattr(
+        flashrl_module,
+        "create_serving_backend",
+        lambda config, startup_logger=None: (
+            serving_backend if serving_backend is not None else FakeServingBackend(config)
+        ),
+    )
+
+
+def build_flashrl(
+    tmp_path: Path,
+    *,
+    reward_callback=reward_fn,
+    serving_config: ServingConfig | None = None,
+) -> FlashRL:
+    """Create one explicit-config FlashRL instance for serving tests."""
+    return FlashRL(
+        actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
+        serving_config=serving_config or ServingConfig(model_name="fake/model", device="cpu"),
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        grpo_config=GrpoConfig(group_size=2),
+        rollout_fn=build_rollout_fn,
+        reward_fn=reward_callback,
+        logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
+        metrics_config=MetricsConfig(enabled=False),
+    )
 
 
 def _make_fake_runtime(
@@ -779,18 +767,23 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
     config_path.write_text(
         yaml.safe_dump(
             {
-                "common": {"model_name": "fake/model"},
-                "training": {"batch_size": 2, "max_epochs": 1, "num_threads": 1},
+                "actor": {
+                    "model_name": "fake/model",
+                    "device": "cpu",
+                    "num_threads": 1,
+                },
                 "serving": {
+                    "model_name": "fake/model",
                     "backend": "vllm",
                     "runtime_python": "${FLASHRL_VLLM_PYTHON}",
                     "num_replicas": 2,
                     "vllm_args": ["--max-num-seqs=32", "--enable-prefix-caching"],
                 },
+                "trainer": {"batch_size": 2, "max_epochs": 1},
                 "grpo": {"group_size": 2, "clip_ratio": 0.2, "kl_coefficient": 0.0},
                 "logging": {"log_dir": str(tmp_path / "logs"), "console": False, "file": True},
                 "metrics": {"enabled": False},
-                "runtime": {"reference_enabled": False},
+                "admin": {"admin_enabled": False},
                 "hooks": {
                     "rollout_fn": "tests.test_vllm_backend:build_rollout_fn",
                     "reward_fn": "tests.test_vllm_backend:failing_reward_fn",
@@ -805,14 +798,9 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
     monkeypatch.setattr(
         flashrl_module,
         "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
+        lambda config, role, learning_rate=None: StubTrainingBackend(
+            config,
+            learning_rate=float(learning_rate or 1e-5),
         ),
     )
     monkeypatch.setattr(
@@ -841,16 +829,21 @@ def test_flashrl_from_yaml_requires_present_runtime_python_env_var(
     config_path.write_text(
         yaml.safe_dump(
             {
-                "common": {"model_name": "fake/model"},
-                "training": {"batch_size": 2, "max_epochs": 1, "num_threads": 1},
+                "actor": {
+                    "model_name": "fake/model",
+                    "device": "cpu",
+                    "num_threads": 1,
+                },
                 "serving": {
+                    "model_name": "fake/model",
                     "backend": "vllm",
                     "runtime_python": "${FLASHRL_VLLM_PYTHON}",
                 },
+                "trainer": {"batch_size": 2, "max_epochs": 1},
                 "grpo": {"group_size": 2, "clip_ratio": 0.2, "kl_coefficient": 0.0},
                 "logging": {"log_dir": str(tmp_path / "logs"), "console": False, "file": True},
                 "metrics": {"enabled": False},
-                "runtime": {"reference_enabled": False},
+                "admin": {"admin_enabled": False},
                 "hooks": {
                     "rollout_fn": "tests.test_vllm_backend:build_rollout_fn",
                     "reward_fn": "tests.test_vllm_backend:failing_reward_fn",
@@ -872,33 +865,11 @@ def test_flashrl_train_failure_closes_serving_backend(
 ) -> None:
     """Training failures should close the serving backend worker."""
     serving_backend = ClosableServingBackend()
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_serving_backend",
-        lambda config, startup_logger=None: serving_backend,
-    )
+    patch_backends(monkeypatch, serving_backend=serving_backend)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=build_rollout_fn,
-        reward_fn=failing_reward_fn,
-        batch_size=2,
-        max_epochs=1,
-        logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
-        metrics_config=MetricsConfig(enabled=False),
+    trainer = build_flashrl(
+        tmp_path,
+        reward_callback=failing_reward_fn,
     )
 
     with pytest.raises(ValueError, match="reward failure"):
@@ -913,33 +884,10 @@ def test_flashrl_train_computes_missing_rollout_logprobs_from_training_actor(
 ) -> None:
     """GRPO training should fall back to the synced training actor when serving omits logprobs."""
     serving_backend = MissingLogprobServingBackend()
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_training_backend",
-        lambda config, learning_rate, grpo_config, reference_enabled=False, reference_device=None: (
-            StubTrainingBackend(
-                config,
-                learning_rate=learning_rate,
-                grpo_config=grpo_config,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-            )
-        ),
-    )
-    monkeypatch.setattr(
-        flashrl_module,
-        "create_serving_backend",
-        lambda config, startup_logger=None: serving_backend,
-    )
+    patch_backends(monkeypatch, serving_backend=serving_backend)
 
-    trainer = FlashRL(
-        model="fake/model",
-        rollout_fn=build_rollout_fn,
-        reward_fn=reward_fn,
-        batch_size=2,
-        max_epochs=1,
-        logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
-        metrics_config=MetricsConfig(enabled=False),
+    trainer = build_flashrl(
+        tmp_path,
     )
 
     try:
