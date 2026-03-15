@@ -186,6 +186,27 @@ class MetricsConfig(BaseConfig):
     pushgateway: PushgatewayMetricsConfig = Field(default_factory=PushgatewayMetricsConfig)
 
 
+class CheckpointingConfig(BaseConfig):
+    """Configuration for managed training checkpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    save_every_steps: int | None = Field(default=None, ge=1)
+    save_on_run_end: bool = False
+    directory: str | Path | None = None
+    final_path: str | Path | None = None
+    resume_from: str | Path | Literal["latest"] | None = None
+
+    @model_validator(mode="after")
+    def validate_resume_target(self) -> "CheckpointingConfig":
+        """Require a managed directory when resuming from the latest checkpoint."""
+        if self.resume_from == "latest" and self.directory is None:
+            raise ValueError(
+                "checkpointing.directory is required when checkpointing.resume_from='latest'."
+            )
+        return self
+
+
 class RuntimeConfig(BaseConfig):
     """Runtime options that sit outside the model/trainer sections."""
 
@@ -254,5 +275,6 @@ class RunConfig(BaseConfig):
     grpo: GrpoConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    checkpointing: CheckpointingConfig = Field(default_factory=CheckpointingConfig)
     runtime: RuntimeConfig = Field(default_factory=RuntimeConfig)
     hooks: HookConfig | None = None

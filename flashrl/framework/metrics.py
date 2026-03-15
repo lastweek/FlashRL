@@ -15,6 +15,7 @@ from flashrl.framework.config import (
     PushgatewayMetricsConfig,
     TensorBoardMetricsConfig,
 )
+from flashrl.framework.observability import RuntimeEvent, observe_event
 
 
 LABEL_NAMES = ("model", "algorithm", "runtime")
@@ -25,6 +26,9 @@ class MetricsSink(Protocol):
 
     def start_run(self, *, run_dir: Path, run_id: str) -> None:
         """Prepare the sink for a new run."""
+
+    def observe_event(self, event: RuntimeEvent) -> None:
+        """Observe one typed runtime event."""
 
     def observe_stage(self, payload: dict[str, Any]) -> None:
         """Observe one completed training stage."""
@@ -55,17 +59,18 @@ class CompositeMetricsSink:
         for sink in self.sinks:
             sink.start_run(run_dir=run_dir, run_id=run_id)
 
-    def observe_stage(self, payload: dict[str, Any]) -> None:
+    def observe_event(self, event: RuntimeEvent) -> None:
         for sink in self.sinks:
-            sink.observe_stage(payload)
+            observe_event(sink, event)
+
+    def observe_stage(self, payload: dict[str, Any]) -> None:
+        self.observe_event(RuntimeEvent(kind="step_stage", payload=payload))
 
     def observe_step(self, payload: dict[str, Any]) -> None:
-        for sink in self.sinks:
-            sink.observe_step(payload)
+        self.observe_event(RuntimeEvent(kind="step_done", payload=payload))
 
     def observe_serving_debug(self, payload: dict[str, Any]) -> None:
-        for sink in self.sinks:
-            sink.observe_serving_debug(payload)
+        self.observe_event(RuntimeEvent(kind="serving_debug_done", payload=payload))
 
     def push(self) -> None:
         for sink in self.sinks:
@@ -169,6 +174,17 @@ class TensorBoardMetricsSink:
         del run_id
         self.finish_run()
         self._writer = self.writer_factory(str(run_dir))
+
+    def observe_event(self, event: RuntimeEvent) -> None:
+        """Record one typed runtime event."""
+        if event.kind == "step_stage":
+            self.observe_stage(event.payload)
+            return
+        if event.kind == "step_done":
+            self.observe_step(event.payload)
+            return
+        if event.kind == "serving_debug_done":
+            self.observe_serving_debug(event.payload)
 
     def observe_stage(self, payload: dict[str, Any]) -> None:
         """Record stage-specific TensorBoard scalars."""
@@ -373,6 +389,17 @@ class PrometheusMetricsSink:
     def start_run(self, *, run_dir: Path, run_id: str) -> None:
         """Prometheus registry is process-scoped and needs no per-run setup."""
         del run_dir, run_id
+
+    def observe_event(self, event: RuntimeEvent) -> None:
+        """Update gauges from one typed runtime event."""
+        if event.kind == "step_stage":
+            self.observe_stage(event.payload)
+            return
+        if event.kind == "step_done":
+            self.observe_step(event.payload)
+            return
+        if event.kind == "serving_debug_done":
+            self.observe_serving_debug(event.payload)
 
     def observe_stage(self, payload: dict[str, Any]) -> None:
         """Update the latency gauges for stages tracked in v1."""

@@ -130,6 +130,9 @@ Available flags:
 - `--memory-limit-mb`
 - `--max-tests-per-problem`
 
+These explicit checkpoint flags are the manual operator path. For production
+training runs, prefer managed checkpointing in `RunConfig` / YAML.
+
 ### Evaluation
 
 ```bash

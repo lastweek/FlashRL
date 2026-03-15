@@ -2,19 +2,39 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
-import math
 import random
-import time
 from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
 from flashrl.framework.config import GrpoConfig, TrainerConfig
 from flashrl.framework.data_models import LearnerBatch, Prompt, RewardOutput, TrainingBatch
+from flashrl.framework.observability import (
+    RuntimeEvent,
+    StageResult,
+    dominant_stage_name,
+    elapsed_seconds,
+    observe_event,
+    observe_event_pair,
+    stage_timings,
+    timed_call,
+)
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.training import OptimizationResult
+from flashrl.framework.trainer.step_support import (
+    STAGE_ORDER,
+    StepContext,
+    accumulate_totals,
+    batch_items,
+    compute_advantages,
+    mean,
+    mean_payload_metrics,
+    prompt_batch_size,
+    reward_rate_stats,
+    summary_stats,
+    truncate_preview,
+)
 
 if TYPE_CHECKING:
     from flashrl.framework.metrics import MetricsSink
@@ -22,60 +42,6 @@ if TYPE_CHECKING:
     from flashrl.framework.serving import ServingBackend
     from flashrl.framework.training import TrainingBackend
 
-
-STAGE_ORDER = (
-    "rollout",
-    "reward",
-    "advantage",
-    "prepare_inputs",
-    "actor_forward",
-    "reference_forward",
-    "loss_assembly",
-    "backward",
-    "optimizer",
-    "sync",
-)
-
-
-@dataclass(frozen=True)
-class StepContext:
-    """Stable metadata shared by all events in a training step."""
-
-    step: int
-    epoch: int
-    total_epochs: int
-    batch_index: int
-    batches_in_epoch: int
-    batch_size: int
-    prompt_count: int
-    group_size: int
-    dataset_prompt_start: int
-    dataset_prompt_end: int
-    dataset_prompt_count: int
-    planned_prompts_per_step: int
-    planned_samples_per_step: int
-
-    def payload(self) -> dict[str, int]:
-        """Return the event payload fields shared by all step-stage logs."""
-        return {
-            "step": self.step,
-            "epoch": self.epoch,
-            "total_epochs": self.total_epochs,
-            "batch_index": self.batch_index,
-            "batches_in_epoch": self.batches_in_epoch,
-            "batch_size": self.batch_size,
-            "prompt_count": self.prompt_count,
-            "group_size": self.group_size,
-            "dataset_prompt_start": self.dataset_prompt_start,
-            "dataset_prompt_end": self.dataset_prompt_end,
-            "dataset_prompt_count": self.dataset_prompt_count,
-            "planned_prompts_per_step": self.planned_prompts_per_step,
-            "planned_samples_per_step": self.planned_samples_per_step,
-            "completions_per_prompt": self.group_size,
-            "planned_completions_per_step": self.planned_samples_per_step,
-            "samples_this_step": self.batch_size,
-            "completions_this_step": self.batch_size,
-        }
 
 class GRPOTrainer:
     """GRPO trainer implementation with detailed step logging."""
@@ -91,6 +57,7 @@ class GRPOTrainer:
         reference: Any | None = None,
         run_logger: "RunLogger | None" = None,
         metrics_sink: "MetricsSink | None" = None,
+        on_step_complete: Callable[[dict[str, Any]], None] | None = None,
     ) -> None:
         """Initialize GRPO trainer."""
         self.config = config
@@ -107,6 +74,7 @@ class GRPOTrainer:
         self.reference = getattr(self.training_backend, "reference", reference)
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
+        self.on_step_complete = on_step_complete
 
     def attach_run_logger(self, run_logger: "RunLogger | None") -> None:
         """Attach or clear the current run-scoped logger."""
@@ -120,12 +88,12 @@ class GRPOTrainer:
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
         prompts_per_step = self._prompts_per_step()
-        batches_in_epoch = math.ceil(len(dataset) / prompts_per_step) if len(dataset) else 0
+        batches_in_epoch = math_ceil_div(len(dataset), prompts_per_step) if len(dataset) else 0
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
             self.current_epoch = epoch
             epoch_number = epoch + 1
-            epoch_started_at = time.perf_counter()
+            epoch_started_at = current_time()
             epoch_step_payloads: list[dict[str, Any]] = []
             epoch_dataset = list(dataset)
             if self.config.shuffle_each_epoch and len(epoch_dataset) > 1:
@@ -139,18 +107,18 @@ class GRPOTrainer:
                 )
 
             for batch_index, prompts in enumerate(
-                self._batch_prompts(epoch_dataset, prompts_per_step),
+                batch_items(epoch_dataset, prompts_per_step),
                 start=1,
             ):
                 next_step = self.total_steps + 1
-                sample_count = len(prompts) * self.grpo_config.group_size
+                candidate_count = len(prompts) * self.grpo_config.group_size
                 context = StepContext(
                     step=next_step,
                     epoch=epoch_number,
                     total_epochs=self.config.max_epochs,
                     batch_index=batch_index,
                     batches_in_epoch=batches_in_epoch,
-                    batch_size=sample_count,
+                    batch_size=candidate_count,
                     prompt_count=len(prompts),
                     group_size=self.grpo_config.group_size,
                     dataset_prompt_start=((batch_index - 1) * prompts_per_step) + 1,
@@ -162,13 +130,22 @@ class GRPOTrainer:
                 step_payload = self._run_logged_step(prompts, context)
                 epoch_step_payloads.append(step_payload)
                 self.total_steps = context.step
+                if self.on_step_complete is not None:
+                    self.on_step_complete(
+                        {
+                            "epoch": epoch_number,
+                            "epoch_index": self.current_epoch,
+                            "step": self.total_steps,
+                            "batch_index": batch_index,
+                            "batches_in_epoch": batches_in_epoch,
+                        }
+                    )
 
             if self.run_logger is not None:
-                epoch_duration_seconds = time.perf_counter() - epoch_started_at
                 epoch_summary = self._build_epoch_summary(
                     epoch=epoch_number,
                     total_epochs=self.config.max_epochs,
-                    duration_seconds=epoch_duration_seconds,
+                    duration_seconds=elapsed_seconds(epoch_started_at),
                     step_payloads=epoch_step_payloads,
                 )
                 self.run_logger.log_epoch_summary(epoch_summary)
@@ -179,11 +156,11 @@ class GRPOTrainer:
         context: StepContext,
     ) -> dict[str, Any]:
         """Run one full training step and emit detailed stage logs."""
-        step_started_at = time.perf_counter()
+        step_started_at = current_time()
         if self.run_logger is not None:
             self.run_logger.log_step_start(context.payload())
 
-        rollout_started_at = time.perf_counter()
+        rollout_started_at = current_time()
         self._install_serving_debug(context)
         try:
             grouped_prompts, rollouts, prompt_indices, candidate_indices = (
@@ -191,37 +168,38 @@ class GRPOTrainer:
             )
         finally:
             self._clear_serving_debug()
-        rollout_seconds = time.perf_counter() - rollout_started_at
+        rollout_seconds = elapsed_seconds(rollout_started_at)
         prompt_lengths = [len(rollout.prompt_token_ids) for rollout in rollouts]
         response_lengths = [len(rollout.response_token_ids) for rollout in rollouts]
         self._log_stage(
             context,
-            "rollout",
-            rollout_seconds,
-            {
-                "sample_count": len(grouped_prompts),
-                "prompt_tokens_mean": self._mean(prompt_lengths),
-                "prompt_tokens_max": max(prompt_lengths, default=0),
-                "response_tokens_mean": self._mean(response_lengths),
-                "response_tokens_max": max(response_lengths, default=0),
-            },
+            StageResult(
+                name="rollout",
+                seconds=rollout_seconds,
+                metrics={
+                    "sample_count": len(grouped_prompts),
+                    "prompt_tokens_mean": mean(prompt_lengths),
+                    "prompt_tokens_max": max(prompt_lengths, default=0),
+                    "response_tokens_mean": mean(response_lengths),
+                    "response_tokens_max": max(response_lengths, default=0),
+                },
+            ),
         )
 
         rewards, reward_seconds = self._compute_rewards(context, grouped_prompts, rollouts)
         reward_values = [reward.reward for reward in rewards]
-        reward_stats = self._summary_stats("reward", reward_values)
-        reward_rate_stats = self._reward_rate_stats(rewards)
-        reward_per_item_mean_seconds = reward_seconds / len(rewards) if rewards else 0.0
-        self._log_stage(
-            context,
-            "reward",
-            reward_seconds,
-            {
-                **reward_stats,
-                **reward_rate_stats,
-                "reward_per_item_mean_seconds": reward_per_item_mean_seconds,
+        reward_stage = StageResult(
+            name="reward",
+            seconds=reward_seconds,
+            metrics={
+                **summary_stats("reward", reward_values),
+                **reward_rate_stats(rewards),
+                "reward_per_item_mean_seconds": (
+                    reward_seconds / len(rewards) if rewards else 0.0
+                ),
             },
         )
+        self._log_stage(context, reward_stage)
         if self.run_logger is not None:
             self.run_logger.log_rollout_batch(
                 step=context.step,
@@ -248,77 +226,81 @@ class GRPOTrainer:
             candidate_indices=candidate_indices,
         )
 
-        advantages, advantage_seconds = self._measure(
-            lambda: self._compute_advantages(batch.rewards, batch.prompt_count, batch.group_size)
+        advantages, advantage_seconds = timed_call(
+            lambda: self._compute_advantages(
+                batch.rewards,
+                prompt_count=batch.prompt_count,
+                group_size=batch.group_size,
+            )
         )
         advantage_values = [float(value) for value in advantages.tolist()]
-        advantage_stats = self._summary_stats("advantage", advantage_values)
         self._log_stage(
             context,
-            "advantage",
-            advantage_seconds,
-            advantage_stats,
+            StageResult(
+                name="advantage",
+                seconds=advantage_seconds,
+                metrics=summary_stats("advantage", advantage_values),
+            ),
         )
 
         learner_batch = self._build_learner_batch(batch, advantages)
         result = self._optimize_batch(learner_batch, context)
-        stage_timings = {
+        all_stage_timings = {
             "rollout": rollout_seconds,
             "reward": reward_seconds,
             "advantage": advantage_seconds,
-            **result.stage_timings,
+            **stage_timings(result.stages),
         }
-        step_duration_seconds = time.perf_counter() - step_started_at
+        all_stage_timings.setdefault("reference_forward", 0.0)
+        step_duration_seconds = elapsed_seconds(step_started_at)
         response_tokens_total = result.response_tokens_total
-        if step_duration_seconds > 0.0:
-            tokens_per_second = response_tokens_total / step_duration_seconds
-        else:
-            tokens_per_second = 0.0
+        tokens_per_second = (
+            response_tokens_total / step_duration_seconds if step_duration_seconds > 0.0 else 0.0
+        )
 
-        stage_order: list[str] = []
-        for stage in STAGE_ORDER:
-            if stage == "reference_forward" and not result.reference_active:
-                continue
-            stage_order.append(stage)
-
-        if stage_timings:
-            dominant_stage = max(stage_timings.items(), key=lambda item: item[1])[0]
-        else:
-            dominant_stage = "n/a"
-
-        reward_mean = self._mean(reward_values)
-        reference_enabled = bool(getattr(self.training_backend, "reference_loaded", False))
-
+        visible_stage_order = [
+            stage_name
+            for stage_name in STAGE_ORDER
+            if stage_name in all_stage_timings
+            and (stage_name != "reference_forward" or result.reference_active)
+        ]
+        reward_summary = reward_stage.metrics
         payload = {
             **context.payload(),
             "loss": result.loss,
             "policy_loss": result.policy_loss,
             "kl_divergence": result.kl_divergence,
             "learning_rate": result.learning_rate,
-            "reward_mean": reward_mean,
-            **reward_rate_stats,
+            "reward_mean": mean([float(value) for value in reward_values]),
+            **{
+                key: value
+                for key, value in reward_summary.items()
+                if key.endswith("_rate")
+            },
             "response_tokens_total": response_tokens_total,
             "tokens_per_second": tokens_per_second,
             "step_duration_seconds": step_duration_seconds,
-            "stage_timings": stage_timings,
-            "stage_order": stage_order,
-            "reference_enabled": reference_enabled,
+            "stage_timings": all_stage_timings,
+            "stage_order": visible_stage_order,
+            "reference_enabled": bool(getattr(self.training_backend, "reference_loaded", False)),
             "reference_active": result.reference_active,
-            "dominant_stage": dominant_stage,
+            "dominant_stage": dominant_stage_name(result.stages),
+            "candidate_count": len(grouped_prompts),
             "sample_count": len(grouped_prompts),
         }
 
+        done_event = RuntimeEvent(kind="step_done", payload=payload)
+        observe_event_pair(self.run_logger, self.metrics_sink, done_event)
+        if self.metrics_sink is not None:
+            self.metrics_sink.push()
+
         if self.run_logger is not None:
-            self.run_logger.log_step_done(payload)
             self.run_logger.log_sample_preview(
                 step=context.step,
                 prompt=grouped_prompts[0].text if grouped_prompts else "",
                 response=rollouts[0].text if rollouts else "",
                 reward=reward_values[0] if reward_values else 0.0,
             )
-        if self.metrics_sink is not None:
-            self.metrics_sink.observe_step(payload)
-            self.metrics_sink.push()
 
         return payload
 
@@ -329,7 +311,7 @@ class GRPOTrainer:
         rollouts: list[Any],
     ) -> tuple[list[RewardOutput], float]:
         """Compute rewards and attach prompt/response context on failure."""
-        started_at = time.perf_counter()
+        started_at = current_time()
         try:
             rewards = [self.reward_fn.compute(rollout) for rollout in rollouts]
         except Exception as exc:
@@ -341,12 +323,14 @@ class GRPOTrainer:
                         "epoch": context.epoch,
                         "step": context.step,
                         "batch_index": context.batch_index,
-                        "prompt_preview": self._truncate(prompts[0].text if prompts else ""),
-                        "response_preview": self._truncate(rollouts[0].text if rollouts else ""),
+                        "prompt_preview": truncate_preview(prompts[0].text if prompts else ""),
+                        "response_preview": truncate_preview(
+                            rollouts[0].text if rollouts else ""
+                        ),
                     },
                 )
             raise
-        return rewards, time.perf_counter() - started_at
+        return rewards, elapsed_seconds(started_at)
 
     def _build_learner_batch(
         self,
@@ -382,43 +366,32 @@ class GRPOTrainer:
     ) -> OptimizationResult:
         """Delegate learner-side tensor work to the training backend."""
         result = self.training_backend.optimize_batch(learner_batch)
-        for stage in (
-            "prepare_inputs",
-            "actor_forward",
-            "reference_forward",
-            "loss_assembly",
-            "backward",
-            "optimizer",
-        ):
-            if stage == "reference_forward" and not result.reference_active:
+        for stage in result.stages:
+            if stage.name == "reference_forward" and not result.reference_active:
                 continue
-            self._log_stage(
-                context,
-                stage,
-                result.stage_timings.get(stage, 0.0),
-                result.stage_metrics.get(stage, {}),
-            )
+            self._log_stage(context, stage)
 
-        _, sync_seconds = self._measure(
+        _, sync_seconds = timed_call(
             lambda: self.training_backend.sync_weights_to(self.serving_backend)
         )
-        result.stage_timings["sync"] = sync_seconds
+        sync_stage = StageResult(
+            name="sync",
+            seconds=sync_seconds,
+            metrics={},
+        )
+        result.stages.append(sync_stage)
         if context is not None:
-            partial_step_seconds = sum(result.stage_timings.values())
-            tokens_per_second = (
-                result.response_tokens_total / partial_step_seconds
-                if partial_step_seconds > 0.0
-                else 0.0
-            )
-            self._log_stage(
-                context,
-                "sync",
-                sync_seconds,
-                {
-                    "step_duration_seconds": partial_step_seconds,
-                    "tokens_per_second": tokens_per_second,
-                },
-            )
+            partial_step_seconds = sum(stage.seconds for stage in result.stages)
+            sync_stage.metrics = {
+                "step_duration_seconds": partial_step_seconds,
+                "tokens_per_second": (
+                    result.response_tokens_total / partial_step_seconds
+                    if partial_step_seconds > 0.0
+                    else 0.0
+                ),
+            }
+            self._log_stage(context, sync_stage)
+        result.refresh_stage_views()
         return result
 
     def _reference_logits(
@@ -500,18 +473,20 @@ class GRPOTrainer:
 
         stage_totals: dict[str, float] = {}
         for payload in step_payloads:
-            self._accumulate_totals(stage_totals, payload["stage_timings"])
+            accumulate_totals(stage_totals, payload["stage_timings"])
 
         return {
             "epoch": epoch,
             "total_epochs": total_epochs,
-            "loss": self._mean([payload["loss"] for payload in step_payloads]),
-            "reward": self._mean([payload["reward_mean"] for payload in step_payloads]),
-            "kl_divergence": self._mean([payload["kl_divergence"] for payload in step_payloads]),
-            "tokens_per_second": self._mean([payload["tokens_per_second"] for payload in step_payloads]),
+            "loss": mean([payload["loss"] for payload in step_payloads]),
+            "reward": mean([payload["reward_mean"] for payload in step_payloads]),
+            "kl_divergence": mean([payload["kl_divergence"] for payload in step_payloads]),
+            "tokens_per_second": mean(
+                [payload["tokens_per_second"] for payload in step_payloads]
+            ),
             "duration_seconds": duration_seconds,
             "stage_totals": stage_totals,
-            **self._mean_payload_metrics(
+            **mean_payload_metrics(
                 step_payloads,
                 ("accuracy_pass_rate", "format_pass_rate", "truncation_rate"),
             ),
@@ -520,23 +495,19 @@ class GRPOTrainer:
     def _log_stage(
         self,
         context: StepContext | None,
-        stage: str,
-        latency_seconds: float,
-        extra: dict[str, Any],
+        stage: StageResult,
     ) -> None:
         """Emit one step-stage event if a run logger and context are available."""
         if context is None:
             return
-        payload = {
-            **context.payload(),
-            "stage": stage,
-            "latency_seconds": latency_seconds,
-            **extra,
-        }
-        if self.run_logger is not None:
-            self.run_logger.log_step_stage(payload)
-        if self.metrics_sink is not None:
-            self.metrics_sink.observe_stage(payload)
+        event = RuntimeEvent(
+            kind="step_stage",
+            payload={
+                **context.payload(),
+                **stage.to_payload(),
+            },
+        )
+        observe_event_pair(self.run_logger, self.metrics_sink, event)
 
     def _install_serving_debug(self, context: StepContext) -> None:
         """Install serving live-rollout debug hooks for the current step when enabled."""
@@ -557,19 +528,11 @@ class GRPOTrainer:
 
     def _handle_serving_debug_event(self, kind: str, payload: dict[str, Any]) -> None:
         """Dispatch actor-level live-rollout debug events to logging and metrics."""
-        if kind == "start":
-            if self.run_logger is not None:
-                self.run_logger.log_serving_debug_start(payload)
-            return
-        if kind == "chunk":
-            if self.run_logger is not None:
-                self.run_logger.log_serving_debug_chunk(payload)
-            return
+        event = RuntimeEvent(kind=f"serving_debug_{kind}", payload=payload)
         if kind == "done":
-            if self.run_logger is not None:
-                self.run_logger.log_serving_debug_done(payload)
-            if self.metrics_sink is not None:
-                self.metrics_sink.observe_serving_debug(payload)
+            observe_event_pair(self.run_logger, self.metrics_sink, event)
+            return
+        observe_event(self.run_logger, event)
 
     def _compute_advantages(
         self,
@@ -578,107 +541,51 @@ class GRPOTrainer:
         group_size: int,
     ) -> torch.Tensor:
         """Compute GRPO advantages within each prompt group."""
-        reward_values = torch.tensor(
-            [reward.reward for reward in rewards],
-            dtype=torch.float32,
+        return compute_advantages(
+            rewards,
+            prompt_count=prompt_count,
+            group_size=group_size,
         )
-        expected_samples = prompt_count * group_size
-        if reward_values.numel() != expected_samples:
-            raise ValueError(
-                "Reward count must match prompt_count * group_size for GRPO "
-                f"(expected {expected_samples}, got {reward_values.numel()})."
-            )
-        if reward_values.numel() == 0:
-            return reward_values
-        grouped_rewards = reward_values.view(prompt_count, group_size)
-        group_means = grouped_rewards.mean(dim=1, keepdim=True)
-        group_stds = grouped_rewards.std(dim=1, unbiased=False, keepdim=True)
-        return ((grouped_rewards - group_means) / (group_stds + 1e-8)).reshape(-1)
 
-    def _batch_prompts(self, dataset: Any, batch_size: int | None = None) -> Any:
-        """Split dataset into batches."""
+    def _batch_prompts(self, dataset: list[Any], batch_size: int | None = None):
+        """Split a dataset into prompt batches."""
         size = batch_size or self.config.batch_size
-        for index in range(0, len(dataset), size):
-            yield dataset[index:index + size]
+        return batch_items(dataset, size)
 
     def _prompts_per_step(self) -> int:
         """Return the number of unique prompts consumed by each grouped GRPO step."""
-        return self.config.batch_size // self.grpo_config.group_size
-
-    def _measure(self, operation: Callable[[], Any]) -> tuple[Any, float]:
-        """Measure one operation with perf_counter."""
-        started_at = time.perf_counter()
-        result = operation()
-        return result, time.perf_counter() - started_at
+        return prompt_batch_size(self.config.batch_size, self.grpo_config.group_size)
 
     def _summary_stats(self, prefix: str, values: list[float]) -> dict[str, float]:
-        """Compute mean/std/min/max stats for a list of floats."""
-        if not values:
-            return {
-                f"{prefix}_mean": 0.0,
-                f"{prefix}_std": 0.0,
-                f"{prefix}_min": 0.0,
-                f"{prefix}_max": 0.0,
-            }
-        tensor = torch.tensor(values, dtype=torch.float32)
-        return {
-            f"{prefix}_mean": float(tensor.mean().item()),
-            f"{prefix}_std": float(tensor.std(unbiased=False).item()),
-            f"{prefix}_min": float(tensor.min().item()),
-            f"{prefix}_max": float(tensor.max().item()),
-        }
+        """Compatibility wrapper around shared summary stats."""
+        return summary_stats(prefix, values)
 
     def _reward_rate_stats(self, rewards: list[RewardOutput]) -> dict[str, float]:
-        """Aggregate common boolean reward metadata into per-step rates."""
-        mappings = (
-            ("accuracy_pass", "accuracy_pass_rate"),
-            ("format_pass", "format_pass_rate"),
-            ("truncated", "truncation_rate"),
-        )
-        stats: dict[str, float] = {}
-        for source_key, target_key in mappings:
-            values = [
-                float(bool(reward.metadata[source_key]))
-                for reward in rewards
-                if source_key in reward.metadata
-            ]
-            if values:
-                stats[target_key] = self._mean(values)
-        return stats
+        """Compatibility wrapper around shared reward rate stats."""
+        return reward_rate_stats(rewards)
 
     def _mean_payload_metrics(
         self,
         payloads: list[dict[str, Any]],
         keys: tuple[str, ...],
     ) -> dict[str, float]:
-        """Average selected float payload metrics across a list of step payloads."""
-        result: dict[str, float] = {}
-        for key in keys:
-            values = [float(payload[key]) for payload in payloads if key in payload]
-            if values:
-                result[key] = self._mean(values)
-        return result
+        """Compatibility wrapper around shared payload averaging."""
+        return mean_payload_metrics(payloads, keys)
 
-    def _accumulate_totals(
-        self,
-        target: dict[str, float],
-        update: dict[str, float],
-    ) -> None:
-        for key, value in update.items():
-            target[key] = target.get(key, 0.0) + float(value)
+    def _accumulate_totals(self, target: dict[str, float], update: dict[str, float]) -> None:
+        accumulate_totals(target, update)
 
     def _mean(self, values: list[float] | list[int]) -> float:
-        if not values:
-            return 0.0
-        return float(sum(values) / len(values))
+        return mean(values)
 
     def _truncate(self, text: str, *, limit: int = 240) -> str:
-        normalized = " ".join(text.strip().split())
-        if len(normalized) <= limit:
-            return normalized
-        return normalized[: limit - 3] + "..."
+        return truncate_preview(text, limit=limit)
 
-    def save_checkpoint(self, path: str) -> None:
+    def save_checkpoint(
+        self,
+        path: str,
+        checkpoint_metadata: dict[str, Any] | None = None,
+    ) -> None:
         """Save model checkpoint."""
         self.training_backend.save_checkpoint(
             path,
@@ -686,11 +593,43 @@ class GRPOTrainer:
                 "epoch": self.current_epoch,
                 "total_steps": self.total_steps,
             },
+            checkpoint_metadata=checkpoint_metadata,
         )
 
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
-        controller_state = self.training_backend.load_checkpoint(path)
+        controller_state, _ = self.load_checkpoint_with_metadata(path)
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
         self.training_backend.sync_weights_to(self.serving_backend)
+
+    def load_checkpoint_with_metadata(
+        self,
+        path: str,
+    ) -> tuple[dict[str, Any], dict[str, Any] | None]:
+        """Load checkpoint state and expose any attached checkpoint metadata."""
+        controller_state, checkpoint_metadata = self.training_backend.load_checkpoint_with_metadata(
+            path
+        )
+        self.current_epoch = int(controller_state.get("epoch", 0))
+        self.total_steps = int(controller_state.get("total_steps", 0))
+        self.training_backend.sync_weights_to(self.serving_backend)
+        return controller_state, checkpoint_metadata
+
+    def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:
+        """Return checkpoint metadata without mutating trainer state."""
+        return self.training_backend.read_checkpoint_metadata(path)
+
+
+def current_time() -> float:
+    """Wrapper around perf-counter access for readability."""
+    import time
+
+    return time.perf_counter()
+
+
+def math_ceil_div(size: int, divisor: int) -> int:
+    """Return ``ceil(size / divisor)`` without importing ``math`` into the main flow."""
+    if divisor <= 0:
+        raise ValueError(f"divisor must be > 0, got {divisor}")
+    return (size + divisor - 1) // divisor

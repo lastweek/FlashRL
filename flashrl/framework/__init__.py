@@ -1,6 +1,7 @@
 """Framework layer: Core RL training APIs."""
 
 from flashrl.framework.config import (
+    CheckpointingConfig,
     CommonConfig,
     FSDP2Config,
     GrpoConfig,
@@ -49,6 +50,7 @@ __all__ = [
     "FlashRL",
     # Config
     "CommonConfig",
+    "CheckpointingConfig",
     "GrpoConfig",
     "TrainerConfig",
     "ModelConfig",

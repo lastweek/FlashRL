@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 import argparse
-import importlib
+from dataclasses import dataclass
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -12,22 +13,27 @@ import time
 from typing import Any, Callable, Sequence
 from uuid import uuid4
 
+from . import runtime_support
 from .admin import AdminRegistry, AdminServer, build_admin_object, utc_now_iso
+from .checkpointing import (
+    CHECKPOINT_SCHEMA_VERSION,
+    CheckpointManager,
+    RestoredCheckpoint,
+)
 from .config import (
-    CommonConfig,
+    CheckpointingConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
-    ModelConfig,
     RewardConfig,
     RunConfig,
-    RolloutConfig,
     ServingConfig,
-    TrainingConfig,
     TrainerConfig,
+    TrainingConfig,
 )
 from .data_models import Prompt, RewardOutput, RolloutOutput
 from .metrics import MetricsSink, build_metrics_sink
+from .observability import timed_call
 from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
@@ -36,142 +42,16 @@ from .training import TrainingBackend, create_training_backend
 from .trainer.grpo import GRPOTrainer
 
 
-def _resolve_import_string(import_string: str) -> Any:
-    """Resolve a ``module:attribute`` import string."""
-    module_name, separator, attr_path = import_string.partition(":")
-    if separator == "" or not module_name or not attr_path:
-        raise ValueError(
-            "Hook import strings must use the format 'module.submodule:attribute'."
-        )
+@dataclass
+class TrainRunState:
+    """Precomputed metadata shared across one FlashRL training run."""
 
-    module = importlib.import_module(module_name)
-    resolved = module
-    for attr_name in attr_path.split("."):
-        resolved = getattr(resolved, attr_name)
-    return resolved
-
-
-def _coerce_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
-    """Normalize string datasets into Prompt objects."""
-    normalized: list[Prompt] = []
-    for item in dataset:
-        if isinstance(item, Prompt):
-            normalized.append(item)
-        else:
-            normalized.append(Prompt(text=str(item)))
-    return normalized
-
-
-COMMON_MODEL_SECTION_FIELDS = {
-    "model_name",
-    "device",
-    "dtype",
-    "max_length",
-    "load_in_8bit",
-    "trust_remote_code",
-    "num_threads",
-    "metadata",
-}
-
-SERVING_ONLY_SECTION_FIELDS = {
-    "backend",
-    "runtime_python",
-    "num_replicas",
-    "vllm_args",
-    "debug_live_rollout",
-}
-
-TRAINING_ONLY_SECTION_FIELDS = {
-    "backend",
-    "dp_size",
-    "fsdp2",
-}
-
-
-def _resolve_model_config(
-    *,
-    common: CommonConfig | None,
-    section: CommonConfig,
-    config_cls: type[ModelConfig] | type[ServingConfig] | type[TrainingConfig],
-    section_name: str,
-) -> ModelConfig | ServingConfig | TrainingConfig:
-    """Merge optional common defaults with one model-copy section."""
-    merged = {}
-    if common is not None:
-        merged.update(common.model_dump(exclude_none=True))
-    include_fields = set(COMMON_MODEL_SECTION_FIELDS)
-    if config_cls is ServingConfig:
-        include_fields.update(SERVING_ONLY_SECTION_FIELDS)
-    if config_cls is TrainingConfig:
-        include_fields.update(TRAINING_ONLY_SECTION_FIELDS)
-    merged.update(section.model_dump(include=include_fields, exclude_none=True))
-
-    if not merged.get("model_name"):
-        raise ValueError(
-            f"Run config requires '{section_name}.model_name' or 'common.model_name' after merge."
-        )
-    return config_cls(**merged)
-
-
-def _rollout_config_from_grpo(grpo_config: GrpoConfig) -> RolloutConfig:
-    """Build the internal rollout config from GRPO sampling knobs."""
-    return RolloutConfig(
-        max_new_tokens=grpo_config.max_new_tokens,
-        temperature=grpo_config.temperature,
-        top_p=grpo_config.top_p,
-        top_k=grpo_config.top_k,
-        do_sample=grpo_config.do_sample,
-    )
-
-
-def _coerce_run_config(
-    *,
-    config_path: str | Path | None,
-    run_config: RunConfig | dict[str, Any] | None,
-) -> RunConfig | None:
-    """Normalize the optional profile input into one RunConfig object."""
-    if config_path is not None and run_config is not None:
-        raise ValueError("Pass only one of config_path or run_config when constructing FlashRL.")
-    if config_path is not None:
-        return RunConfig.from_yaml(config_path)
-    if run_config is None:
-        return None
-    if isinstance(run_config, RunConfig):
-        return run_config
-    if isinstance(run_config, dict):
-        return RunConfig.from_dict(run_config)
-    raise TypeError("run_config must be a RunConfig, dict, or None.")
-
-
-def _trainer_config_from_run_config(run_config: RunConfig) -> TrainerConfig:
-    """Extract trainer loop settings from one top-level RunConfig."""
-    return TrainerConfig(
-        learning_rate=run_config.training.learning_rate,
-        batch_size=run_config.training.batch_size,
-        max_epochs=run_config.training.max_epochs,
-        seed=run_config.training.seed,
-        shuffle_each_epoch=run_config.training.shuffle_each_epoch,
-    )
-
-
-def _resolve_runtime_profile(
-    run_config: RunConfig,
-) -> tuple[TrainingConfig, ServingConfig, TrainerConfig]:
-    """Resolve the merged training/serving configs from one RunConfig."""
-    training_config = _resolve_model_config(
-        common=run_config.common,
-        section=run_config.training,
-        config_cls=TrainingConfig,
-        section_name="training",
-    )
-    serving_config = _resolve_model_config(
-        common=run_config.common,
-        section=run_config.serving,
-        config_cls=ServingConfig,
-        section_name="serving",
-    )
-    trainer_config = _trainer_config_from_run_config(run_config)
-    return training_config, serving_config, trainer_config
+    dataset: list[Prompt]
+    dataset_size: int
+    prompts_per_step: int
+    steps_per_epoch: int
+    total_planned_steps: int
+    run_logger: RunLogger | None = None
 
 
 class FlashRL:
@@ -216,10 +96,11 @@ class FlashRL:
         exactly one device. A frozen reference model is optional and is only
         needed when the user wants KL-regularized GRPO.
         """
-        resolved_run_config = _coerce_run_config(
+        resolved_run_config = runtime_support.load_run_config(
             config_path=config_path,
             run_config=run_config,
         )
+        checkpointing_config: CheckpointingConfig | None = None
         if resolved_run_config is not None:
             if rollout_fn is None or reward_fn is None:
                 raise ValueError(
@@ -260,7 +141,7 @@ class FlashRL:
                     "FlashRL profile construction cannot be combined with an explicit grpo_config."
                 )
 
-            training_config, serving_config, trainer_config = _resolve_runtime_profile(
+            training_config, serving_config, trainer_config = runtime_support.build_runtime_profile(
                 resolved_run_config
             )
             model = training_config.model_name
@@ -272,6 +153,7 @@ class FlashRL:
             grpo_config = resolved_run_config.grpo
             logging_config = resolved_run_config.logging
             metrics_config = resolved_run_config.metrics
+            checkpointing_config = resolved_run_config.checkpointing
             reference_enabled = resolved_run_config.runtime.reference_enabled
             reference_device = resolved_run_config.runtime.reference_device
             admin_enabled = resolved_run_config.runtime.admin_enabled
@@ -312,7 +194,9 @@ class FlashRL:
             serving_config
             if serving_config is not None
             else ServingConfig(
-                **self.training_config.model_dump(include=COMMON_MODEL_SECTION_FIELDS)
+                **self.training_config.model_dump(
+                    include=runtime_support.COMMON_MODEL_SECTION_FIELDS
+                )
             )
         )
         self.trainer_config = TrainerConfig(
@@ -333,10 +217,11 @@ class FlashRL:
                 f"(got batch_size={self.trainer_config.batch_size}, "
                 f"group_size={self.grpo_config.group_size})."
             )
-        self.rollout_config = _rollout_config_from_grpo(self.grpo_config)
+        self.rollout_config = runtime_support.build_rollout_config(self.grpo_config)
         self.reward_config = RewardConfig()
         self.logging_config = logging_config or LoggingConfig()
         self.metrics_config = metrics_config or MetricsConfig()
+        self.checkpointing_config = checkpointing_config or CheckpointingConfig()
 
         self._training_backend: TrainingBackend | None = None
         self._serving_backend: ServingBackend | None = None
@@ -346,9 +231,12 @@ class FlashRL:
         self._run_logger: RunLogger | None = None
         self._metrics_sink: MetricsSink | None = None
         self._run_lifecycle_totals: dict[str, float] = {}
+        self._restored_run_lifecycle_totals: dict[str, float] = {}
         self._runtime_bootstrap_events: list[dict[str, Any]] = []
         self._runtime_bootstrap_totals: dict[str, float] = {}
         self._resume_from_checkpoint = False
+        self._managed_resume: RestoredCheckpoint | None = None
+        self._managed_resume_load_seconds = 0.0
         self._dataset_loader = dataset_loader
         self._admin_registry: AdminRegistry | None = None
         self._admin_server: AdminServer | None = None
@@ -357,6 +245,7 @@ class FlashRL:
         self._runtime_phase = "Pending"
         self._last_runtime_error: str | None = None
         self._closed = False
+        self._checkpoint_manager = CheckpointManager(self.checkpointing_config)
 
         self._metrics_sink = build_metrics_sink(
             self.metrics_config,
@@ -428,9 +317,9 @@ class FlashRL:
                 "FlashRL.from_yaml(...) requires hooks.rollout_fn, hooks.reward_fn, and "
                 "hooks.dataset_fn in the YAML config."
             )
-        rollout_fn = _resolve_import_string(run_config.hooks.rollout_fn)
-        reward_fn = _resolve_import_string(run_config.hooks.reward_fn)
-        dataset_fn = _resolve_import_string(run_config.hooks.dataset_fn)
+        rollout_fn = runtime_support.resolve_import(run_config.hooks.rollout_fn)
+        reward_fn = runtime_support.resolve_import(run_config.hooks.reward_fn)
+        dataset_fn = runtime_support.resolve_import(run_config.hooks.dataset_fn)
 
         return cls(
             rollout_fn=rollout_fn,
@@ -500,14 +389,14 @@ class FlashRL:
             f"starting backend={self.serving_config.backend}"
             f"{self._serving_replica_summary()}",
         )
-        started_at = time.perf_counter()
-        self._serving_backend = create_serving_backend(
-            self.serving_config,
-            startup_logger=(
-                self._emit_bootstrap_console if self._bootstrap_console_enabled() else None
-            ),
+        self._serving_backend, duration_seconds = timed_call(
+            lambda: create_serving_backend(
+                self.serving_config,
+                startup_logger=(
+                    self._emit_bootstrap_console if self._bootstrap_console_enabled() else None
+                ),
+            )
         )
-        duration_seconds = time.perf_counter() - started_at
         startup_total_seconds += duration_seconds
         serving_ready_line = (
             f"backend={self.serving_config.backend} "
@@ -546,6 +435,7 @@ class FlashRL:
             rollout_generator=self._rollout_generator,
             run_logger=None,
             metrics_sink=self._metrics_sink,
+            on_step_complete=self._on_trainer_step_complete,
         )
         self._initialize_admin()
         self._runtime_bootstrap_totals["startup_total_seconds"] = startup_total_seconds
@@ -559,15 +449,12 @@ class FlashRL:
         cpu_threads: int,
     ) -> dict[str, Any]:
         """Build one cached model-load event for replay into each run logger."""
-        return {
-            "component": component,
-            "status": "completed",
-            "metadata": {
-                "device": str(device),
-                "cpu_threads": cpu_threads,
-                "duration_seconds": duration_seconds,
-            },
-        }
+        return runtime_support.build_model_load_event(
+            component=component,
+            duration_seconds=duration_seconds,
+            device=device,
+            cpu_threads=cpu_threads,
+        )
 
     def _initialize_admin(self) -> None:
         """Start the runtime-owned admin registry and HTTP server when enabled."""
@@ -780,8 +667,11 @@ class FlashRL:
         self._serving_backend = None
         self._training_backend = None
 
-    def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
-        """Train on dataset or use the configured dataset loader."""
+    def _resolve_train_dataset(
+        self,
+        dataset: list[Prompt] | list[str] | None,
+    ) -> list[Prompt]:
+        """Resolve the explicit or configured dataset into normalized prompts."""
         if dataset is None:
             if self._dataset_loader is None:
                 raise ValueError(
@@ -789,121 +679,212 @@ class FlashRL:
                     "a configured dataset_loader."
                 )
             dataset = self._dataset_loader()
+        return runtime_support.normalize_dataset(dataset)
 
-        dataset = _coerce_dataset(dataset)
-        if self._run_logger is not None:
-            self._run_logger.close()
-
+    def _reset_run_lifecycle_totals(self) -> None:
+        """Reset run totals while preserving checkpoint timings and managed carry-over."""
         checkpoint_totals = {
             key: value
             for key, value in self._run_lifecycle_totals.items()
             if key.startswith("checkpoint_")
         }
-        self._run_lifecycle_totals = {
-            **self._runtime_bootstrap_totals,
-            **checkpoint_totals,
-        }
+        self._run_lifecycle_totals = self._merge_float_mappings(
+            self._restored_run_lifecycle_totals,
+            self._runtime_bootstrap_totals,
+            checkpoint_totals,
+        )
+
+    def _merge_float_mappings(self, *mappings: dict[str, Any]) -> dict[str, float]:
+        """Accumulate float-like values from one or more mappings."""
+        merged: dict[str, float] = {}
+        for mapping in mappings:
+            for key, value in mapping.items():
+                try:
+                    merged[key] = merged.get(key, 0.0) + float(value)
+                except (TypeError, ValueError):
+                    continue
+        return merged
+
+    def _build_train_run_state(self, dataset: list[Prompt]) -> TrainRunState:
+        """Compute the per-run dataset and step metadata once."""
         prompts_per_step = self.trainer_config.batch_size // self.grpo_config.group_size
-        total_batches = (
-            math.ceil(len(dataset) / prompts_per_step) * self.trainer_config.max_epochs
-            if dataset
-            else 0
-        )
-        self._run_logger = RunLogger(
-            self.logging_config,
-            model_name=self.training_model_config.model_name,
-        )
-        self._run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
-        self._run_logger.start_run(
+        steps_per_epoch = math.ceil(len(dataset) / prompts_per_step) if dataset else 0
+        return TrainRunState(
+            dataset=dataset,
             dataset_size=len(dataset),
-            batch_size=self.trainer_config.batch_size,
-            max_epochs=self.trainer_config.max_epochs,
-            total_batches=total_batches,
-            device=self.training_config.device or "auto",
-            dtype=self.training_config.dtype,
-            cpu_threads=self.training_config.num_threads,
-            runtime_shape="single-device-per-backend",
-            reference_enabled=self.reference_enabled,
-            reference_device=self._training_backend.resolved_reference_device,
-            group_size=self.grpo_config.group_size,
-            clip_ratio=self.grpo_config.clip_ratio,
             prompts_per_step=prompts_per_step,
-            steps_per_epoch=(math.ceil(len(dataset) / prompts_per_step) if dataset else 0),
-            total_planned_steps=total_batches,
-            training_backend=self.training_config.backend,
-            training_device=str(self._training_backend.device),
-            training_dp_size=self.training_config.dp_size,
-            serving_backend=self.serving_config.backend,
-            serving_device=str(self._serving_backend.device),
-            serving_num_replicas=self.serving_config.num_replicas,
-            admin_base_url=self.admin_base_url,
-            max_new_tokens=self.rollout_config.max_new_tokens,
-            include_startup_divider=bool(self._runtime_bootstrap_console_lines),
+            steps_per_epoch=steps_per_epoch,
+            total_planned_steps=steps_per_epoch * self.trainer_config.max_epochs,
         )
+
+    def _open_run_logger(self, run_state: TrainRunState) -> RunLogger:
+        """Open and initialize the run-scoped logger for one training invocation."""
+        if self._run_logger is not None:
+            self._run_logger.close()
+
+        assert self._training_backend is not None
+        assert self._serving_backend is not None
+        run_open_kwargs = {
+            "dataset_size": run_state.dataset_size,
+            "batch_size": self.trainer_config.batch_size,
+            "max_epochs": self.trainer_config.max_epochs,
+            "total_batches": run_state.total_planned_steps,
+            "device": self.training_config.device or "auto",
+            "dtype": self.training_config.dtype,
+            "cpu_threads": self.training_config.num_threads,
+            "runtime_shape": "single-device-per-backend",
+            "reference_enabled": self.reference_enabled,
+            "reference_device": self._training_backend.resolved_reference_device,
+            "group_size": self.grpo_config.group_size,
+            "clip_ratio": self.grpo_config.clip_ratio,
+            "prompts_per_step": run_state.prompts_per_step,
+            "steps_per_epoch": run_state.steps_per_epoch,
+            "total_planned_steps": run_state.total_planned_steps,
+            "training_backend": self.training_config.backend,
+            "training_device": str(self._training_backend.device),
+            "training_dp_size": self.training_config.dp_size,
+            "serving_backend": self.serving_config.backend,
+            "serving_device": str(self._serving_backend.device),
+            "serving_num_replicas": self.serving_config.num_replicas,
+            "admin_base_url": self.admin_base_url,
+            "max_new_tokens": self.rollout_config.max_new_tokens,
+            "include_startup_divider": bool(self._runtime_bootstrap_console_lines),
+        }
+        if self._managed_resume is not None:
+            run_logger = RunLogger.open_existing_run(
+                self.logging_config,
+                model_name=self.training_model_config.model_name,
+                run_id=self._managed_resume.run_id,
+                run_index=self._managed_resume.run_index,
+                run_dir=self._managed_resume.run_dir,
+                restored_state=self._managed_resume.run_logger_state,
+            )
+        else:
+            run_logger = RunLogger(
+                self.logging_config,
+                model_name=self.training_model_config.model_name,
+            )
+        run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
+        if self._managed_resume is not None:
+            run_logger.resume_run(
+                checkpoint_path=str(self._managed_resume.checkpoint_path),
+                **run_open_kwargs,
+            )
+        else:
+            run_logger.start_run(**run_open_kwargs)
         for event in self._runtime_bootstrap_events:
-            self._run_logger.log_model_load(
+            run_logger.log_model_load(
                 event["component"],
                 event["status"],
                 event["metadata"],
             )
+        if self._managed_resume is not None:
+            run_logger.log_checkpoint(
+                "load",
+                str(self._managed_resume.checkpoint_path),
+                epoch=self._trainer.current_epoch + 1,
+                step=self._trainer.total_steps,
+                duration_seconds=self._managed_resume_load_seconds,
+                trigger="resume",
+            )
 
-        status = "completed"
+        self._run_logger = run_logger
+        run_state.run_logger = run_logger
+        return run_logger
+
+    def _prepare_trainer_for_run(self, run_logger: RunLogger) -> None:
+        """Apply resume/reset behavior and attach the run logger to the trainer."""
         assert self._trainer is not None
         if not self._resume_from_checkpoint:
             self._trainer.reset_state()
-        self._trainer.attach_run_logger(self._run_logger)
-        training_loop_started_at = time.perf_counter()
-        self._last_runtime_error = None
-        self._runtime_phase = "Training"
-        try:
-            if self._metrics_sink is not None:
-                self._metrics_sink.start_run(
-                    run_dir=self._run_logger.run_dir,
-                    run_id=self._run_logger.run_id,
-                )
-            training_loop_started_at = time.perf_counter()
-            self._trainer.train(dataset)
-        except Exception as exc:
-            status = "failed"
-            self._runtime_phase = "Failed"
-            self._last_runtime_error = f"{type(exc).__name__}: {exc}"
-            if self._run_logger is not None:
-                epoch = self._trainer.current_epoch + 1
-                step = self._trainer.total_steps
-                context = {
-                    "stage": "train",
-                    "step": step,
-                }
-                context["epoch"] = epoch
-                self._run_logger.log_exception(exc, context=context)
-            if self._serving_backend is not None:
-                self._serving_backend.close()
-            raise
-        finally:
-            self._run_lifecycle_totals["training_loop_seconds"] = (
-                time.perf_counter() - training_loop_started_at
-            )
-            self._trainer.attach_run_logger(None)
-            self._resume_from_checkpoint = False
-            if self._metrics_sink is not None:
-                self._metrics_sink.finish_run()
-            if status == "completed":
-                self._runtime_phase = "Ready"
-            if self._run_logger is not None:
-                self._run_logger.finish_run(
-                    status=status,
-                    total_steps=self._trainer.total_steps,
-                    lifecycle_totals=self._run_lifecycle_totals,
-                )
-                self._run_logger.close()
+        self._trainer.attach_run_logger(run_logger)
 
-    def save_checkpoint(self, path: str) -> None:
-        """Save model checkpoint."""
+    def _prepare_managed_resume(self) -> RestoredCheckpoint | None:
+        """Load one configured managed checkpoint before opening the run logger."""
         assert self._trainer is not None
+        assert self._training_backend is not None
+        checkpoint_path = self._checkpoint_manager.resolve_resume_path()
+        if checkpoint_path is None:
+            self._managed_resume = None
+            self._restored_run_lifecycle_totals = {}
+            self._managed_resume_load_seconds = 0.0
+            return None
+        if not checkpoint_path.exists():
+            raise FileNotFoundError(f"Checkpoint does not exist: {checkpoint_path}")
 
-        started_at = time.perf_counter()
-        self._trainer.save_checkpoint(path)
-        duration_seconds = time.perf_counter() - started_at
+        def load_managed_checkpoint():
+            self._training_backend.barrier()
+            try:
+                return self._trainer.load_checkpoint_with_metadata(str(checkpoint_path))
+            finally:
+                self._training_backend.barrier()
+
+        (_, checkpoint_metadata), duration_seconds = timed_call(load_managed_checkpoint)
+        managed_resume = self._checkpoint_manager.build_restored_checkpoint(
+            checkpoint_path=checkpoint_path,
+            checkpoint_metadata=checkpoint_metadata,
+        )
+        self._managed_resume = managed_resume
+        self._managed_resume_load_seconds = duration_seconds
+        self._resume_from_checkpoint = True
+        self._restored_run_lifecycle_totals = dict(managed_resume.lifecycle_totals)
+        self._run_lifecycle_totals["checkpoint_load_seconds"] = (
+            self._run_lifecycle_totals.get("checkpoint_load_seconds", 0.0)
+            + duration_seconds
+        )
+        self._checkpoint_manager.mark_resume_consumed()
+        return managed_resume
+
+    def _build_checkpoint_metadata(self, *, trigger: str) -> dict[str, Any]:
+        """Capture the metadata needed for manual restores and managed append-resume."""
+        run_metadata: dict[str, Any] = {}
+        run_logger_state: dict[str, Any] = {}
+        if self._run_logger is not None:
+            run_metadata = {
+                "run_id": self._run_logger.run_id,
+                "run_index": self._run_logger.run_index,
+                "run_dir": str(self._run_logger.run_dir),
+            }
+            run_logger_state = self._run_logger.export_state()
+        assert self._trainer is not None
+        return {
+            "schema_version": CHECKPOINT_SCHEMA_VERSION,
+            "trigger": trigger,
+            "saved_epoch": self._trainer.current_epoch,
+            "saved_step": self._trainer.total_steps,
+            "lifecycle_totals": dict(self._run_lifecycle_totals),
+            "run": run_metadata,
+            "run_logger_state": run_logger_state,
+        }
+
+    def _save_checkpoint_to_path(
+        self,
+        path: str | Path,
+        *,
+        trigger: str,
+        update_latest: bool,
+    ) -> float:
+        """Save one checkpoint, optionally updating the managed latest manifest."""
+        assert self._trainer is not None
+        assert self._training_backend is not None
+        checkpoint_path = Path(path)
+        checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = checkpoint_path.with_name(f".{checkpoint_path.name}.{uuid4().hex}.tmp")
+
+        def save_checkpoint_file() -> None:
+            self._training_backend.barrier()
+            try:
+                if self._training_backend.is_primary:
+                    self._trainer.save_checkpoint(
+                        str(temp_path),
+                        checkpoint_metadata=self._build_checkpoint_metadata(trigger=trigger),
+                    )
+                    os.replace(temp_path, checkpoint_path)
+                self._training_backend.barrier()
+            finally:
+                temp_path.unlink(missing_ok=True)
+
+        _, duration_seconds = timed_call(save_checkpoint_file)
         self._run_lifecycle_totals["checkpoint_save_seconds"] = (
             self._run_lifecycle_totals.get("checkpoint_save_seconds", 0.0)
             + duration_seconds
@@ -911,20 +892,154 @@ class FlashRL:
         if self._run_logger is not None:
             self._run_logger.log_checkpoint(
                 "save",
-                path,
+                str(checkpoint_path),
                 epoch=self._trainer.current_epoch + 1,
                 step=self._trainer.total_steps,
                 duration_seconds=duration_seconds,
+                trigger=trigger,
             )
+            if update_latest:
+                self._checkpoint_manager.write_latest_manifest(
+                    run_dir=self._run_logger.run_dir,
+                    checkpoint_path=checkpoint_path,
+                    epoch=self._trainer.current_epoch + 1,
+                    step=self._trainer.total_steps,
+                    trigger=trigger,
+                    run_id=self._run_logger.run_id,
+                    run_index=self._run_logger.run_index,
+                )
+        return duration_seconds
+
+    def _on_trainer_step_complete(self, step_context: dict[str, Any]) -> None:
+        """Persist managed interval checkpoints after completed training steps."""
+        if self._run_logger is None:
+            return
+        step = int(step_context.get("step", 0))
+        if not self._checkpoint_manager.should_save_interval(step):
+            return
+        checkpoint_path = self._checkpoint_manager.interval_checkpoint_path(
+            run_dir=self._run_logger.run_dir,
+            step=step,
+        )
+        self._save_checkpoint_to_path(
+            checkpoint_path,
+            trigger="interval",
+            update_latest=True,
+        )
+
+    def _save_final_checkpoint_if_enabled(self) -> None:
+        """Persist the managed final checkpoint for a completed run when configured."""
+        if not self.checkpointing_config.save_on_run_end or self._run_logger is None:
+            return
+        checkpoint_path = self._checkpoint_manager.final_checkpoint_path(
+            run_dir=self._run_logger.run_dir
+        )
+        self._save_checkpoint_to_path(
+            checkpoint_path,
+            trigger="final",
+            update_latest=True,
+        )
+
+    def _start_run_metrics(self, run_logger: RunLogger) -> None:
+        """Open the metrics sink for the current run when enabled."""
+        if self._metrics_sink is None:
+            return
+        self._metrics_sink.start_run(
+            run_dir=run_logger.run_dir,
+            run_id=run_logger.run_id,
+        )
+
+    def _execute_training_loop(self, dataset: list[Prompt]) -> None:
+        """Mark the runtime as training and delegate to the trainer."""
+        assert self._trainer is not None
+        self._last_runtime_error = None
+        self._runtime_phase = "Training"
+        self._trainer.train(dataset)
+
+    def _handle_train_failure(self, exc: Exception) -> None:
+        """Preserve the current runtime and logging failure behavior."""
+        assert self._trainer is not None
+        self._runtime_phase = "Failed"
+        self._last_runtime_error = f"{type(exc).__name__}: {exc}"
+        if self._run_logger is not None:
+            self._run_logger.log_exception(
+                exc,
+                context={
+                    "stage": "train",
+                    "step": self._trainer.total_steps,
+                    "epoch": self._trainer.current_epoch + 1,
+                },
+            )
+        if self._serving_backend is not None:
+            self._serving_backend.close()
+
+    def _finalize_train_run(self, *, status: str, started_at: float) -> None:
+        """Finalize metrics, logger state, and lifecycle totals for one run."""
+        assert self._trainer is not None
+        final_status = status
+        self._run_lifecycle_totals["training_loop_seconds"] = time.perf_counter() - started_at
+        try:
+            if status == "completed":
+                self._save_final_checkpoint_if_enabled()
+                self._runtime_phase = "Ready"
+        except Exception as exc:
+            final_status = "failed"
+            self._handle_train_failure(exc)
+            raise
+        finally:
+            self._trainer.attach_run_logger(None)
+            self._resume_from_checkpoint = False
+            self._managed_resume = None
+            self._managed_resume_load_seconds = 0.0
+            self._restored_run_lifecycle_totals = {}
+            if self._metrics_sink is not None:
+                self._metrics_sink.finish_run()
+            if self._run_logger is not None:
+                self._run_logger.finish_run(
+                    status=final_status,
+                    total_steps=self._trainer.total_steps,
+                    lifecycle_totals=self._run_lifecycle_totals,
+                )
+                self._run_logger.close()
+
+    def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
+        """Train on dataset or use the configured dataset loader."""
+        run_state = self._build_train_run_state(self._resolve_train_dataset(dataset))
+        self._prepare_managed_resume()
+        self._reset_run_lifecycle_totals()
+        run_logger = self._open_run_logger(run_state)
+        status = "completed"
+        assert self._trainer is not None
+        self._prepare_trainer_for_run(run_logger)
+        self._start_run_metrics(run_logger)
+        training_loop_started_at = time.perf_counter()
+        try:
+            self._execute_training_loop(run_state.dataset)
+        except Exception as exc:
+            status = "failed"
+            self._handle_train_failure(exc)
+            raise
+        finally:
+            self._finalize_train_run(status=status, started_at=training_loop_started_at)
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save model checkpoint."""
+        self._save_checkpoint_to_path(path, trigger="manual", update_latest=False)
 
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
         assert self._trainer is not None
+        assert self._training_backend is not None
 
-        started_at = time.perf_counter()
-        self._trainer.load_checkpoint(path)
+        def load_manual_checkpoint() -> None:
+            self._training_backend.barrier()
+            try:
+                self._trainer.load_checkpoint(path)
+            finally:
+                self._training_backend.barrier()
+
+        _, duration_seconds = timed_call(load_manual_checkpoint)
         self._resume_from_checkpoint = True
-        duration_seconds = time.perf_counter() - started_at
         self._run_lifecycle_totals["checkpoint_load_seconds"] = (
             self._run_lifecycle_totals.get("checkpoint_load_seconds", 0.0)
             + duration_seconds
@@ -936,6 +1051,7 @@ class FlashRL:
                 epoch=self._trainer.current_epoch + 1,
                 step=self._trainer.total_steps,
                 duration_seconds=duration_seconds,
+                trigger="manual",
             )
 
 

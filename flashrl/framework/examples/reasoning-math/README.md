@@ -183,6 +183,9 @@ Available flags:
 - `--checkpoint`: load a checkpoint before training.
 - `--checkpoint-out`: save the final checkpoint to a specific path.
 
+These explicit checkpoint flags are the manual operator path. For production
+training runs, prefer managed checkpointing in `RunConfig` / YAML.
+
 ### Evaluation
 
 Useful flags:

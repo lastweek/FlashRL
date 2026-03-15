@@ -15,7 +15,7 @@ import torch.nn.functional as F
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
-from flashrl.framework.config import TrainerConfig, TrainingConfig
+from flashrl.framework.config import RunConfig, TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
     Message,
@@ -241,8 +241,17 @@ class FakeTrainingBackend(TrainingBackend):
                 }
             )
 
-    def save_checkpoint(self, path: str, controller_state: dict | None = None) -> None:
-        super().save_checkpoint(path, controller_state=controller_state)
+    def save_checkpoint(
+        self,
+        path: str,
+        controller_state: dict | None = None,
+        checkpoint_metadata: dict | None = None,
+    ) -> None:
+        super().save_checkpoint(
+            path,
+            controller_state=controller_state,
+            checkpoint_metadata=checkpoint_metadata,
+        )
 
 
 def _encode_text(text: str, *, max_length: int = 128, vocab_size: int = 32) -> list[int]:
@@ -395,6 +404,58 @@ def read_rollouts(run_dir: Path) -> list[dict]:
     ]
 
 
+def build_managed_run_config(
+    *,
+    log_dir: Path,
+    checkpoint_dir: Path | None = None,
+    save_every_steps: int | None = None,
+    save_on_run_end: bool = False,
+    resume_from: str | None = None,
+    max_epochs: int = 1,
+) -> dict[str, object]:
+    """Build a minimal profile-style config for managed checkpoint tests."""
+    checkpointing: dict[str, object] = {}
+    if checkpoint_dir is not None:
+        checkpointing["directory"] = str(checkpoint_dir)
+    if save_every_steps is not None:
+        checkpointing["save_every_steps"] = save_every_steps
+    if save_on_run_end:
+        checkpointing["save_on_run_end"] = True
+    if resume_from is not None:
+        checkpointing["resume_from"] = resume_from
+
+    return {
+        "training": {
+            "model_name": "fake/model",
+            "backend": "huggingface",
+            "device": "cpu",
+            "batch_size": 2,
+            "max_epochs": max_epochs,
+            "shuffle_each_epoch": False,
+        },
+        "serving": {
+            "model_name": "fake/model",
+            "backend": "huggingface",
+            "device": "cpu",
+        },
+        "grpo": {
+            "group_size": 2,
+        },
+        "logging": {
+            "log_dir": str(log_dir),
+            "console": False,
+            "file": True,
+        },
+        "metrics": {
+            "enabled": False,
+        },
+        "checkpointing": checkpointing,
+        "runtime": {
+            "admin_enabled": False,
+        },
+    }
+
+
 def strip_ansi(text: str) -> str:
     """Remove ANSI escape codes from terminal output."""
     return ANSI_ESCAPE_RE.sub("", text)
@@ -434,8 +495,8 @@ def test_factor_shared_messages_falls_back_without_common_prefix() -> None:
     assert suffixes == messages
 
 
-def test_rollout_schema_v2_is_smaller_than_legacy_shape(tmp_path: Path) -> None:
-    """The compact rollout schema should serialize smaller than the legacy record."""
+def test_rollout_schema_v2_deduplicates_transcript_payload(tmp_path: Path) -> None:
+    """The compact rollout schema should serialize transcript data smaller than v1."""
     logger = RunLogger(
         LoggingConfig(log_dir=tmp_path, console=False, file=True),
         model_name="org/model-name",
@@ -570,8 +631,34 @@ def test_rollout_schema_v2_is_smaller_than_legacy_shape(tmp_path: Path) -> None:
         ],
     }
 
-    assert len(json.dumps(v2_record, ensure_ascii=True)) < len(
-        json.dumps(legacy_record, ensure_ascii=True)
+    v2_transcript_payload = {
+        "input": {
+            "shared_messages": v2_record["input"]["shared_messages"],
+            "prompt_preview": v2_record["input"]["prompt_preview"],
+        },
+        "candidates": [
+            {
+                "candidate_index": candidate["candidate_index"],
+                "completion_messages": candidate["completion_messages"],
+                "output_preview": candidate["output"]["preview"],
+            }
+            for candidate in v2_record["candidates"]
+        ],
+    }
+    legacy_transcript_payload = {
+        "prompt": legacy_record["prompt"],
+        "candidates": [
+            {
+                "candidate_index": candidate["candidate_index"],
+                "conversation": candidate["conversation"],
+                "response_text": candidate["rollout"]["response_text"],
+            }
+            for candidate in legacy_record["candidates"]
+        ],
+    }
+
+    assert len(json.dumps(v2_transcript_payload, ensure_ascii=True)) < len(
+        json.dumps(legacy_transcript_payload, ensure_ascii=True)
     )
 
     logger.close()
@@ -1432,6 +1519,65 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     trainer._run_logger.close()
 
 
+def test_flashrl_train_orchestrates_private_run_helpers_in_order(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FlashRL.train() should read as one ordered run lifecycle."""
+    patch_backends(monkeypatch)
+
+    trainer = FlashRL(
+        model="fake/model",
+        rollout_fn=make_rollout_fn(response_suffix="order", repeat=2),
+        reward_fn=reward_fn,
+        batch_size=2,
+        max_epochs=1,
+        shuffle_each_epoch=False,
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+    dataset = [Prompt(text=f"prompt {index}") for index in range(2)]
+
+    call_order: list[str] = []
+    for method_name in (
+        "_resolve_train_dataset",
+        "_build_train_run_state",
+        "_reset_run_lifecycle_totals",
+        "_open_run_logger",
+        "_prepare_trainer_for_run",
+        "_start_run_metrics",
+        "_execute_training_loop",
+        "_handle_train_failure",
+        "_finalize_train_run",
+    ):
+        original = getattr(trainer, method_name)
+
+        def wrapper(*args, __name=method_name, __original=original, **kwargs):
+            call_order.append(__name)
+            return __original(*args, **kwargs)
+
+        monkeypatch.setattr(trainer, method_name, wrapper)
+
+    trainer.train(dataset)
+
+    assert call_order == [
+        "_resolve_train_dataset",
+        "_build_train_run_state",
+        "_reset_run_lifecycle_totals",
+        "_open_run_logger",
+        "_prepare_trainer_for_run",
+        "_start_run_metrics",
+        "_execute_training_loop",
+        "_finalize_train_run",
+    ]
+    assert trainer._run_logger.run_dir.exists()
+    trainer._run_logger.close()
+
+
 def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path) -> None:
     """Default local trainer path should run without a reference model."""
     training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
@@ -2082,6 +2228,174 @@ def test_flashrl_checkpoint_works_before_train_and_resume_skips_reset(
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "epoch 2/3" in transcript
     assert "epoch 1/3" not in transcript
+
+    trainer._run_logger.close()
+
+
+def test_run_config_latest_checkpoint_requires_directory() -> None:
+    """Managed latest resume should require an explicit checkpoint directory."""
+    config = build_managed_run_config(log_dir=Path("/tmp/flashrl-logs"), resume_from="latest")
+
+    with pytest.raises(
+        ValueError,
+        match="checkpointing.directory is required when checkpointing.resume_from='latest'",
+    ):
+        RunConfig.from_dict(config)
+
+    config["checkpointing"] = {
+        "directory": "/tmp/flashrl-checkpoints",
+        "resume_from": "latest",
+    }
+    resolved = RunConfig.from_dict(config)
+    assert resolved.checkpointing.resume_from == "latest"
+
+
+def test_managed_checkpointing_saves_intervals_and_resumes_in_place(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Managed save-every-N checkpoints should resume into the same run directory."""
+    patch_backends(monkeypatch)
+    log_dir = tmp_path / "logs"
+    checkpoint_dir = tmp_path / "checkpoints"
+    dataset = [Prompt(text=f"prompt {index}") for index in range(4)]
+
+    trainer = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="managed", repeat=2),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            save_every_steps=2,
+        ),
+    )
+    trainer.train(dataset)
+
+    first_run_dir = trainer._run_logger.run_dir
+    assert (checkpoint_dir / "step-00000002.pt").exists()
+    assert (checkpoint_dir / "step-00000004.pt").exists()
+    latest_manifest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest_manifest["checkpoint_path"] == str(checkpoint_dir / "step-00000004.pt")
+    assert latest_manifest["run_dir"] == str(first_run_dir)
+
+    trainer_resume = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="managed", repeat=2),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            save_every_steps=2,
+            resume_from="latest",
+        ),
+    )
+    trainer_resume.train(dataset)
+
+    assert trainer_resume._run_logger.run_dir == first_run_dir
+    assert trainer_resume._trainer.total_steps == 8
+    assert (checkpoint_dir / "step-00000006.pt").exists()
+    assert (checkpoint_dir / "step-00000008.pt").exists()
+
+    run_dirs = [path for path in log_dir.iterdir() if path.is_dir()]
+    assert run_dirs == [first_run_dir]
+
+    events = read_events(first_run_dir)
+    assert any(event["event"] == "run_resumed" for event in events)
+    assert any(
+        event["event"] == "checkpoint"
+        and event["payload"]["action"] == "load"
+        and event["payload"]["trigger"] == "resume"
+        for event in events
+    )
+    assert any(
+        event["event"] == "checkpoint"
+        and event["payload"]["action"] == "save"
+        and event["payload"]["trigger"] == "interval"
+        and event["payload"]["step"] == 8
+        for event in events
+    )
+
+    latest_manifest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest_manifest["checkpoint_path"] == str(checkpoint_dir / "step-00000008.pt")
+
+    trainer._run_logger.close()
+    trainer_resume._run_logger.close()
+
+
+def test_managed_checkpointing_writes_final_checkpoint_when_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Managed final checkpointing should emit final.pt and update latest.json."""
+    patch_backends(monkeypatch)
+    log_dir = tmp_path / "logs"
+    checkpoint_dir = tmp_path / "checkpoints"
+    dataset = [Prompt(text=f"prompt {index}") for index in range(2)]
+
+    trainer = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="final", repeat=1),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            save_on_run_end=True,
+        ),
+    )
+    trainer.train(dataset)
+
+    final_checkpoint = checkpoint_dir / "final.pt"
+    assert final_checkpoint.exists()
+    latest_manifest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest_manifest["checkpoint_path"] == str(final_checkpoint)
+
+    events = read_events(trainer._run_logger.run_dir)
+    assert any(
+        event["event"] == "checkpoint"
+        and event["payload"]["action"] == "save"
+        and event["payload"]["trigger"] == "final"
+        for event in events
+    )
+
+    trainer._run_logger.close()
+
+
+def test_managed_resume_fails_fast_when_original_run_dir_is_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Managed append-resume should reject checkpoints without a usable prior run dir."""
+    patch_backends(monkeypatch)
+    log_dir = tmp_path / "logs"
+    checkpoint_dir = tmp_path / "checkpoints"
+    dataset = [Prompt(text=f"prompt {index}") for index in range(2)]
+
+    trainer = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="broken-resume", repeat=1),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            save_every_steps=1,
+        ),
+    )
+    trainer.train(dataset)
+
+    checkpoint_path = checkpoint_dir / "step-00000002.pt"
+    checkpoint = torch.load(checkpoint_path, weights_only=False)
+    checkpoint["checkpoint_metadata"]["run"]["run_dir"] = str(tmp_path / "missing-run-dir")
+    torch.save(checkpoint, checkpoint_path)
+
+    trainer_resume = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="broken-resume", repeat=1),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            checkpoint_dir=checkpoint_dir,
+            resume_from=str(checkpoint_path),
+        ),
+    )
+
+    with pytest.raises(FileNotFoundError, match="original run directory"):
+        trainer_resume.train(dataset)
 
     trainer._run_logger.close()
 

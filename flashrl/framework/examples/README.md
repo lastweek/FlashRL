@@ -39,6 +39,23 @@ Both example folders are intentionally hyphenated, so they are run as scripts.
 Their `train.py` / `eval.py` entrypoints load the YAML profiles directly and
 construct `FlashRL(...)` in code.
 
+For production-style training, prefer config-driven checkpointing in
+`RunConfig` / YAML. The explicit `save_checkpoint(...)` / `load_checkpoint(...)`
+calls in the task examples are still supported, but they are the manual escape
+hatch rather than the recommended training workflow.
+
+## Mock Checkpointing Example
+
+The mock-checkpointing example is fully offline. It uses fake local backends to
+exercise the real managed checkpoint subsystem, including interval saves,
+`latest.json`, and append-resume into the same run directory.
+
+See [flashrl/framework/examples/mock-checkpointing/README.md](mock-checkpointing/README.md) for:
+
+- initial training with managed interval checkpoints
+- resume from `latest`
+- optional final checkpoint behavior
+
 ## Managed vLLM Backend
 
 Use `serving.backend: vllm` when you want FlashRL to launch managed local

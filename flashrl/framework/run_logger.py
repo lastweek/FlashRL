@@ -14,7 +14,9 @@ import textwrap
 from typing import Any
 from uuid import uuid4
 
+from flashrl.framework import log_paths, rollout_logging
 from flashrl.framework.config import LoggingConfig
+from flashrl.framework.observability import RuntimeEvent
 
 
 STAGE_DISPLAY_ORDER = [
@@ -303,15 +305,48 @@ class RunLogger:
         self.config = config
         self.model_name = model_name
         self.log_root = Path(config.log_dir)
-        self.run_index = _allocate_run_index(self.log_root)
-        formatted_run_index = _format_run_index(self.run_index)
+        self.run_index = log_paths.allocate_run_index(self.log_root)
+        formatted_run_index = log_paths.format_run_index(self.run_index)
         self.run_id = (
             f"{formatted_run_index}-"
             f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
-            f"{_sanitize_model_name(model_name)}-"
+            f"{log_paths.sanitize_model_name(model_name)}-"
             f"{uuid4().hex[:8]}"
         )
         self.run_dir = self.log_root / self.run_id
+        self._initialize_run_files()
+        self._reset_runtime_state()
+        self._reset_aggregates()
+
+    @classmethod
+    def open_existing_run(
+        cls,
+        config: LoggingConfig,
+        model_name: str,
+        *,
+        run_id: str,
+        run_index: int,
+        run_dir: str | Path,
+        restored_state: dict[str, Any] | None = None,
+    ) -> "RunLogger":
+        """Reopen an existing run directory and restore aggregate logger state."""
+        logger = cls.__new__(cls)
+        logger.config = config
+        logger.model_name = model_name
+        logger.log_root = Path(config.log_dir)
+        logger.run_id = str(run_id)
+        logger.run_index = int(run_index)
+        logger.run_dir = Path(run_dir)
+        if not logger.run_dir.exists():
+            raise FileNotFoundError(f"Run directory does not exist: {logger.run_dir}")
+        logger._initialize_run_files()
+        logger._reset_runtime_state()
+        logger._reset_aggregates()
+        logger.restore_state(restored_state)
+        return logger
+
+    def _initialize_run_files(self) -> None:
+        """Ensure the run directory and append-only artifact files exist."""
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.events_path = self.run_dir / "events.jsonl"
         self.console_path = self.run_dir / "console.log"
@@ -320,17 +355,50 @@ class RunLogger:
         self.console_path.touch(exist_ok=True)
         self.rollouts_path.touch(exist_ok=True)
 
-        self._total_step_count = 0
-        self._total_step_seconds = 0.0
-        self._slowest_step_seconds = 0.0
-        self._dominant_stage = "n/a"
-        self._stage_totals: dict[str, float] = {}
+    def _reset_runtime_state(self) -> None:
+        """Reset transient step/terminal state before a run starts or resumes."""
         self._total_batches = 0
         self._current_step_header: int | None = None
         self._current_serving_prompt_key: tuple[int, int] | None = None
         self._step_block_complete = False
         self._terminal_serving_status_open = False
         self._terminal_serving_status_length = 0
+
+    def _reset_aggregates(self) -> None:
+        """Reset cumulative per-run aggregates."""
+        self._total_step_count = 0
+        self._total_step_seconds = 0.0
+        self._slowest_step_seconds = 0.0
+        self._dominant_stage = "n/a"
+        self._stage_totals: dict[str, float] = {}
+
+    def export_state(self) -> dict[str, Any]:
+        """Serialize the aggregate logger state needed for append-resume."""
+        return {
+            "schema_version": 1,
+            "total_step_count": self._total_step_count,
+            "total_step_seconds": self._total_step_seconds,
+            "slowest_step_seconds": self._slowest_step_seconds,
+            "dominant_stage": self._dominant_stage,
+            "stage_totals": dict(self._stage_totals),
+        }
+
+    def restore_state(self, restored_state: dict[str, Any] | None) -> None:
+        """Restore aggregate logger state from a previous checkpoint."""
+        if not isinstance(restored_state, dict):
+            return
+        self._total_step_count = int(restored_state.get("total_step_count", 0))
+        self._total_step_seconds = float(restored_state.get("total_step_seconds", 0.0))
+        self._slowest_step_seconds = float(restored_state.get("slowest_step_seconds", 0.0))
+        dominant_stage = restored_state.get("dominant_stage", "n/a")
+        self._dominant_stage = str(dominant_stage) if dominant_stage else "n/a"
+        stage_totals = restored_state.get("stage_totals", {})
+        if isinstance(stage_totals, dict):
+            self._stage_totals = {
+                str(key): float(value)
+                for key, value in stage_totals.items()
+                if isinstance(value, (int, float))
+            }
 
     def start_run(
         self,
@@ -360,6 +428,125 @@ class RunLogger:
         include_startup_divider: bool = False,
     ) -> None:
         """Log the start of a training run."""
+        self._log_run_open(
+            event_name="run_started",
+            resume_checkpoint_path=None,
+            dataset_size=dataset_size,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            total_batches=total_batches,
+            device=device,
+            dtype=dtype,
+            cpu_threads=cpu_threads,
+            runtime_shape=runtime_shape,
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+            group_size=group_size,
+            clip_ratio=clip_ratio,
+            prompts_per_step=prompts_per_step,
+            steps_per_epoch=steps_per_epoch,
+            total_planned_steps=total_planned_steps,
+            training_backend=training_backend,
+            training_device=training_device,
+            training_dp_size=training_dp_size,
+            serving_backend=serving_backend,
+            serving_device=serving_device,
+            serving_num_replicas=serving_num_replicas,
+            admin_base_url=admin_base_url,
+            max_new_tokens=max_new_tokens,
+            include_startup_divider=include_startup_divider,
+        )
+
+    def resume_run(
+        self,
+        *,
+        checkpoint_path: str,
+        dataset_size: int,
+        batch_size: int,
+        max_epochs: int,
+        total_batches: int,
+        device: str,
+        dtype: str,
+        cpu_threads: int,
+        runtime_shape: str,
+        reference_enabled: bool,
+        reference_device: str,
+        group_size: int | None = None,
+        clip_ratio: float | None = None,
+        prompts_per_step: int | None = None,
+        steps_per_epoch: int | None = None,
+        total_planned_steps: int | None = None,
+        training_backend: str | None = None,
+        training_device: str | None = None,
+        training_dp_size: int | None = None,
+        serving_backend: str | None = None,
+        serving_device: str | None = None,
+        serving_num_replicas: int | None = None,
+        admin_base_url: str | None = None,
+        max_new_tokens: int | None = None,
+        include_startup_divider: bool = False,
+    ) -> None:
+        """Log the start of a resumed training run."""
+        self._log_run_open(
+            event_name="run_resumed",
+            resume_checkpoint_path=checkpoint_path,
+            dataset_size=dataset_size,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            total_batches=total_batches,
+            device=device,
+            dtype=dtype,
+            cpu_threads=cpu_threads,
+            runtime_shape=runtime_shape,
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+            group_size=group_size,
+            clip_ratio=clip_ratio,
+            prompts_per_step=prompts_per_step,
+            steps_per_epoch=steps_per_epoch,
+            total_planned_steps=total_planned_steps,
+            training_backend=training_backend,
+            training_device=training_device,
+            training_dp_size=training_dp_size,
+            serving_backend=serving_backend,
+            serving_device=serving_device,
+            serving_num_replicas=serving_num_replicas,
+            admin_base_url=admin_base_url,
+            max_new_tokens=max_new_tokens,
+            include_startup_divider=include_startup_divider,
+        )
+
+    def _log_run_open(
+        self,
+        *,
+        event_name: str,
+        resume_checkpoint_path: str | None,
+        dataset_size: int,
+        batch_size: int,
+        max_epochs: int,
+        total_batches: int,
+        device: str,
+        dtype: str,
+        cpu_threads: int,
+        runtime_shape: str,
+        reference_enabled: bool,
+        reference_device: str,
+        group_size: int | None = None,
+        clip_ratio: float | None = None,
+        prompts_per_step: int | None = None,
+        steps_per_epoch: int | None = None,
+        total_planned_steps: int | None = None,
+        training_backend: str | None = None,
+        training_device: str | None = None,
+        training_dp_size: int | None = None,
+        serving_backend: str | None = None,
+        serving_device: str | None = None,
+        serving_num_replicas: int | None = None,
+        admin_base_url: str | None = None,
+        max_new_tokens: int | None = None,
+        include_startup_divider: bool = False,
+    ) -> None:
+        """Emit the common run-open event and header for fresh or resumed runs."""
         self._total_batches = total_batches
         self._current_step_header = None
         self._current_serving_prompt_key = None
@@ -397,69 +584,47 @@ class RunLogger:
             "admin_base_url": admin_base_url,
             "run_dir": str(self.run_dir),
         }
-        self._emit_event("run_started", payload)
+        if resume_checkpoint_path is not None:
+            payload["checkpoint_path"] = resume_checkpoint_path
+        self._emit_event(event_name, payload)
+
+        header_lines = self._format_compact_run_header(
+            device=device,
+            dtype=dtype,
+            cpu_threads=cpu_threads,
+            dataset_size=dataset_size,
+            batch_size=batch_size,
+            max_epochs=max_epochs,
+            total_batches=total_batches,
+            runtime_shape=runtime_shape,
+            reference_enabled=reference_enabled,
+            reference_device=reference_device,
+            group_size=group_size,
+            clip_ratio=clip_ratio,
+            prompts_per_step=prompts_per_step,
+            steps_per_epoch=steps_per_epoch,
+            total_planned_steps=total_planned_steps,
+            training_backend=training_backend,
+            training_device=training_device,
+            training_dp_size=training_dp_size,
+            serving_backend=serving_backend,
+            serving_device=serving_device,
+            serving_num_replicas=serving_num_replicas,
+            admin_base_url=admin_base_url,
+            max_new_tokens=max_new_tokens,
+        )
+        if resume_checkpoint_path is not None:
+            header_lines.insert(2, f"  resume   {resume_checkpoint_path}")
 
         if self.config.console_mode == "compact":
             if include_startup_divider:
                 self._emit_console(SECTION_SEPARATOR)
-            self._emit_console_lines(
-                self._format_compact_run_header(
-                    device=device,
-                    dtype=dtype,
-                    cpu_threads=cpu_threads,
-                    dataset_size=dataset_size,
-                    batch_size=batch_size,
-                    max_epochs=max_epochs,
-                    total_batches=total_batches,
-                    runtime_shape=runtime_shape,
-                    reference_enabled=reference_enabled,
-                    reference_device=reference_device,
-                    group_size=group_size,
-                    clip_ratio=clip_ratio,
-                    prompts_per_step=prompts_per_step,
-                    steps_per_epoch=steps_per_epoch,
-                    total_planned_steps=total_planned_steps,
-                    training_backend=training_backend,
-                    training_device=training_device,
-                    training_dp_size=training_dp_size,
-                    serving_backend=serving_backend,
-                    serving_device=serving_device,
-                    serving_num_replicas=serving_num_replicas,
-                    admin_base_url=admin_base_url,
-                    max_new_tokens=max_new_tokens,
-                )
-            )
+            self._emit_console_lines(header_lines)
             return
 
         if include_startup_divider:
             self._emit_console(SECTION_SEPARATOR)
-        self._emit_console_lines(
-            self._format_compact_run_header(
-                device=device,
-                dtype=dtype,
-                cpu_threads=cpu_threads,
-                dataset_size=dataset_size,
-                batch_size=batch_size,
-                max_epochs=max_epochs,
-                total_batches=total_batches,
-                runtime_shape=runtime_shape,
-                reference_enabled=reference_enabled,
-                reference_device=reference_device,
-                group_size=group_size,
-                clip_ratio=clip_ratio,
-                prompts_per_step=prompts_per_step,
-                steps_per_epoch=steps_per_epoch,
-                total_planned_steps=total_planned_steps,
-                training_backend=training_backend,
-                training_device=training_device,
-                training_dp_size=training_dp_size,
-                serving_backend=serving_backend,
-                serving_device=serving_device,
-                serving_num_replicas=serving_num_replicas,
-                admin_base_url=admin_base_url,
-                max_new_tokens=max_new_tokens,
-            )
-        )
+        self._emit_console_lines(header_lines)
 
     def log_model_load(
         self,
@@ -482,6 +647,26 @@ class RunLogger:
         """Replay cached startup lines into console.log without reprinting them live."""
         for line in lines:
             self._emit_file_line(line)
+
+    def observe_event(self, event: RuntimeEvent) -> None:
+        """Consume one typed runtime event."""
+        if event.kind == "step_start":
+            self.log_step_start(event.payload)
+            return
+        if event.kind == "step_stage":
+            self.log_step_stage(event.payload)
+            return
+        if event.kind == "step_done":
+            self.log_step_done(event.payload)
+            return
+        if event.kind == "serving_debug_start":
+            self.log_serving_debug_start(event.payload)
+            return
+        if event.kind == "serving_debug_chunk":
+            self.log_serving_debug_chunk(event.payload)
+            return
+        if event.kind == "serving_debug_done":
+            self.log_serving_debug_done(event.payload)
 
     def log_epoch_start(self, epoch: int, total_epochs: int, num_batches: int) -> None:
         """Log the start of an epoch."""
@@ -662,152 +847,22 @@ class RunLogger:
         candidates: list[dict[str, Any]],
     ) -> dict[str, Any]:
         """Serialize one prompt-group rollout record in schema v2."""
-        prompt_text = str(getattr(prompt, "text", ""))
-        prompt_metadata = _clone_json_mapping(self._serialize_for_json(getattr(prompt, "metadata", {})))
-
-        message_groups: list[list[dict[str, Any]]] = []
-        for candidate in candidates:
-            rollout = candidate["rollout"]
-            conversation = _clone_json_mapping(
-                self._serialize_for_json(getattr(rollout, "conversation", {}))
-            )
-            messages = _clone_json_messages(conversation.get("messages"))
-            if not messages:
-                synthetic_messages = []
-                if prompt_text:
-                    synthetic_messages.append(
-                        {
-                            "role": "user",
-                            "content": prompt_text,
-                            "tool_calls": [],
-                            "metadata": {},
-                        }
-                    )
-                synthetic_messages.append(
-                    {
-                        "role": "assistant",
-                        "content": str(getattr(rollout, "text", "")),
-                        "tool_calls": [],
-                        "metadata": {},
-                    }
-                )
-                messages = synthetic_messages
-            message_groups.append(messages)
-
-        shared_messages, completion_message_groups = _factor_shared_messages(message_groups)
-
-        serialized_candidates: list[dict[str, Any]] = []
-        merged_prompt_metadata = dict(prompt_metadata)
-        for candidate, completion_messages in zip(
-            candidates,
-            completion_message_groups,
-            strict=True,
-        ):
-            rollout = candidate["rollout"]
-            reward = candidate["reward"]
-            response_text = str(getattr(rollout, "text", ""))
-            prompt_token_count = len(getattr(rollout, "prompt_token_ids", []))
-            response_token_count = len(getattr(rollout, "response_token_ids", []))
-
-            rollout_metadata = _clone_json_mapping(
-                self._serialize_for_json(getattr(rollout, "metadata", {}))
-            )
-            raw_prompt_metadata = _clone_json_mapping(rollout_metadata.pop("prompt_metadata", {}))
-            merged_prompt_metadata.update(
-                {
-                    key: value
-                    for key, value in raw_prompt_metadata.items()
-                    if key not in merged_prompt_metadata
-                }
-            )
-
-            promoted_output, _ = _promote_metadata_fields(
-                rollout_metadata,
-                PROMOTED_OUTPUT_METADATA_KEYS,
-            )
-            output_stats = _derive_log_prob_stats(
-                log_prob=float(getattr(rollout, "log_prob", 0.0)),
-                response_token_count=response_token_count,
-                prompt_token_count=prompt_token_count,
-            )
-            generation_seconds = promoted_output.get("generation_seconds")
-            tokens_per_second = 0.0
-            if isinstance(generation_seconds, (int, float)) and float(generation_seconds) > 0.0:
-                tokens_per_second = float(response_token_count / float(generation_seconds))
-
-            reward_metadata = _clone_json_mapping(
-                self._serialize_for_json(getattr(reward, "metadata", {}))
-            )
-            promoted_reward, remaining_reward_metadata = _promote_metadata_fields(
-                reward_metadata,
-                PROMOTED_REWARD_METADATA_KEYS,
-            )
-
-            serialized_candidates.append(
-                {
-                    "candidate_index": int(candidate["candidate_index"]),
-                    "completion_messages": completion_messages,
-                    "output": {
-                        "preview": self._truncate(response_text),
-                        "response_token_count": response_token_count,
-                        "response_char_count": len(response_text),
-                        "finish_reason": promoted_output.get("finish_reason"),
-                        "stop_reason": promoted_output.get("stop_reason"),
-                        "ttft_seconds": promoted_output.get("ttft_seconds"),
-                        "tpot_seconds": promoted_output.get("tpot_seconds"),
-                        "generation_seconds": generation_seconds,
-                        "tokens_per_second": tokens_per_second,
-                        "log_prob": float(getattr(rollout, "log_prob", 0.0)),
-                        **output_stats,
-                    },
-                    "reward": {
-                        "value": float(getattr(reward, "reward", 0.0)),
-                        "pass_rate": promoted_reward.get("pass_rate"),
-                        "passed_tests": promoted_reward.get("passed_tests"),
-                        "total_tests": promoted_reward.get("total_tests"),
-                        "accuracy_pass": promoted_reward.get("accuracy_pass"),
-                        "format_pass": promoted_reward.get("format_pass"),
-                        "truncated": promoted_reward.get("truncated"),
-                        "execution_seconds": promoted_reward.get("execution_seconds"),
-                        "failure_reason": promoted_reward.get("failure_reason"),
-                        "checker_used": promoted_reward.get("checker_used"),
-                        "execution_status": promoted_reward.get("execution_status"),
-                        "code_preview": promoted_reward.get("code_preview"),
-                        "metadata": remaining_reward_metadata,
-                    },
-                }
-            )
-
-        promoted_prompt_metadata, remaining_prompt_metadata = _promote_metadata_fields(
-            merged_prompt_metadata,
-            PROMOTED_PROMPT_METADATA_KEYS,
+        return rollout_logging.build_rollout_record(
+            run_id=self.run_id,
+            run_index=self.run_index,
+            step=step,
+            epoch=epoch,
+            batch_index=batch_index,
+            batches_in_epoch=batches_in_epoch,
+            prompt_index=prompt_index,
+            prompt_count=prompt_count,
+            group_size=group_size,
+            batch_candidate_count=batch_candidate_count,
+            prompt=prompt,
+            candidates=candidates,
+            serialize_for_json=self._serialize_for_json,
+            truncate_text=self._truncate,
         )
-        return {
-            "schema_version": ROLLOUT_SCHEMA_VERSION,
-            "run_id": self.run_id,
-            "run_index": self.run_index,
-            "step": step,
-            "epoch": epoch,
-            "batch_index": batch_index,
-            "batches_in_epoch": batches_in_epoch,
-            "prompt_index": prompt_index,
-            "prompt_count": prompt_count,
-            "group_size": group_size,
-            "candidate_count": len(serialized_candidates),
-            "batch_candidate_count": batch_candidate_count,
-            "input": {
-                "shared_messages": shared_messages,
-                "prompt_preview": self._truncate(prompt_text),
-                "prompt_token_count": (
-                    len(getattr(candidates[0]["rollout"], "prompt_token_ids", [])) if candidates else 0
-                ),
-                "prompt_char_count": len(prompt_text),
-                "metadata": remaining_prompt_metadata,
-                **promoted_prompt_metadata,
-            },
-            "summary": _derive_rollout_summary(serialized_candidates),
-            "candidates": serialized_candidates,
-        }
 
     def log_serving_debug_start(self, payload: dict[str, Any]) -> None:
         """Log the start of one live serving candidate stream."""
@@ -929,10 +984,13 @@ class RunLogger:
         epoch: int,
         step: int,
         duration_seconds: float,
+        *,
+        trigger: str = "manual",
     ) -> None:
         """Log checkpoint save/load operations."""
         payload = {
             "action": action,
+            "trigger": trigger,
             "path": path,
             "epoch": epoch,
             "step": step,
@@ -947,7 +1005,7 @@ class RunLogger:
             return
 
         self._emit_console(
-            f"checkpoint action={action} epoch={epoch} step={step}"
+            f"checkpoint action={action} trigger={trigger} epoch={epoch} step={step}"
             f" path={path} latency={self._format_duration(duration_seconds)}"
         )
 
