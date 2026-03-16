@@ -53,8 +53,8 @@ grpo:
   # Log-ratio penalty (Kimi-style)
   log_ratio_penalty_coefficient: 0.005  # Small penalty
 
-  # Train/infer mismatch gate (GLM-5 style)
-  enable_train_infer_gate: false  # Disabled for this experiment
+  # IcePop token gate (GLM-5 style, per-token)
+  enable_icepop_token_gate: false  # Disabled for this experiment
 
   # Sequence-level off-policy masking (DeepSeek-V3.2)
   enable_off_policy_sequence_masking: true

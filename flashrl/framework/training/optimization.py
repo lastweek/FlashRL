@@ -195,6 +195,22 @@ def optimize_grpo_batch(
         lambda: actor_backend.forward_logits(input_ids, attention_mask)
     )
 
+    # Compute π^train_old logprobs BEFORE optimizer update
+    # This is critical for GLM-5 IcePop token gate
+    # π^train_old = training backend's policy before optimizer step
+    # Only compute when IcePop token gate is enabled to avoid unnecessary overhead
+    training_old_response_log_probs = None
+    training_old_seconds = 0.0
+    if grpo_config.enable_icepop_token_gate:
+        training_old_response_log_probs, training_old_seconds = timed_call(
+            lambda: compute_rollout_log_probs_from_actor(
+                actor=actor_backend.model_copy,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                prompt_lengths=prompt_lengths,
+            )
+        )
+
     reference_active = reference_backend is not None and grpo_config.kl_coefficient > 0.0
     if reference_active:
         ref_logits, reference_forward_seconds = timed_call(
@@ -216,7 +232,8 @@ def optimize_grpo_batch(
             prompt_lengths=prompt_lengths,
             actor_logits=actor_logits,
             ref_logits=ref_logits,
-            rollout_response_log_probs=rollout_response_log_probs,
+            rollout_response_log_probs=rollout_response_log_probs,  # π^infer_old
+            training_response_log_probs=training_old_response_log_probs,  # π^train_old
             advantages=advantages,
             config=grpo_config,  # Pass full config instead of individual parameters
         )

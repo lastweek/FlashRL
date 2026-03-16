@@ -61,11 +61,11 @@ class TestPresetResolution:
         # Preset sets penalty coefficient to 0.01 even though we can't explicitly set it
         # assert resolved.log_ratio_penalty_coefficient == 0.01  # Skip due to conflict detection bug
 
-    def test_glm_5_applies_train_infer_gate(self):
-        """Test that glm_5 applies train/infer gate and group-normalized advantages."""
+    def test_glm_5_applies_icepop_token_gate(self):
+        """Test that glm_5 applies IcePop token gate and group-normalized advantages."""
         config = GrpoConfig(
             loss_preset="glm_5",
-            enable_train_infer_gate=True,  # Match preset value
+            enable_icepop_token_gate=True,  # Match preset value
         )
         resolved = resolve_loss_preset(config)
 
@@ -73,8 +73,8 @@ class TestPresetResolution:
         assert resolved.clip_ratio_lower == 0.1
         assert resolved.clip_ratio_upper == 0.2
         assert resolved.kl_mode == "none"
-        assert resolved.enable_train_infer_gate is True
-        assert resolved.train_infer_gate_beta == 2.0
+        assert resolved.enable_icepop_token_gate is True
+        assert resolved.icepop_token_gate_beta == 2.0
         assert resolved.advantage_mode == "group_normalized"
 
     def test_mimo_v2_applies_importance_gating(self):

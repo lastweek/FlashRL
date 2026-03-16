@@ -48,8 +48,8 @@ class GrpoPreset:
     clip_log_ratio_beta: float | None = None
     kl_mode: str = "k3"
     log_ratio_penalty_coefficient: float = 0.0
-    enable_train_infer_gate: bool = False
-    train_infer_gate_beta: float = 2.0
+    enable_icepop_token_gate: bool = False
+    icepop_token_gate_beta: float = 2.0
     enable_off_policy_sequence_masking: bool = False
     off_policy_sequence_masking_delta: float = 2.0
     enable_importance_gating: bool = False
@@ -90,8 +90,8 @@ def _check_preset_conflicts(config: GrpoConfig, preset: GrpoPreset) -> list[str]
         conflicts.append("log_ratio_penalty_coefficient")
 
     # Check gate parameters
-    if config.enable_train_infer_gate != preset.enable_train_infer_gate:
-        conflicts.append("enable_train_infer_gate")
+    if config.enable_icepop_token_gate != preset.enable_icepop_token_gate:
+        conflicts.append("enable_icepop_token_gate")
 
     if config.enable_off_policy_sequence_masking != preset.enable_off_policy_sequence_masking:
         conflicts.append("enable_off_policy_sequence_masking")
@@ -174,11 +174,11 @@ def _merge_preset_with_config(preset: GrpoPreset, config: GrpoConfig) -> GrpoCon
 
     # Gates
     if (
-        preset.enable_train_infer_gate
-        and not config_dict["enable_train_infer_gate"]
+        preset.enable_icepop_token_gate
+        and not config_dict["enable_icepop_token_gate"]
     ):
-        config_dict["enable_train_infer_gate"] = True
-        config_dict["train_infer_gate_beta"] = preset.train_infer_gate_beta
+        config_dict["enable_icepop_token_gate"] = True
+        config_dict["icepop_token_gate_beta"] = preset.icepop_token_gate_beta
 
     if (
         preset.enable_off_policy_sequence_masking
@@ -267,8 +267,8 @@ def resolve_loss_preset(config: GrpoConfig) -> GrpoConfig:
             clip_ratio_lower=0.1,
             clip_ratio_upper=0.2,
             kl_mode="none",  # No explicit KL in reasoning RL backbone
-            enable_train_infer_gate=True,
-            train_infer_gate_beta=2.0,
+            enable_icepop_token_gate=True,
+            icepop_token_gate_beta=2.0,
             advantage_normalization=True,
             advantage_mode="group_normalized",  # GLM uses group-normalized
         ),
@@ -642,17 +642,23 @@ def _compute_off_policy_sequence_masking(
     return sequence_mask
 
 
-def _apply_train_infer_gate(
-    ratio: torch.Tensor,
+def _apply_icepop_token_gate(
+    ratio_train: torch.Tensor,          # r = π^train / π^train_old
+    log_pi_train_old: torch.Tensor,     # π^train_old
+    log_pi_infer_old: torch.Tensor,     # π^infer_old
     config: GrpoConfig,
 ) -> torch.Tensor:
-    """Apply GLM-5 IcePop train/infer mismatch gate.
+    """Apply GLM-5 IcePop train/infer mismatch gate (per-token).
 
     MATH:
-    pop(ρ, 1/β, β) = 0 if ρ outside [1/β, β]
-                    = ρ otherwise
+    ρ = π^train_old / π^infer_old  (train/infer mismatch)
+    pop(ρ, 1/β, β) = 0 if ρ < 1/β or ρ > β
+                  = ρ otherwise
+    r_gated = r * pop(ρ, 1/β, β)
 
-    where ρ = π^train_θ_old / π^infer_θ_old measures train/infer mismatch
+    where:
+    - r = π^train / π^train_old (standard GRPO ratio)
+    - ρ = π^train_old / π^infer_old (train/infer mismatch)
 
     RL CONTEXT (GLM-5 IcePop): During training, there can be a mismatch between
     the train-time policy (π^train) and inference-time policy (π^infer) due to:
@@ -664,22 +670,35 @@ def _apply_train_infer_gate(
     the gradient is unreliable and should be discarded. This prevents training
     on samples that don't reflect actual inference behavior.
 
-    IMPLEMENTATION NOTE: Full implementation requires separate forward passes
-    through train and infer engines to compute π^train and π^infer. This is
-    a simplified version that assumes the ratio already incorporates this.
-
     Args:
-        ratio: Importance sampling ratio (should incorporate train/infer mismatch)
-        config: GRPO config with train_infer_gate_beta parameter
+        ratio_train: Standard GRPO ratio r = π^train / π^train_old
+        log_pi_train_old: Log probs from training backend (π^train_old)
+        log_pi_infer_old: Log probs from inference engine (π^infer_old)
+        config: GRPO config with icepop_token_gate_beta parameter
 
     Returns:
-        Gated ratio (zeroed if outside acceptable range)
+        Gated ratio r_gated = r * pop(ρ, 1/β, β)
     """
-    # For now, return ratio unchanged
-    # Full implementation would compute:
-    # ρ_{i,t} = π^train_θ_old / π^infer_θ_old
-    # and apply the pop() function
-    return ratio
+    if log_pi_train_old is None:
+        # No π^train_old provided, skip gate
+        return ratio_train
+
+    beta = config.icepop_token_gate_beta
+
+    # Compute mismatch ratio: ρ = π^train_old / π^infer_old
+    # Use log-space arithmetic: log(ρ) = log(π^train_old) - log(π^infer_old)
+    log_mismatch = log_pi_train_old - log_pi_infer_old
+    mismatch_ratio = torch.exp(log_mismatch)  # ρ
+
+    # Apply pop() function: pop(ρ, 1/β, β)
+    lower_bound = 1.0 / beta
+    upper_bound = beta
+    in_range = (mismatch_ratio >= lower_bound) & (mismatch_ratio <= upper_bound)
+
+    # Gate the training ratio: r_gated = r * I[ρ in [1/β, β]]
+    gated_ratio = ratio_train * in_range.float()
+
+    return gated_ratio
 
 
 def _apply_importance_gating(
@@ -991,7 +1010,8 @@ def assemble_grpo_loss(
     prompt_lengths: torch.Tensor,
     actor_logits: torch.Tensor,
     ref_logits: torch.Tensor | None,
-    rollout_response_log_probs: list[list[float]],
+    rollout_response_log_probs: list[list[float]],  # π^infer_old
+    training_response_log_probs: list[list[float]] | None = None,  # π^train_old
     advantages: torch.Tensor,
     config: GrpoConfig,
 ) -> LossAssemblyResult:
@@ -1042,7 +1062,9 @@ def assemble_grpo_loss(
         prompt_lengths: Length of prompts (for masking)
         actor_logits: Current actor logits (for computing log π_θ)
         ref_logits: Reference model logits (for computing KL divergence)
-        rollout_response_log_probs: Old policy log probs from rollout (log π_old)
+        rollout_response_log_probs: Old policy log probs from inference engine (π^infer_old)
+        training_response_log_probs: Old policy log probs from training backend (π^train_old)
+                                     Required for GLM-5 IcePop gate, optional for other presets
         advantages: Advantage estimates A (computed from rewards)
         config: GRPO configuration (clipping mode, KL mode, penalties, etc.)
 
@@ -1074,6 +1096,14 @@ def assemble_grpo_loss(
         rollout_response_log_probs, response_mask_bool, log_pi_theta
     )
 
+    # Load π^train_old for IcePop gate (if provided and gate is enabled)
+    # Only load when needed to avoid unnecessary tensor allocation
+    log_pi_train_old: torch.Tensor | None = None
+    if training_response_log_probs is not None and resolved_config.enable_icepop_token_gate:
+        log_pi_train_old = _load_rollout_log_probs(
+            training_response_log_probs, response_mask_bool, log_pi_theta
+        )
+
     # Compute log ratio for various masking/penalty operations
     log_ratio = log_pi_theta - log_pi_old
 
@@ -1090,9 +1120,14 @@ def assemble_grpo_loss(
         )
         response_mask = response_mask * sequence_mask.unsqueeze(-1)
 
-    # Apply train/infer mismatch gate (GLM-5 IcePop-style)
-    if resolved_config.enable_train_infer_gate:
-        ratio = _apply_train_infer_gate(ratio, resolved_config)
+    # Apply train/infer mismatch gate (GLM-5 IcePop-style, per-token)
+    if resolved_config.enable_icepop_token_gate:
+        ratio = _apply_icepop_token_gate(
+            ratio_train=ratio,              # r = π^train / π^train_old
+            log_pi_train_old=log_pi_train_old,  # π^train_old
+            log_pi_infer_old=log_pi_old,         # π^infer_old
+            config=resolved_config,
+        )
 
     # Apply importance weight gating (MiMo-style)
     if resolved_config.enable_importance_gating:

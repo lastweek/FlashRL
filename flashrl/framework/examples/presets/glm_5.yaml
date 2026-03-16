@@ -1,11 +1,30 @@
 # GLM-5 GRPO Implementation
 #
 # This preset implements techniques from GLM-5:
-# - Train/infer mismatch gate (IcePop-style)
-# - Group-normalized advantages
+# - Train/infer mismatch gate (IcePop) - filters unreliable gradients
+# - Group-normalized advantages - normalizes within prompt groups
+# - Asymmetric clipping - different bounds for positive/negative advantages
 # - No explicit KL in reasoning RL backbone
 #
 # Research: "GLM-5: IcePop Train/Infer Mismatch Gate"
+#
+# IcePop Gate Details:
+# - Computes ρ = π^train_old / π^infer_old (train/infer mismatch ratio)
+# - Applies pop(ρ, 1/β, β) = 0 if ρ < 1/β or ρ > β, else ρ
+# - Gates standard GRPO ratio: r_gated = r * pop(ρ, 1/β, β)
+# - Filters samples where training backend and inference engine have diverged
+#
+# Why IcePop Matters:
+# Training backend and inference engine can diverge due to:
+# - Different sampling strategies (temperature, top-k, top-p)
+# - Different model weights (train vs infer checkpoints)
+# - Different computational graphs (dropout, batch norm)
+# - Without IcePop, gradients from diverged samples are unreliable
+#
+# Implementation:
+# - π^train_old logprobs computed BEFORE optimizer update
+# - π^infer_old logprobs come from serving engine rollouts
+# - Extra forward pass adds ~10-20% training time for GLM-5
 
 actor:
   model_name: Qwen/Qwen2.5-0.5B
@@ -42,8 +61,8 @@ grpo:
   # - clip_ratio_lower: 0.1
   # - clip_ratio_upper: 0.2
   # - kl_mode: "none" (no explicit KL)
-  # - enable_train_infer_gate: true
-  # - train_infer_gate_beta: 2.0
+  # - enable_icepop_token_gate: true
+  # - icepop_token_gate_beta: 2.0
   # - advantage_normalization: true
   # - advantage_mode: "group_normalized" (GLM uses group-normalized)
 

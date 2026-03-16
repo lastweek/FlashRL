@@ -7,7 +7,7 @@ from flashrl.framework.config import GrpoConfig
 from flashrl.framework.trainer.grpo.loss_variants import (
     _compute_off_policy_sequence_masking,
     _apply_importance_gating,
-    _apply_train_infer_gate,
+    _apply_icepop_token_gate,
 )
 
 
@@ -235,29 +235,6 @@ class TestImportanceGating:
         assert gated[2] == pytest.approx(2.0)
 
 
-class TestTrainInferGate:
-    """Test GLM-5 train/infer mismatch gate (simplified version)."""
-
-    def test_train_infer_gate_returns_ratio_unchanged(self):
-        """Test that current train/infer gate implementation returns ratio unchanged.
-
-        Note: Full implementation would require separate train/infer engine logits.
-        Current simplified version assumes ratio already incorporates this.
-        """
-        config = GrpoConfig(
-            enable_train_infer_gate=True,
-            train_infer_gate_beta=2.0
-        )
-
-        ratio = torch.tensor([0.5, 1.0, 1.5])
-
-        gated = _apply_train_infer_gate(ratio, config)
-
-        # Current implementation returns ratio unchanged
-        assert gated[0] == pytest.approx(0.5)
-        assert gated[1] == pytest.approx(1.0)
-        assert gated[2] == pytest.approx(1.5)
-
 
 class TestGateCombinations:
     """Test combinations of different gates."""
@@ -310,3 +287,89 @@ class TestGateCombinations:
         # Both gates should be enabled
         assert config.enable_off_policy_sequence_masking is True
         assert config.enable_importance_gating is True
+
+
+class TestIcePopTokenGate:
+    """Test GLM-5 IcePop token gate."""
+
+    def test_icepop_token_gate_filters_high_mismatch(self):
+        """Test that gate filters when train/infer mismatch is too high."""
+        config = GrpoConfig(
+            enable_icepop_token_gate=True,
+            icepop_token_gate_beta=2.0,
+        )
+        # π^train_old / π^infer_old = 3.0 (outside [0.5, 2.0])
+        log_pi_train_old = torch.tensor([[1.0, 1.0, 1.0]])
+        log_pi_infer_old = torch.tensor([[0.0, 0.0, 0.0]])  # mismatch = 3.0
+        ratio_train = torch.tensor([[1.5, 1.5, 1.5]])  # r = π^train / π^train_old
+
+        gated = _apply_icepop_token_gate(
+            ratio_train, log_pi_train_old, log_pi_infer_old, config
+        )
+
+        # Should be gated to zero
+        assert torch.all(gated == 0.0)
+
+    def test_icepop_token_gate_passes_low_mismatch(self):
+        """Test that gate passes when train/infer mismatch is acceptable."""
+        config = GrpoConfig(
+            enable_icepop_token_gate=True,
+            icepop_token_gate_beta=2.0,
+        )
+        # π^train_old / π^infer_old = 1.5 (inside [0.5, 2.0])
+        log_pi_train_old = torch.tensor([[0.5, 0.5, 0.5]])
+        log_pi_infer_old = torch.tensor([[0.0, 0.0, 0.0]])  # mismatch = 1.5
+        ratio_train = torch.tensor([[1.5, 1.5, 1.5]])  # r = π^train / π^train_old
+
+        gated = _apply_icepop_token_gate(
+            ratio_train, log_pi_train_old, log_pi_infer_old, config
+        )
+
+        # Should pass through unchanged
+        assert torch.allclose(gated, ratio_train)
+
+    def test_icepop_token_gate_handles_none_train_old(self):
+        """Test that gate returns unchanged ratio when π^train_old is None."""
+        config = GrpoConfig(
+            enable_icepop_token_gate=True,
+            icepop_token_gate_beta=2.0,
+        )
+        ratio_train = torch.tensor([[1.5, 1.5, 1.5]])
+
+        # Pass None for log_pi_train_old
+        gated = _apply_icepop_token_gate(
+            ratio_train, None, torch.zeros_like(ratio_train), config
+        )
+
+        # Should pass through unchanged when π^train_old is None
+        assert torch.allclose(gated, ratio_train)
+
+    def test_icepop_token_gate_at_exact_boundaries(self):
+        """Test gate behavior at exact boundary values."""
+        config = GrpoConfig(
+            enable_icepop_token_gate=True,
+            icepop_token_gate_beta=2.0,
+        )
+        # Test at lower bound: π^train_old / π^infer_old = 0.5 (exactly at 1/β)
+        log_pi_train_old = torch.tensor([[-0.693, -0.693, -0.693]])  # log(0.5)
+        log_pi_infer_old = torch.tensor([[0.0, 0.0, 0.0]])
+        ratio_train = torch.tensor([[1.0, 1.0, 1.0]])
+
+        gated = _apply_icepop_token_gate(
+            ratio_train, log_pi_train_old, log_pi_infer_old, config
+        )
+
+        # Should pass through at exact boundary
+        assert torch.allclose(gated, ratio_train)
+
+        # Test at upper bound: π^train_old / π^infer_old = 2.0 (exactly at β)
+        log_pi_train_old = torch.tensor([[0.693, 0.693, 0.693]])  # log(2.0)
+        log_pi_infer_old = torch.tensor([[0.0, 0.0, 0.0]])
+        ratio_train = torch.tensor([[1.0, 1.0, 1.0]])
+
+        gated = _apply_icepop_token_gate(
+            ratio_train, log_pi_train_old, log_pi_infer_old, config
+        )
+
+        # Should pass through at exact boundary
+        assert torch.allclose(gated, ratio_train)

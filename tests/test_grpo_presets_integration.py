@@ -54,7 +54,7 @@ def create_preset_config(preset_name: str) -> GrpoConfig:
     elif preset_name == "glm_5":
         return GrpoConfig(
             loss_preset=preset_name,
-            enable_train_infer_gate=True,
+            enable_icepop_token_gate=True,
         )
     elif preset_name == "mimo_v2":
         return GrpoConfig(
@@ -196,7 +196,7 @@ class TestPresetIntegration:
 
     def test_glm_5_uses_group_normalized_advantages(self):
         """Test that glm_5 uses group-normalized advantages."""
-        config = GrpoConfig(loss_preset="glm_5")
+        config = create_preset_config("glm_5")
         data = create_test_data()
 
         result = assemble_grpo_loss(

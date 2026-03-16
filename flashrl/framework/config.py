@@ -209,9 +209,9 @@ class GrpoConfig(BaseConfig):
     # Log-ratio penalty (Kimi-style)
     log_ratio_penalty_coefficient: float = 0.0  # τ for soft quadratic penalty
 
-    # Train/infer mismatch gate (GLM-5 IcePop-style)
-    enable_train_infer_gate: bool = False
-    train_infer_gate_beta: float = 2.0  # β for pop(ρ, 1/β, β)
+    # IcePop token gate (GLM-5 train/infer mismatch, per-token)
+    enable_icepop_token_gate: bool = False
+    icepop_token_gate_beta: float = 2.0  # β for pop(ρ, 1/β, β)
 
     # Sequence-level off-policy masking (DeepSeek-V3.2)
     enable_off_policy_sequence_masking: bool = False
