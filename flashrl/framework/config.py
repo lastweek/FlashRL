@@ -147,6 +147,22 @@ class GrpoConfig(BaseConfig):
     do_sample: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
+    # Loss variant selection
+    loss_variant: Literal[
+        "grpo_naive",
+        "ppo_clipped",  # Alias for grpo_naive
+        "deepseek_v3.2",
+        "kimi_k2.5",
+        "glm_5",
+    ] = "grpo_naive"
+
+    # Component-specific parameters
+    clip_ratio_lower: float | None = None  # For dual asymmetric clipping
+    clip_ratio_upper: float = 0.2  # For dual asymmetric clipping
+    kl_target: float = 0.05  # For hard KL constraint
+    entropy_coefficient: float = 0.01  # For entropy regularization
+    entropy_decay_rate: float = 0.995  # For decaying entropy
+
 
 class LoggingConfig(BaseConfig):
     """Configuration for run logging and terminal UX."""

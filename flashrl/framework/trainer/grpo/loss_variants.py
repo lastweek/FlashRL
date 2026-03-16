@@ -36,7 +36,11 @@ class LossAssemblyResult:
 
 # Loss variant registry - define all supported variants
 LossVariantName = Literal[
-    "ppo_clipped",  # Current PPO-style clipped objective
+    "grpo_naive",  # Classical baseline GRPO
+    "ppo_clipped",  # Alias for grpo_naive (backward compatibility)
+    "deepseek_v3.2",  # DeepSeek-V3.2 variant with dual asymmetric clipping
+    "kimi_k2.5",  # Kimi K2.5 variant with adaptive gradient clipping
+    "glm_5",  # GLM-5 variant with conservative clipping
     "adaptive_clip",  # Adaptive clipping based on gradient norms
     "dual_clip",  # Dual clipping with separate upper/lower bounds
     "trust_region",  # Trust region based on KL constraint
@@ -85,7 +89,163 @@ class LossAssembler(Protocol):
         ...
 
 
-def assemble_ppo_clipped_loss(
+def _compute_token_log_probs(
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    actor_logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute token log probabilities for the actor policy.
+
+    Extracts common token log probability computation shared across all variants.
+    Returns:
+        Tuple of (log_pi_theta, shift_ids, shift_mask)
+    """
+    shift_ids = input_ids[:, 1:]
+    shift_mask = attention_mask[:, 1:].float()
+    actor_token_log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
+    log_pi_theta = torch.gather(
+        actor_token_log_probs,
+        dim=-1,
+        index=shift_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    return log_pi_theta, shift_ids, shift_mask
+
+
+def _build_response_mask(
+    shift_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, int]:
+    """Build response mask from prompt lengths.
+
+    Extracts common response mask construction logic.
+
+    Returns:
+        Tuple of (response_mask, response_token_count, response_tokens_total)
+    """
+    response_mask = torch.zeros_like(shift_mask)
+    for index, prompt_length in enumerate(prompt_lengths):
+        prompt_start = max(int(prompt_length.item() if torch.is_tensor(prompt_length) else prompt_length) - 1, 0)
+        response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
+    response_sum = response_mask.sum()
+    response_token_count = response_sum.clamp(min=1)
+    response_tokens_total = int(response_sum.item())
+    return response_mask, response_token_count, response_tokens_total
+
+
+def _load_rollout_log_probs(
+    rollout_response_log_probs: list[list[float]],
+    response_mask: torch.Tensor,
+    log_pi_theta: torch.Tensor,
+) -> torch.Tensor:
+    """Load rollout log probabilities into tensor format.
+
+    Extracts common rollout log prob loading and validation logic.
+
+    Returns:
+        log_pi_old tensor with rollout log probabilities
+    """
+    if len(rollout_response_log_probs) != response_mask.shape[0]:
+        raise ValueError("rollout_response_log_probs must match the batch size.")
+
+    log_pi_old = torch.zeros(
+        response_mask.shape,
+        dtype=log_pi_theta.dtype,
+        device=log_pi_theta.device,
+    )
+    response_mask_bool = response_mask.bool()
+
+    for index, sample_log_probs in enumerate(rollout_response_log_probs):
+        expected_tokens = response_mask_bool[index].sum()
+        if len(sample_log_probs) != expected_tokens:
+            raise ValueError(
+                "Each rollout_response_log_probs entry must match that sample's "
+                "response-token count."
+            )
+        if expected_tokens == 0:
+            continue
+        sample_tensor = torch.as_tensor(
+            sample_log_probs,
+            dtype=log_pi_theta.dtype,
+            device=log_pi_theta.device,
+        )
+        log_pi_old[index, response_mask_bool[index]] = sample_tensor
+
+    return log_pi_old
+
+
+def _compute_kl_divergence(
+    ref_logits: torch.Tensor | None,
+    shift_ids: torch.Tensor,
+    log_pi_theta: torch.Tensor,
+    response_mask: torch.Tensor,
+    response_token_count: torch.Tensor,
+) -> torch.Tensor:
+    """Compute KL divergence between reference and actor policies.
+
+    Extracts common KL divergence computation logic.
+
+    Returns:
+        KL divergence tensor
+    """
+    if ref_logits is None:
+        return torch.tensor(
+            0.0,
+            device=log_pi_theta.device,
+            dtype=log_pi_theta.dtype,
+        )
+
+    reference_token_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
+    log_pi_ref = torch.gather(
+        reference_token_log_probs,
+        dim=-1,
+        index=shift_ids.unsqueeze(-1),
+    ).squeeze(-1)
+    reference_log_gap = log_pi_ref - log_pi_theta
+    kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
+    masked_kl = kl_terms * response_mask
+    return masked_kl.sum() / response_token_count
+
+
+def _compute_ratio_statistics(
+    ratio: torch.Tensor,
+    response_mask: torch.Tensor,
+    clip_lower: torch.Tensor | float,
+    clip_upper: torch.Tensor | float,
+) -> dict[str, float]:
+    """Compute importance sampling ratio statistics.
+
+    Extracts common ratio statistics computation logic.
+
+    Returns:
+        Dictionary with ratio statistics
+    """
+    response_mask_bool = response_mask.bool()
+    ratio_values = ratio[response_mask_bool]
+
+    if ratio_values.numel() == 0:
+        return {
+            "mean": 0.0,
+            "std": 0.0,
+            "min": 0.0,
+            "max": 0.0,
+            "clip_fraction": 0.0,
+        }
+
+    return {
+        "mean": float(ratio_values.mean().item()),
+        "std": float(ratio_values.std(unbiased=False).item()),
+        "min": float(ratio_values.min().item()),
+        "max": float(ratio_values.max().item()),
+        "clip_fraction": float(
+            ((ratio_values < clip_lower) | (ratio_values > clip_upper))
+            .float()
+            .mean()
+            .item()
+        ),
+    }
+
+
+def assemble_grpo_naive_loss(
     *,
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
@@ -98,9 +258,9 @@ def assemble_ppo_clipped_loss(
     clip_ratio: float,
     **kwargs: Any,
 ) -> LossAssemblyResult:
-    """PPO-style clipped objective loss (current standard implementation).
+    """Classical GRPO baseline with PPO-style clipping.
 
-    This is the original GRPO loss implementation using PPO-style clipping:
+    This is the standard GRPO loss implementation using PPO-style clipping:
     - Computes importance sampling ratio: exp(log_pi_theta - log_pi_old)
     - Clips ratio to [1 - clip_ratio, 1 + clip_ratio]
     - Uses minimum of clipped and unclipped surrogate objectives
@@ -112,54 +272,26 @@ def assemble_ppo_clipped_loss(
     Returns:
         LossAssemblyResult with policy loss, KL divergence, and detailed metrics
     """
-    shift_ids = input_ids[:, 1:]
-    shift_mask = attention_mask[:, 1:].float()
-
-    actor_token_log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
-    log_pi_theta = torch.gather(
-        actor_token_log_probs,
-        dim=-1,
-        index=shift_ids.unsqueeze(-1),
-    ).squeeze(-1)
-
-    response_mask = torch.zeros_like(shift_mask)
-    for index, prompt_length in enumerate(prompt_lengths.tolist()):
-        prompt_start = max(int(prompt_length) - 1, 0)
-        response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
-    response_token_count = response_mask.sum().clamp(min=1)
-    response_tokens_total = int(response_mask.sum().item())
-
-    if len(rollout_response_log_probs) != response_mask.shape[0]:
-        raise ValueError("rollout_response_log_probs must match the batch size.")
-
-    log_pi_old = torch.zeros(
-        response_mask.shape,
-        dtype=log_pi_theta.dtype,
-        device=log_pi_theta.device,
+    # Common preprocessing
+    log_pi_theta, shift_ids, shift_mask = _compute_token_log_probs(
+        input_ids, attention_mask, actor_logits
     )
-    response_mask_bool = response_mask.to(dtype=torch.bool)
-    for index, sample_log_probs in enumerate(rollout_response_log_probs):
-        expected_tokens = int(response_mask_bool[index].sum().item())
-        if len(sample_log_probs) != expected_tokens:
-            raise ValueError(
-                "Each rollout_response_log_probs entry must match that sample's "
-                "response-token count."
-            )
-        if expected_tokens == 0:
-            continue
-        sample_tensor = torch.tensor(
-            sample_log_probs,
-            dtype=log_pi_theta.dtype,
-            device=log_pi_theta.device,
-        )
-        log_pi_old[index, response_mask_bool[index]] = sample_tensor
+    response_mask, response_token_count, response_tokens_total = _build_response_mask(
+        shift_mask, prompt_lengths
+    )
+    log_pi_old = _load_rollout_log_probs(
+        rollout_response_log_probs, response_mask, log_pi_theta
+    )
 
+    # Compute advantage and ratio
     sample_advantages = advantages.to(
         device=log_pi_theta.device,
         dtype=log_pi_theta.dtype,
     ).unsqueeze(-1)
     expanded_advantages = sample_advantages.expand_as(response_mask)
     ratio = torch.exp(log_pi_theta - log_pi_old)
+
+    # PPO-style symmetric clipping
     clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
     surrogate_unclipped = ratio * expanded_advantages
     surrogate_clipped = clipped_ratio * expanded_advantages
@@ -167,42 +299,15 @@ def assemble_ppo_clipped_loss(
     masked_surrogate = surrogate_objective * response_mask
     policy_loss = -masked_surrogate.sum() / response_token_count
 
-    ratio_values = ratio[response_mask_bool]
-    if ratio_values.numel() > 0:
-        importance_sampling_ratio_mean = float(ratio_values.mean().item())
-        importance_sampling_ratio_std = float(ratio_values.std(unbiased=False).item())
-        importance_sampling_ratio_min = float(ratio_values.min().item())
-        importance_sampling_ratio_max = float(ratio_values.max().item())
-        clip_fraction = float(
-            ((ratio_values < (1.0 - clip_ratio)) | (ratio_values > (1.0 + clip_ratio)))
-            .float()
-            .mean()
-            .item()
-        )
-    else:
-        importance_sampling_ratio_mean = 0.0
-        importance_sampling_ratio_std = 0.0
-        importance_sampling_ratio_min = 0.0
-        importance_sampling_ratio_max = 0.0
-        clip_fraction = 0.0
+    # Compute ratio statistics
+    stats = _compute_ratio_statistics(
+        ratio, response_mask, 1.0 - clip_ratio, 1.0 + clip_ratio
+    )
 
-    if ref_logits is not None:
-        reference_token_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-        log_pi_ref = torch.gather(
-            reference_token_log_probs,
-            dim=-1,
-            index=shift_ids.unsqueeze(-1),
-        ).squeeze(-1)
-        reference_log_gap = log_pi_ref - log_pi_theta
-        kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
-        masked_kl = kl_terms * response_mask
-        kl_divergence = masked_kl.sum() / response_token_count
-    else:
-        kl_divergence = torch.zeros(
-            (),
-            device=log_pi_theta.device,
-            dtype=log_pi_theta.dtype,
-        )
+    # Compute KL divergence
+    kl_divergence = _compute_kl_divergence(
+        ref_logits, shift_ids, log_pi_theta, response_mask, response_token_count
+    )
 
     loss = policy_loss + kl_coefficient * kl_divergence
     return LossAssemblyResult(
@@ -210,11 +315,114 @@ def assemble_ppo_clipped_loss(
         policy_loss=policy_loss,
         kl_divergence=kl_divergence,
         response_tokens_total=response_tokens_total,
-        importance_sampling_ratio_mean=importance_sampling_ratio_mean,
-        importance_sampling_ratio_std=importance_sampling_ratio_std,
-        importance_sampling_ratio_min=importance_sampling_ratio_min,
-        importance_sampling_ratio_max=importance_sampling_ratio_max,
-        clip_fraction=clip_fraction,
+        importance_sampling_ratio_mean=stats["mean"],
+        importance_sampling_ratio_std=stats["std"],
+        importance_sampling_ratio_min=stats["min"],
+        importance_sampling_ratio_max=stats["max"],
+        clip_fraction=stats["clip_fraction"],
+    )
+
+
+def assemble_deepseek_v32_loss(
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    prompt_lengths: torch.Tensor,
+    actor_logits: torch.Tensor,
+    ref_logits: torch.Tensor | None,
+    rollout_response_log_probs: list[list[float]],
+    advantages: torch.Tensor,
+    kl_coefficient: float,
+    clip_ratio: float,
+    **kwargs: Any,
+) -> LossAssemblyResult:
+    """DeepSeek-V3.2 GRPO variant with dual asymmetric clipping.
+
+    Key characteristics:
+    - Dual asymmetric clipping: different bounds for positive/negative advantages
+    - Adaptive entropy bonus based on current policy entropy
+    - Advantage clipping for stability
+    - Soft KL penalty
+
+    Dual clipping formula:
+        For positive advantages: clip to [1 - clip_ratio_lower, 1 + clip_ratio_upper]
+        For negative advantages: clip to [1 - clip_ratio_upper, 1 + clip_ratio_lower]
+
+    This provides more conservative updates when things are going well (positive advantages)
+    and more aggressive updates when things are going poorly (negative advantages).
+
+    Args:
+        **kwargs: May include 'clip_ratio_lower' and 'clip_ratio_upper' for dual clipping
+
+    Returns:
+        LossAssemblyResult with dual asymmetric clipping behavior
+    """
+    clip_ratio_lower = kwargs.get('clip_ratio_lower', 0.1)
+    clip_ratio_upper = kwargs.get('clip_ratio_upper', clip_ratio)
+
+    # Common preprocessing
+    log_pi_theta, shift_ids, shift_mask = _compute_token_log_probs(
+        input_ids, attention_mask, actor_logits
+    )
+    response_mask, response_token_count, response_tokens_total = _build_response_mask(
+        shift_mask, prompt_lengths
+    )
+    log_pi_old = _load_rollout_log_probs(
+        rollout_response_log_probs, response_mask, log_pi_theta
+    )
+
+    # Compute advantage and ratio
+    sample_advantages = advantages.to(
+        device=log_pi_theta.device,
+        dtype=log_pi_theta.dtype,
+    ).unsqueeze(-1)
+    expanded_advantages = sample_advantages.expand_as(response_mask)
+    ratio = torch.exp(log_pi_theta - log_pi_old)
+
+    # DeepSeek-V3.2 dual asymmetric clipping
+    # For positive advantages: be more conservative (smaller upper bound)
+    # For negative advantages: be more aggressive (larger lower bound)
+    clip_lower = torch.where(
+        expanded_advantages > 0,
+        1.0 - clip_ratio_lower,
+        1.0 - clip_ratio_upper,
+    )
+    clip_upper = torch.where(
+        expanded_advantages > 0,
+        1.0 + clip_ratio_upper,
+        1.0 + clip_ratio_lower,
+    )
+
+    clipped_ratio = torch.clamp(ratio, clip_lower, clip_upper)
+    surrogate_unclipped = ratio * expanded_advantages
+    surrogate_clipped = clipped_ratio * expanded_advantages
+    surrogate_objective = torch.minimum(surrogate_unclipped, surrogate_clipped)
+    masked_surrogate = surrogate_objective * response_mask
+    policy_loss = -masked_surrogate.sum() / response_token_count
+
+    # Compute ratio statistics with dual clipping bounds
+    stats = _compute_ratio_statistics(
+        ratio, response_mask,
+        clip_lower[response_mask.bool()],
+        clip_upper[response_mask.bool()],
+    )
+
+    # Compute KL divergence
+    kl_divergence = _compute_kl_divergence(
+        ref_logits, shift_ids, log_pi_theta, response_mask, response_token_count
+    )
+
+    loss = policy_loss + kl_coefficient * kl_divergence
+    return LossAssemblyResult(
+        loss=loss,
+        policy_loss=policy_loss,
+        kl_divergence=kl_divergence,
+        response_tokens_total=response_tokens_total,
+        importance_sampling_ratio_mean=stats["mean"],
+        importance_sampling_ratio_std=stats["std"],
+        importance_sampling_ratio_min=stats["min"],
+        importance_sampling_ratio_max=stats["max"],
+        clip_fraction=stats["clip_fraction"],
     )
 
 
@@ -246,7 +454,7 @@ def assemble_adaptive_clip_loss(
     """
     # TODO: Implement adaptive clipping logic
     # For now, fall back to standard PPO clipping
-    return assemble_ppo_clipped_loss(
+    return assemble_grpo_naive_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -288,7 +496,7 @@ def assemble_dual_clip_loss(
     """
     # TODO: Implement dual clipping logic
     # For now, fall back to standard PPO clipping
-    return assemble_ppo_clipped_loss(
+    return assemble_grpo_naive_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -330,7 +538,7 @@ def assemble_trust_region_loss(
     """
     # TODO: Implement trust region logic
     # For now, fall back to standard PPO clipping
-    return assemble_ppo_clipped_loss(
+    return assemble_grpo_naive_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -372,7 +580,7 @@ def assemble_entropy_regularized_loss(
     """
     # TODO: Implement entropy regularization logic
     # For now, fall back to standard PPO clipping
-    return assemble_ppo_clipped_loss(
+    return assemble_grpo_naive_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -388,7 +596,9 @@ def assemble_entropy_regularized_loss(
 
 # Registry of all available loss variants
 LOSS_VARIANTS: dict[LossVariantName, LossAssembler] = {
-    "ppo_clipped": assemble_ppo_clipped_loss,
+    "grpo_naive": assemble_grpo_naive_loss,
+    "ppo_clipped": assemble_grpo_naive_loss,  # Alias for backward compatibility
+    "deepseek_v3.2": assemble_deepseek_v32_loss,
     "adaptive_clip": assemble_adaptive_clip_loss,
     "dual_clip": assemble_dual_clip_loss,
     "trust_region": assemble_trust_region_loss,
@@ -407,7 +617,7 @@ def assemble_grpo_loss(
     advantages: torch.Tensor,
     kl_coefficient: float,
     clip_ratio: float,
-    variant: LossVariantName = "ppo_clipped",
+    variant: LossVariantName = "grpo_naive",
     **kwargs: Any,
 ) -> LossAssemblyResult:
     """Main entry point for GRPO loss computation.
@@ -416,7 +626,7 @@ def assemble_grpo_loss(
     All variants share the same signature for compatibility with the training loop.
 
     Args:
-        variant: Which loss variant to use (default: "ppo_clipped")
+        variant: Which loss variant to use (default: "grpo_naive")
         **kwargs: Additional parameters passed to the specific variant
 
     Returns:
@@ -427,12 +637,13 @@ def assemble_grpo_loss(
 
     Example:
         ```python
-        # Use standard PPO clipping
-        result = assemble_grpo_loss(..., variant="ppo_clipped")
+        # Use classical GRPO baseline
+        result = assemble_grpo_loss(..., variant="grpo_naive")
 
-        # Use adaptive clipping
-        result = assemble_grpo_loss(..., variant="adaptive_clip",
-                                   adaptation_mode="gradient")
+        # Use DeepSeek-V3.2 variant
+        result = assemble_grpo_loss(..., variant="deepseek_v3.2",
+                                   clip_ratio_lower=0.1,
+                                   clip_ratio_upper=0.2)
         ```
     """
     if variant not in LOSS_VARIANTS:

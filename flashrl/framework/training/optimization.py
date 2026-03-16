@@ -10,7 +10,7 @@ import torch.nn.functional as F
 
 from flashrl.framework.data_models import LearnerBatch
 from flashrl.framework.observability import StageResult, timed_call
-from flashrl.framework.training.loss_variants import (
+from flashrl.framework.trainer.grpo.loss_variants import (
     LossAssemblyResult,
     assemble_grpo_loss,
 )
@@ -220,6 +220,13 @@ def optimize_grpo_batch(
             advantages=advantages,
             kl_coefficient=grpo_config.kl_coefficient,
             clip_ratio=grpo_config.clip_ratio,
+            variant=grpo_config.loss_variant,
+            # Pass component-specific parameters
+            clip_ratio_lower=grpo_config.clip_ratio_lower,
+            clip_ratio_upper=grpo_config.clip_ratio_upper,
+            kl_target=grpo_config.kl_target,
+            entropy_coefficient=grpo_config.entropy_coefficient,
+            entropy_decay_rate=grpo_config.entropy_decay_rate,
         )
     )
 

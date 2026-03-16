@@ -40,7 +40,7 @@ from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
 from .training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend, create_training_backend
-from .trainer.grpo import GRPOTrainer
+from .trainer.grpo.trainer import GRPOTrainer
 
 
 @dataclass

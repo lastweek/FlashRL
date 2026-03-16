@@ -16,7 +16,10 @@ from flashrl.framework.config import ServingConfig, TrainerConfig, TrainingConfi
 from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
-from flashrl.framework.trainer.grpo import GRPOTrainer
+from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
+from flashrl.framework.trainer.grpo.grpo_helpers import compute_advantages, prompt_batch_size
+from flashrl.framework.trainer.grpo.loss_variants import assemble_grpo_loss
+from flashrl.framework.data_models import LearnerBatch
 from tests.conftest import (
     TinyReferenceModel,
     TinyActor,
@@ -108,7 +111,7 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
 
     trainer.train(dataset)
 
-    assert trainer._prompts_per_step() == 2
+    assert prompt_batch_size(trainer.config.batch_size, trainer.grpo_config.group_size) == 2
     assert prompt_batches == [
         ["prompt 0", "prompt 1"],
         ["prompt 0", "prompt 1"],
@@ -156,7 +159,7 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
     """Advantage normalization should be done independently for each prompt group."""
     trainer = build_trainer(batch_size=4, group_size=2)
 
-    advantages = trainer._compute_advantages(
+    advantages = compute_advantages(
         [
             RewardOutput(reward=1.0),
             RewardOutput(reward=3.0),
@@ -175,7 +178,7 @@ def test_grpo_compute_advantages_rejects_mismatched_group_shape() -> None:
     trainer = build_trainer(batch_size=4, group_size=2)
 
     with pytest.raises(ValueError, match="prompt_count \\* group_size"):
-        trainer._compute_advantages(
+        compute_advantages(
             [RewardOutput(reward=1.0), RewardOutput(reward=3.0), RewardOutput(reward=10.0)],
             prompt_count=2,
             group_size=2,
@@ -239,10 +242,16 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     rollouts = grouped_rollouts
 
     actor = trainer.training_backend.actor
-    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
-        SimpleNamespace(rollouts=rollouts),
-        actor,
-        actor.device,
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[int(tid) for tid in rollout.prompt_token_ids] for rollout in rollouts],
+        response_token_ids=[[int(tid) for tid in rollout.response_token_ids] for rollout in rollouts],
+        response_token_logprobs=[rollout.response_token_logprobs for rollout in rollouts],
+        advantages=[0.0 for _ in rollouts],
+        group_size=2,
+        prompt_count=2,
+    )
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer.training_backend.prepare_inputs(
+        learner_batch,
     )
 
     actor_logits = actor.model(
@@ -257,7 +266,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
 
     advantages = torch.tensor([1.25, -0.5], dtype=torch.float32)
 
-    loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = trainer._assemble_loss(
+    loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -280,7 +289,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
             continue
         prompt_only_mutated_logits[index, :prompt_positions, 0] += 25.0
 
-    mutated_loss, mutated_policy, mutated_kl, _ = trainer._assemble_loss(
+    mutated_loss, mutated_policy, mutated_kl, _ = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -296,7 +305,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     assert mutated_policy.item() == pytest.approx(policy_no_ref.item())
     assert mutated_kl.item() == pytest.approx(0.0)
 
-    loss_with_ref, policy_with_ref, kl_with_ref, _ = trainer._assemble_loss(
+    loss_with_ref, policy_with_ref, kl_with_ref, _ = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -326,17 +335,23 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     rollouts = grouped_rollouts
     rollout_response_log_probs = [rollout.response_token_logprobs for rollout in rollouts]
 
-    input_ids, attention_mask, prompt_lengths, _, _ = trainer._prepare_inputs(
-        SimpleNamespace(rollouts=rollouts),
-        trainer.training_backend.actor,
-        trainer.training_backend.actor.device,
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[int(tid) for tid in rollout.prompt_token_ids] for rollout in rollouts],
+        response_token_ids=[[int(tid) for tid in rollout.response_token_ids] for rollout in rollouts],
+        response_token_logprobs=rollout_response_log_probs,
+        advantages=[0.0 for _ in rollouts],
+        group_size=2,
+        prompt_count=2,
+    )
+    input_ids, attention_mask, prompt_lengths, _, _ = trainer.training_backend.prepare_inputs(
+        learner_batch,
     )
     actor_logits = trainer.training_backend.actor.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
     ).logits
 
-    _, _, _, response_tokens_total = trainer._assemble_loss(
+    _, _, _, response_tokens_total = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -351,7 +366,7 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     assert response_tokens_total == sum(len(sample) for sample in rollout_response_log_probs)
 
     with pytest.raises(ValueError, match="response-token count"):
-        trainer._assemble_loss(
+        assemble_grpo_loss(
             input_ids=input_ids,
             attention_mask=attention_mask,
             prompt_lengths=prompt_lengths,
@@ -373,17 +388,23 @@ def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
         trainer.serving_backend,
     )
 
-    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
-        SimpleNamespace(rollouts=rollouts),
-        trainer.training_backend.actor,
-        trainer.training_backend.actor.device,
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[int(tid) for tid in rollout.prompt_token_ids] for rollout in rollouts],
+        response_token_ids=[[int(tid) for tid in rollout.response_token_ids] for rollout in rollouts],
+        response_token_logprobs=[rollout.response_token_logprobs for rollout in rollouts],
+        advantages=[0.0 for _ in rollouts],
+        group_size=2,
+        prompt_count=2,
+    )
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer.training_backend.prepare_inputs(
+        learner_batch,
     )
     actor_logits = trainer.training_backend.actor.model(
         input_ids=input_ids,
         attention_mask=attention_mask,
     ).logits
 
-    loss, policy_loss, kl_divergence, _ = trainer._assemble_loss(
+    loss, policy_loss, kl_divergence, _ = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -444,7 +465,7 @@ def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
     ]
 
     reward_values = [reward.reward for reward in rewards]
-    advantages = trainer._compute_advantages(rewards, prompt_count=1, group_size=4)
+    advantages = compute_advantages(rewards, prompt_count=1, group_size=4)
 
     assert any(value > 0.0 for value in reward_values)
     assert any(abs(float(value)) > 1e-6 for value in advantages.tolist())
@@ -459,10 +480,16 @@ def test_grpo_prepare_inputs_reuses_rollout_token_ids_without_tokenizer_calls() 
     actor = trainer.training_backend.actor
     actor.tokenizer.calls.clear()
 
-    input_ids, attention_mask, prompt_lengths, full_lengths, rollout_response_log_probs = trainer._prepare_inputs(
-        SimpleNamespace(rollouts=rollouts),
-        actor,
-        actor.device,
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[int(tid) for tid in rollout.prompt_token_ids] for rollout in rollouts],
+        response_token_ids=[[int(tid) for tid in rollout.response_token_ids] for rollout in rollouts],
+        response_token_logprobs=[rollout.response_token_logprobs for rollout in rollouts],
+        advantages=[0.0 for _ in rollouts],
+        group_size=2,
+        prompt_count=2,
+    )
+    input_ids, attention_mask, prompt_lengths, full_lengths, rollout_response_log_probs = trainer.training_backend.prepare_inputs(
+        learner_batch,
     )
 
     assert actor.tokenizer.calls == []

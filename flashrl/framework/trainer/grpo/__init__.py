@@ -1,5 +1,7 @@
 """GRPO (Group Relative Policy Optimization) trainer and utilities."""
 
+from __future__ import annotations
+
 from flashrl.framework.trainer.grpo.grpo_helpers import (
     STAGE_ORDER,
     StepContext,
@@ -10,10 +12,13 @@ from flashrl.framework.trainer.grpo.grpo_helpers import (
     prompt_batch_size,
     reward_rate_stats,
 )
-from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
+from flashrl.framework.trainer.grpo.loss_variants import (
+    LOSS_VARIANTS,
+    LossAssemblyResult,
+    assemble_grpo_loss,
+)
 
 __all__ = [
-    "GRPOTrainer",
     "StepContext",
     "compute_advantages",
     "prompt_batch_size",
@@ -22,4 +27,7 @@ __all__ = [
     "accumulate_totals",
     "batch_items",
     "STAGE_ORDER",
+    "LossAssemblyResult",
+    "assemble_grpo_loss",
+    "LOSS_VARIANTS",
 ]

@@ -22,7 +22,6 @@ from flashrl.framework.observability import (
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.training import OptimizationResult
-from flashrl.framework.training.base import assemble_loss
 from flashrl.framework.training.optimization import optimize_grpo_batch
 from flashrl.framework.trainer.grpo.grpo_helpers import (
     STAGE_ORDER,
@@ -89,7 +88,7 @@ class GRPOTrainer:
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
-        prompts_per_step = self._prompts_per_step()
+        prompts_per_step = prompt_batch_size(self.config.batch_size, self.grpo_config.group_size)
         batches_in_epoch = math_ceil_div(len(dataset), prompts_per_step) if len(dataset) else 0
 
         for epoch in range(self.current_epoch, self.config.max_epochs):
@@ -171,15 +170,19 @@ class GRPOTrainer:
         finally:
             self._clear_serving_debug()
         rollout_seconds = elapsed_seconds(rollout_started_at)
-        prompt_lengths = [len(rollout.prompt_token_ids) for rollout in rollouts]
-        response_lengths = [len(rollout.response_token_ids) for rollout in rollouts]
+        grouped_prompts_count = len(grouped_prompts)
+        prompt_lengths = []
+        response_lengths = []
+        for rollout in rollouts:
+            prompt_lengths.append(len(rollout.prompt_token_ids))
+            response_lengths.append(len(rollout.response_token_ids))
         self._log_stage(
             context,
             StageResult(
                 name="rollout",
                 seconds=rollout_seconds,
                 metrics={
-                    "sample_count": len(grouped_prompts),
+                    "sample_count": grouped_prompts_count,
                     "prompt_tokens_mean": mean(prompt_lengths),
                     "prompt_tokens_max": max(prompt_lengths, default=0),
                     "response_tokens_mean": mean(response_lengths),
@@ -229,13 +232,13 @@ class GRPOTrainer:
         )
 
         advantages, advantage_seconds = timed_call(
-            lambda: self._compute_advantages(
+            lambda: compute_advantages(
                 batch.rewards,
                 prompt_count=batch.prompt_count,
                 group_size=batch.group_size,
             )
         )
-        advantage_values = [float(value) for value in advantages.tolist()]
+        advantage_values = advantages.cpu().numpy().tolist()
         self._log_stage(
             context,
             StageResult(
@@ -260,11 +263,12 @@ class GRPOTrainer:
             response_tokens_total / step_duration_seconds if step_duration_seconds > 0.0 else 0.0
         )
 
+        ref_active = result.reference_active
         visible_stage_order = [
             stage_name
             for stage_name in STAGE_ORDER
             if stage_name in all_stage_timings
-            and (stage_name != "reference_forward" or result.reference_active)
+            and (stage_name != "reference_forward" or ref_active)
         ]
         reward_summary = reward_stage.metrics
         payload = {
@@ -273,7 +277,7 @@ class GRPOTrainer:
             "policy_loss": result.policy_loss,
             "kl_divergence": result.kl_divergence,
             "learning_rate": result.learning_rate,
-            "reward_mean": mean([float(value) for value in reward_values]),
+            "reward_mean": mean(reward_values),
             **{
                 key: value
                 for key, value in reward_summary.items()
@@ -285,10 +289,10 @@ class GRPOTrainer:
             "stage_timings": all_stage_timings,
             "stage_order": visible_stage_order,
             "reference_configured": self.reference_backend is not None,
-            "reference_active": result.reference_active,
+            "reference_active": ref_active,
             "dominant_stage": dominant_stage_name(result.stages),
-            "candidate_count": len(grouped_prompts),
-            "sample_count": len(grouped_prompts),
+            "candidate_count": grouped_prompts_count,
+            "sample_count": grouped_prompts_count,
         }
 
         done_event = RuntimeEvent(kind="step_done", payload=payload)
@@ -340,20 +344,19 @@ class GRPOTrainer:
         advantages: torch.Tensor,
     ) -> LearnerBatch:
         """Convert controller-owned rollout outputs into one learner batch."""
+        prompt_token_ids = []
+        response_token_ids = []
+        response_token_logprobs = []
+        for rollout in batch.rollouts:
+            prompt_token_ids.append([int(token_id) for token_id in rollout.prompt_token_ids])
+            response_token_ids.append([int(token_id) for token_id in rollout.response_token_ids])
+            response_token_logprobs.append([float(value) for value in rollout.response_token_logprobs])
+
         return LearnerBatch(
-            prompt_token_ids=[
-                [int(token_id) for token_id in rollout.prompt_token_ids]
-                for rollout in batch.rollouts
-            ],
-            response_token_ids=[
-                [int(token_id) for token_id in rollout.response_token_ids]
-                for rollout in batch.rollouts
-            ],
-            response_token_logprobs=[
-                [float(value) for value in rollout.response_token_logprobs]
-                for rollout in batch.rollouts
-            ],
-            advantages=[float(value) for value in advantages.tolist()],
+            prompt_token_ids=prompt_token_ids,
+            response_token_ids=response_token_ids,
+            response_token_logprobs=response_token_logprobs,
+            advantages=advantages.cpu().numpy().tolist(),
             group_size=batch.group_size,
             prompt_count=batch.prompt_count,
             prompt_indices=list(batch.prompt_indices),
@@ -400,37 +403,6 @@ class GRPOTrainer:
             self._log_stage(context, sync_stage)
         result.refresh_stage_views()
         return result
-
-    def _prepare_inputs(
-        self,
-        batch: TrainingBatch | Any,
-        actor: Any,
-        device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, list[int], list[list[float]]]:
-        """Compatibility wrapper around actor-backend input preparation."""
-        del actor, device
-        learner_batch = LearnerBatch(
-            prompt_token_ids=[
-                [int(token_id) for token_id in rollout.prompt_token_ids]
-                for rollout in batch.rollouts
-            ],
-            response_token_ids=[
-                [int(token_id) for token_id in rollout.response_token_ids]
-                for rollout in batch.rollouts
-            ],
-            response_token_logprobs=[
-                [float(value) for value in rollout.response_token_logprobs]
-                for rollout in batch.rollouts
-            ],
-            advantages=[0.0 for _ in batch.rollouts],
-            group_size=getattr(batch, "group_size", 1),
-            prompt_count=getattr(batch, "prompt_count", len(batch.rollouts)),
-        )
-        return self.actor_backend.prepare_inputs(learner_batch)
-
-    def _assemble_loss(self, **kwargs: Any):
-        """Compatibility wrapper around the shared GRPO loss helper."""
-        return assemble_loss(**kwargs)
 
     def _build_epoch_summary(
         self,
@@ -514,53 +486,6 @@ class GRPOTrainer:
             observe_event_pair(self.run_logger, self.metrics_sink, event)
             return
         observe_event(self.run_logger, event)
-
-    def _compute_advantages(
-        self,
-        rewards: list[RewardOutput],
-        prompt_count: int,
-        group_size: int,
-    ) -> torch.Tensor:
-        """Compute GRPO advantages within each prompt group."""
-        return compute_advantages(
-            rewards,
-            prompt_count=prompt_count,
-            group_size=group_size,
-        )
-
-    def _batch_prompts(self, dataset: list[Any], batch_size: int | None = None):
-        """Split a dataset into prompt batches."""
-        size = batch_size or self.config.batch_size
-        return batch_items(dataset, size)
-
-    def _prompts_per_step(self) -> int:
-        """Return the number of unique prompts consumed by each grouped GRPO step."""
-        return prompt_batch_size(self.config.batch_size, self.grpo_config.group_size)
-
-    def _summary_stats(self, prefix: str, values: list[float]) -> dict[str, float]:
-        """Compatibility wrapper around shared summary stats."""
-        return summary_stats(prefix, values)
-
-    def _reward_rate_stats(self, rewards: list[RewardOutput]) -> dict[str, float]:
-        """Compatibility wrapper around shared reward rate stats."""
-        return reward_rate_stats(rewards)
-
-    def _mean_payload_metrics(
-        self,
-        payloads: list[dict[str, Any]],
-        keys: tuple[str, ...],
-    ) -> dict[str, float]:
-        """Compatibility wrapper around shared payload averaging."""
-        return mean_payload_metrics(payloads, keys)
-
-    def _accumulate_totals(self, target: dict[str, float], update: dict[str, float]) -> None:
-        accumulate_totals(target, update)
-
-    def _mean(self, values: list[float] | list[int]) -> float:
-        return mean(values)
-
-    def _truncate(self, text: str, *, limit: int = 240) -> str:
-        return truncate_preview(text, limit=limit)
 
     def save_checkpoint(
         self,

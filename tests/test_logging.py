@@ -27,7 +27,7 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.run_logger import RunLogger, _factor_shared_messages
 from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
-from flashrl.framework.trainer.grpo import GRPOTrainer
+from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
 
 
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-9;]*m")
