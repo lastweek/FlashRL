@@ -24,25 +24,23 @@ from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.training import OptimizationResult
 from flashrl.framework.training.base import assemble_loss
 from flashrl.framework.training.optimization import optimize_grpo_batch
-from flashrl.framework.trainer.step_support import (
+from flashrl.framework.trainer.grpo.grpo_helpers import (
     STAGE_ORDER,
     StepContext,
     accumulate_totals,
     batch_items,
     compute_advantages,
-    mean,
     mean_payload_metrics,
     prompt_batch_size,
     reward_rate_stats,
-    summary_stats,
-    truncate_preview,
 )
+from flashrl.framework.utils import mean, summary_stats, truncate_preview
 
 if TYPE_CHECKING:
     from flashrl.framework.metrics import MetricsSink
     from flashrl.framework.run_logger import RunLogger
     from flashrl.framework.serving import ServingBackend
-    from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
+    from flashrl.framework.training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend
 
 
 class GRPOTrainer:
@@ -53,7 +51,7 @@ class GRPOTrainer:
         config: TrainerConfig,
         grpo_config: GrpoConfig,
         actor_backend: "ActorTrainingBackend",
-        reference_backend: "TrainingBackend | None",
+        reference_backend: "ReferenceTrainingBackend | None",
         serving_backend: "ServingBackend",
         reward_fn: UserDefinedReward,
         rollout_generator: UserDefinedRollout,

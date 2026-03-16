@@ -10,32 +10,18 @@ import torch.nn.functional as F
 
 from flashrl.framework.data_models import LearnerBatch
 from flashrl.framework.observability import StageResult, timed_call
+from flashrl.framework.training.loss_variants import (
+    LossAssemblyResult,
+    assemble_grpo_loss,
+)
 
 if TYPE_CHECKING:
     from flashrl.framework.config import GrpoConfig
     from flashrl.framework.training.base import ActorTrainingBackend, OptimizationResult, TrainingBackend
 
 
-@dataclass
-class LossAssemblyResult:
-    """Full response-only GRPO loss assembly output."""
-
-    loss: torch.Tensor
-    policy_loss: torch.Tensor
-    kl_divergence: torch.Tensor
-    response_tokens_total: int
-    importance_sampling_ratio_mean: float
-    importance_sampling_ratio_std: float
-    importance_sampling_ratio_min: float
-    importance_sampling_ratio_max: float
-    clip_fraction: float
-
-    def __iter__(self):
-        """Preserve tuple-style unpacking in tests."""
-        yield self.loss
-        yield self.policy_loss
-        yield self.kl_divergence
-        yield self.response_tokens_total
+# LossAssemblyResult and assemble_grpo_loss are now imported from
+# flashrl.framework.training.loss_variants to support multiple variants
 
 
 def reference_logits(
@@ -180,123 +166,9 @@ def compute_rollout_log_probs_from_actor(
     return computed
 
 
-def assemble_grpo_loss(
-    *,
-    input_ids: torch.Tensor,
-    attention_mask: torch.Tensor,
-    prompt_lengths: torch.Tensor,
-    actor_logits: torch.Tensor,
-    ref_logits: torch.Tensor | None,
-    rollout_response_log_probs: list[list[float]],
-    advantages: torch.Tensor,
-    kl_coefficient: float,
-    clip_ratio: float,
-) -> LossAssemblyResult:
-    """Assemble the response-only GRPO objective and count response tokens."""
-    shift_ids = input_ids[:, 1:]
-    shift_mask = attention_mask[:, 1:].float()
-
-    actor_token_log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
-    log_pi_theta = torch.gather(
-        actor_token_log_probs,
-        dim=-1,
-        index=shift_ids.unsqueeze(-1),
-    ).squeeze(-1)
-
-    response_mask = torch.zeros_like(shift_mask)
-    for index, prompt_length in enumerate(prompt_lengths.tolist()):
-        prompt_start = max(int(prompt_length) - 1, 0)
-        response_mask[index, prompt_start:] = shift_mask[index, prompt_start:]
-    response_token_count = response_mask.sum().clamp(min=1)
-    response_tokens_total = int(response_mask.sum().item())
-
-    if len(rollout_response_log_probs) != response_mask.shape[0]:
-        raise ValueError("rollout_response_log_probs must match the batch size.")
-
-    log_pi_old = torch.zeros(
-        response_mask.shape,
-        dtype=log_pi_theta.dtype,
-        device=log_pi_theta.device,
-    )
-    response_mask_bool = response_mask.to(dtype=torch.bool)
-    for index, sample_log_probs in enumerate(rollout_response_log_probs):
-        expected_tokens = int(response_mask_bool[index].sum().item())
-        if len(sample_log_probs) != expected_tokens:
-            raise ValueError(
-                "Each rollout_response_log_probs entry must match that sample's "
-                "response-token count."
-            )
-        if expected_tokens == 0:
-            continue
-        sample_tensor = torch.tensor(
-            sample_log_probs,
-            dtype=log_pi_theta.dtype,
-            device=log_pi_theta.device,
-        )
-        log_pi_old[index, response_mask_bool[index]] = sample_tensor
-
-    sample_advantages = advantages.to(
-        device=log_pi_theta.device,
-        dtype=log_pi_theta.dtype,
-    ).unsqueeze(-1)
-    expanded_advantages = sample_advantages.expand_as(response_mask)
-    ratio = torch.exp(log_pi_theta - log_pi_old)
-    clipped_ratio = torch.clamp(ratio, 1.0 - clip_ratio, 1.0 + clip_ratio)
-    surrogate_unclipped = ratio * expanded_advantages
-    surrogate_clipped = clipped_ratio * expanded_advantages
-    surrogate_objective = torch.minimum(surrogate_unclipped, surrogate_clipped)
-    masked_surrogate = surrogate_objective * response_mask
-    policy_loss = -masked_surrogate.sum() / response_token_count
-
-    ratio_values = ratio[response_mask_bool]
-    if ratio_values.numel() > 0:
-        importance_sampling_ratio_mean = float(ratio_values.mean().item())
-        importance_sampling_ratio_std = float(ratio_values.std(unbiased=False).item())
-        importance_sampling_ratio_min = float(ratio_values.min().item())
-        importance_sampling_ratio_max = float(ratio_values.max().item())
-        clip_fraction = float(
-            ((ratio_values < (1.0 - clip_ratio)) | (ratio_values > (1.0 + clip_ratio)))
-            .float()
-            .mean()
-            .item()
-        )
-    else:
-        importance_sampling_ratio_mean = 0.0
-        importance_sampling_ratio_std = 0.0
-        importance_sampling_ratio_min = 0.0
-        importance_sampling_ratio_max = 0.0
-        clip_fraction = 0.0
-
-    if ref_logits is not None:
-        reference_token_log_probs = F.log_softmax(ref_logits[:, :-1, :], dim=-1)
-        log_pi_ref = torch.gather(
-            reference_token_log_probs,
-            dim=-1,
-            index=shift_ids.unsqueeze(-1),
-        ).squeeze(-1)
-        reference_log_gap = log_pi_ref - log_pi_theta
-        kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
-        masked_kl = kl_terms * response_mask
-        kl_divergence = masked_kl.sum() / response_token_count
-    else:
-        kl_divergence = torch.zeros(
-            (),
-            device=log_pi_theta.device,
-            dtype=log_pi_theta.dtype,
-        )
-
-    loss = policy_loss + kl_coefficient * kl_divergence
-    return LossAssemblyResult(
-        loss=loss,
-        policy_loss=policy_loss,
-        kl_divergence=kl_divergence,
-        response_tokens_total=response_tokens_total,
-        importance_sampling_ratio_mean=importance_sampling_ratio_mean,
-        importance_sampling_ratio_std=importance_sampling_ratio_std,
-        importance_sampling_ratio_min=importance_sampling_ratio_min,
-        importance_sampling_ratio_max=importance_sampling_ratio_max,
-        clip_fraction=clip_fraction,
-    )
+# assemble_grpo_loss function is now in flashrl.framework.training.grpo.loss_variants
+# and supports multiple variants. The optimize_grpo_batch function below
+# will use the imported version automatically.
 
 
 def optimize_grpo_batch(

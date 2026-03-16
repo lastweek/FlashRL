@@ -3,7 +3,12 @@
 from __future__ import annotations
 
 from flashrl.framework.config import TrainingConfig
-from flashrl.framework.training.base import ActorTrainingBackend, OptimizationResult, TrainingBackend
+from flashrl.framework.training.base import (
+    ActorTrainingBackend,
+    OptimizationResult,
+    ReferenceTrainingBackend,
+    TrainingBackend,
+)
 from flashrl.framework.training.fsdp2 import FSDP2ReferenceBackend, FSDP2TrainingBackend
 from flashrl.framework.training.huggingface import (
     HuggingFaceReferenceBackend,
@@ -40,6 +45,7 @@ def create_training_backend(
 __all__ = [
     "TrainingBackend",
     "ActorTrainingBackend",
+    "ReferenceTrainingBackend",
     "OptimizationResult",
     "HuggingFaceTrainingBackend",
     "FSDP2TrainingBackend",

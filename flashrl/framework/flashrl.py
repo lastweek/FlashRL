@@ -39,7 +39,7 @@ from .reward.user_defined import UserDefinedReward
 from .rollout.user_defined import UserDefinedRollout
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
-from .training import ActorTrainingBackend, TrainingBackend, create_training_backend
+from .training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend, create_training_backend
 from .trainer.grpo import GRPOTrainer
 
 
@@ -167,7 +167,7 @@ class FlashRL:
         self.checkpointing_config = checkpointing_config or CheckpointingConfig()
 
         self._actor_backend: ActorTrainingBackend | None = None
-        self._reference_backend: TrainingBackend | None = None
+        self._reference_backend: ReferenceTrainingBackend | None = None
         self._serving_backend: ServingBackend | None = None
         self._rollout_generator: UserDefinedRollout | None = None
         self._reward: UserDefinedReward | None = None

@@ -226,6 +226,50 @@ class ActorTrainingBackend(TrainingBackend):
         self.optimizer.load_state_dict(state["optimizer_state_dict"])
 
 
+class ReferenceTrainingBackend(TrainingBackend):
+    """Frozen reference backend for stable policy evaluation.
+
+    The reference model is kept frozen during training and provides
+    stable log-probability targets for KL divergence computation.
+
+    This backend is optimized for inference-only operations and does
+    not support training methods like backward_step() or optimizer_step().
+    """
+
+    def __init__(self, config: TrainingConfig) -> None:
+        super().__init__(config, role="reference")
+
+    def forward_logits(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run forward pass with torch.no_grad() for efficiency."""
+        with torch.no_grad():
+            return self.model_copy.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+            ).logits
+
+    def backward_step(self, loss: torch.Tensor):
+        """Reference models do not support backward passes."""
+        raise NotImplementedError(
+            "Reference models are frozen and cannot perform backward passes"
+        )
+
+    def optimizer_step(self) -> None:
+        """Reference models do not support optimizer steps."""
+        raise NotImplementedError(
+            "Reference models are frozen and cannot perform optimizer steps"
+        )
+
+    def sync_weights_to(self, serving_backend: ServingBackend) -> None:
+        """Reference models do not sync weights to serving backends."""
+        raise NotImplementedError(
+            "Reference models do not sync weights to serving backends"
+        )
+
+
 def assemble_loss(
     *,
     input_ids: torch.Tensor,

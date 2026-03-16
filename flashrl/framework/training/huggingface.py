@@ -9,7 +9,7 @@ import torch
 from flashrl.framework.config import TrainingConfig
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.models.device import set_num_threads
-from flashrl.framework.training.base import ActorTrainingBackend, TrainingBackend
+from flashrl.framework.training.base import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend
 
 
 class HuggingFaceTrainingBackend(ActorTrainingBackend):
@@ -46,11 +46,11 @@ class HuggingFaceTrainingBackend(ActorTrainingBackend):
         )
 
 
-class HuggingFaceReferenceBackend(TrainingBackend):
+class HuggingFaceReferenceBackend(ReferenceTrainingBackend):
     """Single-process frozen reference backend backed by a local Hugging Face model."""
 
     def __init__(self, config: TrainingConfig) -> None:
-        super().__init__(config, role="reference")
+        super().__init__(config)
 
         set_num_threads(config.num_threads)
 

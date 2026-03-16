@@ -1,4 +1,4 @@
-"""Small helpers shared by GRPO step orchestration."""
+"""GRPO-specific helpers for training step orchestration."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from typing import Any, Iterable
 import torch
 
 from flashrl.framework.data_models import RewardOutput
+from flashrl.framework.utils import mean
 
 
 STAGE_ORDER = (
@@ -93,30 +94,12 @@ def compute_advantages(
 def batch_items(items: list[Any], batch_size: int) -> Iterable[list[Any]]:
     """Yield fixed-size slices from one list."""
     for index in range(0, len(items), batch_size):
-        yield items[index:index + batch_size]
+        yield items[index : index + batch_size]
 
 
 def prompt_batch_size(batch_size: int, group_size: int) -> int:
     """Return the number of unique prompts consumed by each grouped GRPO step."""
     return batch_size // group_size
-
-
-def summary_stats(prefix: str, values: list[float]) -> dict[str, float]:
-    """Compute mean/std/min/max stats for a list of floats."""
-    if not values:
-        return {
-            f"{prefix}_mean": 0.0,
-            f"{prefix}_std": 0.0,
-            f"{prefix}_min": 0.0,
-            f"{prefix}_max": 0.0,
-        }
-    tensor = torch.tensor(values, dtype=torch.float32)
-    return {
-        f"{prefix}_mean": float(tensor.mean().item()),
-        f"{prefix}_std": float(tensor.std(unbiased=False).item()),
-        f"{prefix}_min": float(tensor.min().item()),
-        f"{prefix}_max": float(tensor.max().item()),
-    }
 
 
 def reward_rate_stats(rewards: list[RewardOutput]) -> dict[str, float]:
@@ -155,18 +138,3 @@ def accumulate_totals(target: dict[str, float], update: dict[str, float]) -> Non
     """Accumulate a flat mapping of numeric totals."""
     for key, value in update.items():
         target[key] = target.get(key, 0.0) + float(value)
-
-
-def mean(values: list[float] | list[int]) -> float:
-    """Return the arithmetic mean or zero for an empty list."""
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
-
-
-def truncate_preview(text: str, *, limit: int = 240) -> str:
-    """Return a one-line preview clipped to the requested size."""
-    normalized = " ".join(text.strip().split())
-    if len(normalized) <= limit:
-        return normalized
-    return normalized[: limit - 3] + "..."
