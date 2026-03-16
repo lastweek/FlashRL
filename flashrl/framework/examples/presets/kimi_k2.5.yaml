@@ -1,0 +1,68 @@
+# Kimi K2.5 GRPO Implementation
+#
+# This preset implements techniques from Kimi K2.5:
+# - Hard token-level gradient mask (rejects tokens outside log-ratio band)
+# - Soft quadratic log-ratio penalty
+# - No explicit reference KL (uses log-ratio penalty instead)
+#
+# Research: "Kimi K2.5: Hard Token Masking with Log-Ratio Penalty"
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use the kimi_k2.5 preset
+  loss_preset: "kimi_k2.5"
+
+  # Core GRPO parameters
+  group_size: 2
+  kl_coefficient: 0.0  # No reference model KL penalty (uses log-ratio penalty instead)
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 0
+  do_sample: true
+
+  # Preset-applied parameters (do not override without loss_preset: "custom")
+  # The kimi_k2.5 preset applies:
+  # - clipping_mode: "hard_mask"
+  # - clip_log_ratio_alpha: -5.0 (lower bound for log-ratio)
+  # - clip_log_ratio_beta: 5.0 (upper bound for log-ratio)
+  # - kl_mode: "none" (no explicit reference KL)
+  # - log_ratio_penalty_coefficient: 0.01 (τ for soft penalty)
+  # - advantage_normalization: true
+  # - advantage_mode: "group_centered"
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_kimi_k25_checkpoint.pt
+
+admin:
+  admin_enabled: true

@@ -4,12 +4,46 @@ import os
 from pathlib import Path
 import re
 from typing import Any, Literal
+from enum import Enum
 
 import yaml
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 
 _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
+
+
+class LossPreset(str, Enum):
+    """GRPO loss preset options."""
+    GRPO_NAIVE = "grpo_naive"
+    PPO_CLIPPED = "ppo_clipped"
+    DEEPSEEK_V3_2 = "deepseek_v3.2"
+    KIMI_K2_5 = "kimi_k2.5"
+    GLM_5 = "glm_5"
+    MIMO_V2 = "mimo_v2"
+    CUSTOM = "custom"
+
+
+class ClippingMode(str, Enum):
+    """Clipping mode options for GRPO loss."""
+    SYMMETRIC = "symmetric"
+    ASYMMETRIC = "asymmetric"
+    HARD_MASK = "hard_mask"
+    NONE = "none"
+
+
+class KLMode(str, Enum):
+    """KL divergence computation mode options."""
+    NONE = "none"
+    K1 = "k1"
+    K3 = "k3"
+    UNBIASED = "unbiased"
+
+
+class AdvantageMode(str, Enum):
+    """Advantage normalization mode options."""
+    GROUP_CENTERED = "group_centered"
+    GROUP_NORMALIZED = "group_normalized"
 
 
 def _expand_env_vars(value: Any) -> Any:
@@ -137,8 +171,8 @@ class GrpoConfig(BaseConfig):
 
     model_config = ConfigDict(extra="forbid")
 
+    # Core GRPO parameters
     group_size: int = Field(default=2, ge=2)
-    clip_ratio: float = 0.2
     kl_coefficient: float = 0.0
     max_new_tokens: int = 512
     temperature: float = 1.0
@@ -147,21 +181,69 @@ class GrpoConfig(BaseConfig):
     do_sample: bool = True
     metadata: dict[str, Any] = Field(default_factory=dict)
 
-    # Loss variant selection
-    loss_variant: Literal[
-        "grpo_naive",
+    # ===== Loss Configuration =====
+    # Preset selection
+    loss_preset: Literal[
+        "grpo_naive",  # PPO-style symmetric clipping
         "ppo_clipped",  # Alias for grpo_naive
-        "deepseek_v3.2",
-        "kimi_k2.5",
-        "glm_5",
+        "deepseek_v3.2",  # Token-level GRPO + reference KL + sequence masking
+        "kimi_k2.5",  # Hard token clip + soft log-ratio penalty
+        "glm_5",  # Train/infer mismatch gate + teacher distillation
+        "mimo_v2",  # Teacher distillation + importance gating
+        "custom",  # Use explicit config parameters
     ] = "grpo_naive"
 
-    # Component-specific parameters
-    clip_ratio_lower: float | None = None  # For dual asymmetric clipping
-    clip_ratio_upper: float = 0.2  # For dual asymmetric clipping
-    kl_target: float = 0.05  # For hard KL constraint
-    entropy_coefficient: float = 0.01  # For entropy regularization
-    entropy_decay_rate: float = 0.995  # For decaying entropy
+    # Clipping mode
+    clipping_mode: Literal["symmetric", "asymmetric", "hard_mask", "none"] = "symmetric"
+    clip_ratio: float = 0.2  # For symmetric clipping
+    clip_ratio_lower: float | None = None  # For asymmetric clipping
+    clip_ratio_upper: float | None = None  # For asymmetric clipping
+    clip_log_ratio_alpha: float | None = None  # For Kimi hard token mask
+    clip_log_ratio_beta: float | None = None  # For Kimi hard token mask
+
+    # KL divergence computation
+    kl_mode: Literal["none", "k1", "k3", "unbiased"] = "k3"
+    kl_target: float | None = None  # For hard KL constraint
+    kl_hard_threshold: float | None = None  # Reject updates if KL exceeds
+
+    # Log-ratio penalty (Kimi-style)
+    log_ratio_penalty_coefficient: float = 0.0  # τ for soft quadratic penalty
+
+    # Train/infer mismatch gate (GLM-5 IcePop-style)
+    enable_train_infer_gate: bool = False
+    train_infer_gate_beta: float = 2.0  # β for pop(ρ, 1/β, β)
+
+    # Sequence-level stale-negative masking (DeepSeek-V3.2)
+    enable_stale_negative_mask: bool = False
+    stale_negative_mask_delta: float = 2.0  # δ threshold
+
+    # Importance weight gating (MiMo-style)
+    enable_importance_gating: bool = False
+    importance_epsilon_low: float | None = None  # ε_low
+    importance_epsilon_high: float | None = None  # ε_high
+
+    # Advantage normalization
+    advantage_normalization: bool = True
+    advantage_mode: Literal["group_centered", "group_normalized"] = "group_centered"
+
+    # Entropy regularization
+    entropy_coefficient: float = 0.0
+    entropy_decay_rate: float = 1.0  # 1.0 = no decay
+
+    # Cache for resolved preset (internal use only)
+    resolved_config_cache: "GrpoConfig | None" = Field(default=None, exclude=True)
+
+    def get_resolved_config(self) -> "GrpoConfig":
+        """Get the preset-resolved configuration, cached for efficiency.
+
+        This resolves the loss_preset to explicit parameters once and caches
+        the result to avoid repeated computation during training.
+        """
+        if self.resolved_config_cache is None:
+            from flashrl.framework.trainer.grpo.loss_variants import resolve_loss_preset
+
+            self.resolved_config_cache = resolve_loss_preset(self)
+        return self.resolved_config_cache
 
 
 class LoggingConfig(BaseConfig):

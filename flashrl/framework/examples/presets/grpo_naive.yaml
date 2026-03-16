@@ -1,0 +1,63 @@
+# GRPO Naive (PPO-style) - Classical Baseline
+#
+# This is the default preset when loss_preset is not specified.
+# Uses PPO-style symmetric clipping with a standard clip ratio.
+# Good baseline for most RLHF tasks.
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use the grpo_naive preset (PPO-style symmetric clipping)
+  loss_preset: "grpo_naive"
+
+  # Core GRPO parameters
+  group_size: 2
+  kl_coefficient: 0.0  # No reference model KL penalty
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 0
+  do_sample: true
+
+  # Preset-applied parameters (do not override without loss_preset: "custom")
+  # The grpo_naive preset applies:
+  # - clipping_mode: "symmetric"
+  # - clip_ratio: 0.2
+  # - kl_mode: "k3"
+  # - advantage_normalization: true
+  # - advantage_mode: "group_centered"
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_grpo_naive_checkpoint.pt
+
+admin:
+  admin_enabled: true

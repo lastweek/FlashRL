@@ -13,7 +13,6 @@ from flashrl.framework.trainer.grpo.grpo_helpers import (
     reward_rate_stats,
 )
 from flashrl.framework.trainer.grpo.loss_variants import (
-    LOSS_VARIANTS,
     LossAssemblyResult,
     assemble_grpo_loss,
 )
@@ -29,5 +28,4 @@ __all__ = [
     "STAGE_ORDER",
     "LossAssemblyResult",
     "assemble_grpo_loss",
-    "LOSS_VARIANTS",
 ]

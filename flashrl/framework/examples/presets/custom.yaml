@@ -1,0 +1,93 @@
+# Custom GRPO Configuration
+#
+# This example demonstrates loss_preset: "custom" which gives you full control
+# over all loss parameters. Use this for experimentation and research.
+#
+# With custom mode, you must explicitly configure all parameters.
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+reference:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use custom mode for full control
+  loss_preset: "custom"
+
+  # Core GRPO parameters
+  group_size: 4  # Larger group for this experiment
+  kl_coefficient: 0.05  # Moderate KL penalty
+  max_new_tokens: 256
+  temperature: 0.9  # Slightly lower temperature
+  top_p: 0.95
+  top_k: 0
+  do_sample: true
+
+  # Clipping configuration (custom experimental setup)
+  clipping_mode: "asymmetric"
+  clip_ratio_lower: 0.05  # Tighter lower bound
+  clip_ratio_upper: 0.15  # Tighter upper bound
+
+  # KL divergence configuration
+  kl_mode: "unbiased"  # Use unbiased estimator
+  kl_target: 0.1  # Target KL value
+  kl_hard_threshold: 0.5  # Reject updates if KL exceeds this
+
+  # Log-ratio penalty (Kimi-style)
+  log_ratio_penalty_coefficient: 0.005  # Small penalty
+
+  # Train/infer mismatch gate (GLM-5 style)
+  enable_train_infer_gate: false  # Disabled for this experiment
+
+  # Sequence-level stale-negative masking (DeepSeek-V3.2)
+  enable_stale_negative_mask: true
+  stale_negative_mask_delta: 2.5  # Higher threshold
+
+  # Importance weight gating (MiMo-style)
+  enable_importance_gating: false  # Disabled for this experiment
+
+  # Advantage processing
+  advantage_normalization: true
+  advantage_mode: "group_centered"
+
+  # Entropy regularization
+  entropy_coefficient: 0.005  # Small entropy bonus
+  entropy_decay_rate: 0.995  # Decay entropy over time
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_custom_checkpoint.pt
+
+admin:
+  admin_enabled: true

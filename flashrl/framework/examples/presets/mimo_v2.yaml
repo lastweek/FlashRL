@@ -1,0 +1,67 @@
+# MiMo-V2-Flash GRPO Implementation
+#
+# This preset implements techniques from MiMo-V2-Flash:
+# - Importance weight gating (gates tokens outside importance band)
+# - Teacher distillation
+# - No explicit clipping (uses gating instead)
+#
+# Research: "MiMo-V2-Flash: Importance-Gated Surrogate with Teacher Distillation"
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use the mimo_v2 preset
+  loss_preset: "mimo_v2"
+
+  # Core GRPO parameters
+  group_size: 2
+  kl_coefficient: 0.0  # No explicit KL
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 0
+  do_sample: true
+
+  # Preset-applied parameters (do not override without loss_preset: "custom")
+  # The mimo_v2 preset applies:
+  # - clipping_mode: "none" (uses importance gating instead)
+  # - kl_mode: "none"
+  # - enable_importance_gating: true
+  # - importance_epsilon_low: 0.8 (1.0 - 0.2)
+  # - importance_epsilon_high: 1.2 (1.0 + 0.2)
+  # - advantage_normalization: false (teacher provides advantage)
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_mimo_v2_checkpoint.pt
+
+admin:
+  admin_enabled: true

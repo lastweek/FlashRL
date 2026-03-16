@@ -1,0 +1,69 @@
+# GLM-5 GRPO Implementation
+#
+# This preset implements techniques from GLM-5:
+# - Train/infer mismatch gate (IcePop-style)
+# - Group-normalized advantages
+# - No explicit KL in reasoning RL backbone
+#
+# Research: "GLM-5: IcePop Train/Infer Mismatch Gate"
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use the glm_5 preset
+  loss_preset: "glm_5"
+
+  # Core GRPO parameters
+  group_size: 2
+  kl_coefficient: 0.0  # No explicit KL in reasoning RL backbone
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 0
+  do_sample: true
+
+  # Preset-applied parameters (do not override without loss_preset: "custom")
+  # The glm_5 preset applies:
+  # - clipping_mode: "asymmetric"
+  # - clip_ratio_lower: 0.1
+  # - clip_ratio_upper: 0.2
+  # - kl_mode: "none" (no explicit KL)
+  # - enable_train_infer_gate: true
+  # - train_infer_gate_beta: 2.0
+  # - advantage_normalization: true
+  # - advantage_mode: "group_normalized" (GLM uses group-normalized)
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_glm5_checkpoint.pt
+
+admin:
+  admin_enabled: true

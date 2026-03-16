@@ -1,0 +1,77 @@
+# DeepSeek-V3.2 GRPO Implementation
+#
+# This preset implements techniques from DeepSeek-V3.2:
+# - Dual asymmetric clipping (different bounds for positive/negative advantages)
+# - Unbiased token-level KL estimator
+# - Sequence-level stale-negative masking
+# - Entropy regularization
+#
+# Research: "DeepSeek-V3.2: Token-level GRPO with Unbiased KL Estimation"
+
+actor:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+reference:  # Required when kl_coefficient > 0
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  backend: huggingface
+  dp_size: 1
+
+serving:
+  model_name: Qwen/Qwen2.5-0.5B
+  num_threads: 1
+  debug_live_rollout: true
+
+trainer:
+  learning_rate: 1.0e-5
+  batch_size: 2
+  max_epochs: 1
+
+grpo:
+  # Use the deepseek_v3.2 preset
+  loss_preset: "deepseek_v3.2"
+
+  # Core GRPO parameters
+  group_size: 2
+  kl_coefficient: 0.1  # Reference KL penalty coefficient
+  max_new_tokens: 256
+  temperature: 1.0
+  top_p: 0.9
+  top_k: 0
+  do_sample: true
+
+  # Preset-applied parameters (do not override without loss_preset: "custom")
+  # The deepseek_v3.2 preset applies:
+  # - clipping_mode: "asymmetric"
+  # - clip_ratio_lower: 0.1 (for negative advantages)
+  # - clip_ratio_upper: 0.2 (for positive advantages)
+  # - kl_mode: "unbiased" (unbiased token-level KL estimator)
+  # - enable_stale_negative_mask: true
+  # - stale_negative_mask_delta: 2.0
+  # - advantage_normalization: true
+  # - advantage_mode: "group_centered"
+  # - entropy_coefficient: 0.01
+
+logging:
+  console: true
+  file: true
+  console_mode: compact
+
+metrics:
+  enabled: true
+  tensorboard:
+    enabled: true
+  pushgateway:
+    enabled: false
+    url: http://localhost:9091
+    job_name: flashrl
+
+checkpointing:
+  save_on_run_end: true
+  final_path: /tmp/flashrl_deepseek_v32_checkpoint.pt
+
+admin:
+  admin_enabled: true

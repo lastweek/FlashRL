@@ -274,8 +274,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=trainer.grpo_config,
     )
 
     assert loss_no_ref.item() == pytest.approx(policy_no_ref.item())
@@ -297,8 +296,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=trainer.grpo_config,
     )
 
     assert mutated_loss.item() == pytest.approx(loss_no_ref.item())
@@ -313,8 +311,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=ref_logits,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=trainer.grpo_config,
     )
 
     expected_total = (
@@ -359,8 +356,7 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=torch.tensor([1.0, -1.0], dtype=torch.float32),
-        kl_coefficient=0.0,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=trainer.grpo_config,
     )
 
     assert response_tokens_total == sum(len(sample) for sample in rollout_response_log_probs)
@@ -374,8 +370,7 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
             ref_logits=None,
             rollout_response_log_probs=[sample[:-1] for sample in rollout_response_log_probs],
             advantages=torch.tensor([1.0, -1.0], dtype=torch.float32),
-            kl_coefficient=0.0,
-            clip_ratio=trainer.grpo_config.clip_ratio,
+            config=trainer.grpo_config,
         )
 
 
@@ -412,8 +407,7 @@ def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=torch.zeros(2, dtype=torch.float32),
-        kl_coefficient=0.0,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=trainer.grpo_config,
     )
 
     assert policy_loss.item() == pytest.approx(0.0)

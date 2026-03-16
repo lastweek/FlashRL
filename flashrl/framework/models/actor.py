@@ -133,7 +133,7 @@ class ActorModel:
                     sample_input_ids[sample_mask.to(dtype=torch.bool)].tolist()
                 )
 
-            transition_scores = self._transition_scores(outputs)
+            transition_scores = self._extract_generation_logprobs(outputs)
             prompt_width = input_ids.shape[1]
             response_tokens = outputs.sequences[:, prompt_width:]
 
@@ -268,30 +268,42 @@ class ActorModel:
         if eos_token_id is not None:
             generation_kwargs.setdefault("eos_token_id", int(eos_token_id))
 
-    def _transition_scores(self, outputs: Any) -> torch.Tensor:
-        """Compute log-prob scores for each generated token."""
+    def _extract_generation_logprobs(self, outputs: Any) -> torch.Tensor:
+        """Extract log probabilities from HuggingFace generation output.
+
+        Uses HuggingFace's native compute_transition_scores() when available,
+        which is optimized. Falls back to efficient computation only when needed.
+
+        Args:
+            outputs: HuggingFace model.generate() output with output_scores=True
+
+        Returns:
+            Log probabilities for each generated token (batch_size, num_tokens)
+        """
+        # Use HuggingFace's native method (optimized) when available
         if hasattr(self.model, "compute_transition_scores"):
-            scores = self.model.compute_transition_scores(
+            return self.model.compute_transition_scores(
                 outputs.sequences,
                 outputs.scores,
                 normalize_logits=True,
-            )
-            return scores.detach().cpu()
+            ).detach().cpu()
 
+        # Fallback: No scores available (shouldn't happen with output_scores=True)
         if not outputs.scores:
             return torch.zeros(
                 (outputs.sequences.shape[0], 0),
                 dtype=torch.float32,
             )
 
+        # Manual computation (only when native method unavailable)
+        # Uses F.cross_entropy which only computes target token log probs
         transition_scores = []
         generated_tokens = outputs.sequences[:, -len(outputs.scores):]
         for step_index, step_scores in enumerate(outputs.scores):
-            token_logprobs = F.log_softmax(step_scores, dim=-1)
-            step_ids = generated_tokens[:, step_index].unsqueeze(-1)
-            transition_scores.append(
-                torch.gather(token_logprobs, dim=-1, index=step_ids).squeeze(-1)
-            )
+            step_ids = generated_tokens[:, step_index]
+            neg_log_probs = F.cross_entropy(step_scores, step_ids, reduction='none')
+            transition_scores.append(-neg_log_probs)
+
         return torch.stack(transition_scores, dim=1).detach().cpu()
 
     def _trim_generated_response(
@@ -402,7 +414,7 @@ class ActorModel:
                 raise error_holder["error"]
 
             outputs = outputs_holder["outputs"]
-            transition_scores = self._transition_scores(outputs)
+            transition_scores = self._extract_generation_logprobs(outputs)
             prompt_width = inputs["input_ids"].shape[1]
             response_tokens = outputs.sequences[:, prompt_width:]
             response_token_ids, response_token_logprobs = self._trim_generated_response(

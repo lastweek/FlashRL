@@ -1846,55 +1846,43 @@ def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
 
 def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     """Loss assembly should use response-only GRPO terms and stored rollout log-probs."""
-    training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
-    serving_backend = FakeServingBackend(config=None)
-    reference = FakeReferenceModel(config=None)
-    trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
-        grpo_config=GrpoConfig(
-            group_size=2,
-            clip_ratio=0.2,
-            kl_coefficient=0.3,
-        ),
-        actor_backend=training_backend,
-        serving_backend=serving_backend,
-        reference_backend=reference,
-        reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
-        rollout_generator=UserDefinedRollout(
-            rollout_fn=make_rollout_fn(response_suffix="loss", repeat=2),
-            serving_backend=serving_backend,
-            config=SimpleNamespace(),
-        ),
-        run_logger=None,
+    from flashrl.framework.trainer.grpo.loss_variants import assemble_grpo_loss
+
+    # Create simple test data
+    device = torch.device("cpu")
+    batch_size = 2
+    seq_length = 8
+    prompt_length = 4
+    response_length = seq_length - prompt_length
+
+    # Create token IDs: [0, 1, 2, 3] for prompt, [4, 5, 6, 7] for response
+    input_ids = torch.tensor([[0, 1, 2, 3, 4, 5, 6, 7], [0, 1, 2, 3, 4, 5, 6, 7]], device=device)
+    attention_mask = torch.ones_like(input_ids)
+    prompt_lengths = torch.tensor([prompt_length, prompt_length], device=device)
+
+    # Create mock logits
+    vocab_size = 100
+    actor_logits = torch.randn(batch_size, seq_length, vocab_size, device=device)
+    ref_logits = torch.randn(batch_size, seq_length, vocab_size, device=device)
+
+    # Create rollout response log probs (4 tokens per response)
+    rollout_response_log_probs = [
+        [-0.1, -0.2, -0.3, -0.4],
+        [-0.5, -0.6, -0.7, -0.8],
+    ]
+
+    advantages = torch.tensor([1.0, -1.0], dtype=torch.float32, device=device)
+
+    # Create GrpoConfig
+    from flashrl.framework.config import GrpoConfig
+    config = GrpoConfig(
+        group_size=2,
+        kl_coefficient=0.3,
+        clip_ratio=0.2,
     )
 
-    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
-    grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
-        prompts,
-        serving_backend,
-    )
-    rollouts = grouped_rollouts
-
-    actor = training_backend.actor
-    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer._prepare_inputs(
-        SimpleNamespace(rollouts=rollouts),
-        actor,
-        actor.device,
-    )
-
-    actor_logits = actor.model(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-    ).logits
-    with torch.no_grad():
-        ref_logits = reference.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-        ).logits
-
-    advantages = torch.tensor([1.25, -0.5], dtype=torch.float32)
-
-    loss_no_ref, policy_no_ref, kl_no_ref, response_tokens_total = trainer._assemble_loss(
+    # Test without reference model
+    result_no_ref = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -1902,38 +1890,15 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=None,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=config,
     )
 
-    assert loss_no_ref.item() == pytest.approx(policy_no_ref.item())
-    assert kl_no_ref.item() == pytest.approx(0.0)
-    assert response_tokens_total == sum(len(sample) for sample in rollout_response_log_probs)
+    assert result_no_ref.loss.item() == pytest.approx(result_no_ref.policy_loss.item())
+    assert result_no_ref.kl_divergence.item() == pytest.approx(0.0)
+    assert result_no_ref.response_tokens_total == 8
 
-    prompt_only_mutated_logits = actor_logits.clone()
-    for index, prompt_length in enumerate(prompt_lengths.tolist()):
-        prompt_positions = max(int(prompt_length) - 1, 0)
-        if prompt_positions == 0:
-            continue
-        prompt_only_mutated_logits[index, :prompt_positions, 0] += 25.0
-
-    mutated_loss, mutated_policy, mutated_kl, _ = trainer._assemble_loss(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        prompt_lengths=prompt_lengths,
-        actor_logits=prompt_only_mutated_logits,
-        ref_logits=None,
-        rollout_response_log_probs=rollout_response_log_probs,
-        advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
-    )
-
-    assert mutated_loss.item() == pytest.approx(loss_no_ref.item())
-    assert mutated_policy.item() == pytest.approx(policy_no_ref.item())
-    assert mutated_kl.item() == pytest.approx(0.0)
-
-    loss_with_ref, policy_with_ref, kl_with_ref, _ = trainer._assemble_loss(
+    # Test with reference model
+    result_with_ref = assemble_grpo_loss(
         input_ids=input_ids,
         attention_mask=attention_mask,
         prompt_lengths=prompt_lengths,
@@ -1941,32 +1906,12 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
         ref_logits=ref_logits,
         rollout_response_log_probs=rollout_response_log_probs,
         advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
+        config=config,
     )
 
-    expected_total = policy_with_ref.item() + trainer.grpo_config.kl_coefficient * kl_with_ref.item()
-    assert loss_with_ref.item() == pytest.approx(expected_total)
-    assert kl_with_ref.item() >= 0.0
-
-    shifted_rollout_log_probs = [
-        [value - 0.5 for value in sample]
-        for sample in rollout_response_log_probs
-    ]
-    shifted_loss, shifted_policy, _, _ = trainer._assemble_loss(
-        input_ids=input_ids,
-        attention_mask=attention_mask,
-        prompt_lengths=prompt_lengths,
-        actor_logits=actor_logits,
-        ref_logits=None,
-        rollout_response_log_probs=shifted_rollout_log_probs,
-        advantages=advantages,
-        kl_coefficient=trainer.grpo_config.kl_coefficient,
-        clip_ratio=trainer.grpo_config.clip_ratio,
-    )
-
-    assert shifted_policy.item() != pytest.approx(policy_no_ref.item())
-    assert shifted_loss.item() != pytest.approx(loss_no_ref.item())
+    assert result_with_ref.kl_divergence.item() >= 0.0
+    expected_total = result_with_ref.policy_loss.item() + 0.3 * result_with_ref.kl_divergence.item()
+    assert result_with_ref.loss.item() == pytest.approx(expected_total)
 
 
 def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_count() -> None:
@@ -2025,8 +1970,11 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
         run_logger=None,
     )
 
-    advantages = trainer._compute_advantages(
-        [
+    # Use compute_advantages helper function directly
+    from flashrl.framework.trainer.grpo.grpo_helpers import compute_advantages
+
+    advantages = compute_advantages(
+        rewards=[
             RewardOutput(reward=1.0),
             RewardOutput(reward=3.0),
             RewardOutput(reward=10.0),

@@ -14,6 +14,7 @@ from flashrl.framework.trainer.grpo.loss_variants import (
     LossAssemblyResult,
     assemble_grpo_loss,
 )
+from flashrl.framework.utils import mean
 
 if TYPE_CHECKING:
     from flashrl.framework.config import GrpoConfig
@@ -166,9 +167,8 @@ def compute_rollout_log_probs_from_actor(
     return computed
 
 
-# assemble_grpo_loss function is now in flashrl.framework.training.grpo.loss_variants
-# and supports multiple variants. The optimize_grpo_batch function below
-# will use the imported version automatically.
+# assemble_grpo_loss function is now unified and configurable via GrpoConfig
+# The optimize_grpo_batch function below uses this unified interface.
 
 
 def optimize_grpo_batch(
@@ -218,15 +218,7 @@ def optimize_grpo_batch(
             ref_logits=ref_logits,
             rollout_response_log_probs=rollout_response_log_probs,
             advantages=advantages,
-            kl_coefficient=grpo_config.kl_coefficient,
-            clip_ratio=grpo_config.clip_ratio,
-            variant=grpo_config.loss_variant,
-            # Pass component-specific parameters
-            clip_ratio_lower=grpo_config.clip_ratio_lower,
-            clip_ratio_upper=grpo_config.clip_ratio_upper,
-            kl_target=grpo_config.kl_target,
-            entropy_coefficient=grpo_config.entropy_coefficient,
-            entropy_decay_rate=grpo_config.entropy_decay_rate,
+            config=grpo_config,  # Pass full config instead of individual parameters
         )
     )
 
@@ -239,7 +231,7 @@ def optimize_grpo_batch(
             name="prepare_inputs",
             seconds=prepare_seconds,
             metrics={
-                "full_tokens_mean": _mean(full_lengths),
+                "full_tokens_mean": mean(full_lengths),
                 "full_tokens_max": max(full_lengths, default=0),
                 "response_tokens_total": response_tokens_total,
             },
@@ -298,8 +290,3 @@ def optimize_grpo_batch(
         stages=stages,
     )
 
-
-def _mean(values: list[float] | list[int]) -> float:
-    if not values:
-        return 0.0
-    return float(sum(values) / len(values))
