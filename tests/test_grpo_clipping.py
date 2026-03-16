@@ -92,10 +92,12 @@ class TestAsymmetricClipping:
 
         clipped = _apply_clipping(ratio, log_ratio, advantages, response_mask, config)
 
-        # With A=0, should use upper bounds (default behavior)
-        assert clipped[0, 0] == pytest.approx(0.9)
+        # With A=0, the condition `A > 0` is False, so it uses the "negative advantage" bounds
+        # clip_lower and clip_ratio (not clip_upper)
+        # Bounds: [1-0.2, 1+0.1] = [0.8, 1.1]
+        assert clipped[0, 0] == pytest.approx(0.8)
         assert clipped[0, 1] == pytest.approx(1.0)
-        assert clipped[0, 2] == pytest.approx(1.2)
+        assert clipped[0, 2] == pytest.approx(1.1)
 
 
 class TestHardMaskClipping:

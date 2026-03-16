@@ -5,95 +5,100 @@ import torch
 
 from flashrl.framework.config import GrpoConfig
 from flashrl.framework.trainer.grpo.loss_variants import (
-    _compute_stale_negative_mask,
+    _compute_off_policy_sequence_masking,
     _apply_importance_gating,
+    _apply_train_infer_gate,
 )
 
 
-class TestStaleNegativeMask:
-    """Test DeepSeek-V3.2 sequence-level stale negative masking."""
+class TestOffPolicySequenceMasking:
+    """Test DeepSeek-V3.2 sequence-level off-policy masking."""
 
-    def test_stale_negative_mask_masks_bad_sequences(self):
+    def test_off_policy_sequence_masking_masks_bad_sequences(self):
         """Test that sequences with negative advantage and high log-ratio are masked."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([[True, True, True]])
 
-        # Sequence with negative advantage and high mean log-ratio
-        log_ratio = torch.tensor([[0.0, 2.5, 2.5]])  # Mean = 1.67 > 2.0 (not quite)
+        # Sequence with negative advantage and high mean NEGATIVE log-ratio
+        # Note: mask uses NEGATIVE log-ratio, so we need negative values
+        log_ratio = torch.tensor([[0.0, -2.5, -2.5]])  # Mean = -1.67, so -mean = 1.67 < 2.0 (not quite)
         advantages = torch.tensor([-1.0])
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
-        # Should NOT be masked (mean log-ratio = 1.67 < 2.0)
+        # Should NOT be masked (mean negative log-ratio = 1.67 < 2.0)
         assert mask[0] == pytest.approx(1.0)
 
-    def test_stale_negative_mask_with_high_log_ratio(self):
+    def test_off_policy_sequence_masking_with_high_log_ratio(self):
         """Test masking when log-ratio exceeds delta threshold."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([[True, True, True]])
 
         # Sequence with negative advantage and very high mean log-ratio
-        log_ratio = torch.tensor([[2.5, 2.5, 2.5]])  # Mean = 2.5 > 2.0
+        # Note: mask computes NEGATIVE log-ratio, so positive log-ratio becomes negative
+        # For masking, we need: -mean(log_ratio) > delta
+        # If we want -mean(log_ratio) = 2.5 > 2.0, we need mean(log_ratio) = -2.5
+        log_ratio = torch.tensor([[-2.5, -2.5, -2.5]])  # Mean = -2.5, so -mean = 2.5 > 2.0
         advantages = torch.tensor([-1.0])
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
-        # Should be masked (negative advantage + high log-ratio)
+        # Should be masked (negative advantage + high negative log-ratio)
         assert mask[0] == pytest.approx(0.0)
 
-    def test_stale_negative_mask_does_not_mask_positive_advantages(self):
+    def test_off_policy_sequence_masking_does_not_mask_positive_advantages(self):
         """Test that sequences with positive advantages are not masked."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([[True, True, True]])
 
-        # Sequence with positive advantage and high log-ratio
-        log_ratio = torch.tensor([[2.5, 2.5, 2.5]])  # Mean = 2.5 > 2.0
+        # Sequence with positive advantage and high negative log-ratio
+        log_ratio = torch.tensor([[-2.5, -2.5, -2.5]])  # Mean = -2.5, so -mean = 2.5 > 2.0
         advantages = torch.tensor([1.0])  # Positive advantage
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
         # Should NOT be masked (positive advantage)
         assert mask[0] == pytest.approx(1.0)
 
-    def test_stale_negative_mask_does_not_mask_low_log_ratio(self):
+    def test_off_policy_sequence_masking_does_not_mask_low_log_ratio(self):
         """Test that sequences with low log-ratio are not masked."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([[True, True, True]])
 
-        # Sequence with negative advantage but low log-ratio
-        log_ratio = torch.tensor([[0.5, 0.5, 0.5]])  # Mean = 0.5 < 2.0
+        # Sequence with negative advantage but low negative log-ratio
+        log_ratio = torch.tensor([[-0.5, -0.5, -0.5]])  # Mean = -0.5, so -mean = 0.5 < 2.0
         advantages = torch.tensor([-1.0])
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
-        # Should NOT be masked (low log-ratio)
+        # Should NOT be masked (low negative log-ratio)
         assert mask[0] == pytest.approx(1.0)
 
-    def test_stale_negative_mask_multiple_sequences(self):
-        """Test stale negative mask with multiple sequences."""
+    def test_off_policy_sequence_masking_multiple_sequences(self):
+        """Test off-policy sequence mask with multiple sequences."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([
             [True, True, True],
@@ -102,41 +107,43 @@ class TestStaleNegativeMask:
         ])
 
         # Three sequences with different characteristics
+        # Note: mask uses NEGATIVE log-ratio
         log_ratio = torch.tensor([
-            [2.5, 2.5, 2.5],  # Seq 0: high log-ratio
-            [0.5, 0.5, 0.5],  # Seq 1: low log-ratio
-            [2.5, 2.5, 2.5],  # Seq 2: high log-ratio
+            [-2.5, -2.5, -2.5],  # Seq 0: high negative log-ratio (-mean = 2.5 > 2.0)
+            [-0.5, -0.5, -0.5],  # Seq 1: low negative log-ratio (-mean = 0.5 < 2.0)
+            [-2.5, -2.5, -2.5],  # Seq 2: high negative log-ratio (-mean = 2.5 > 2.0)
         ])
         advantages = torch.tensor([-1.0, -1.0, 1.0])  # Seq 2 has positive advantage
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
-        # Seq 0: masked (negative + high log-ratio)
+        # Seq 0: masked (negative + high negative log-ratio)
         assert mask[0] == pytest.approx(0.0)
-        # Seq 1: not masked (negative + low log-ratio)
+        # Seq 1: not masked (negative + low negative log-ratio)
         assert mask[1] == pytest.approx(1.0)
         # Seq 2: not masked (positive advantage)
         assert mask[2] == pytest.approx(1.0)
 
-    def test_stale_negative_mask_with_response_mask(self):
+    def test_off_policy_sequence_masking_with_response_mask(self):
         """Test that response mask is respected."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         response_mask_bool = torch.tensor([[True, False, True]])  # Middle token masked
 
-        # High log-ratio but one token is masked
-        log_ratio = torch.tensor([[2.5, 2.5, 2.5]])  # Mean of unmasked = 2.5 > 2.0
+        # High negative log-ratio but one token is masked
+        # Mean of [-2.5, -2.5] = -2.5, so -mean = 2.5 > 2.0
+        log_ratio = torch.tensor([[-2.5, -2.5, -2.5]])
         advantages = torch.tensor([-1.0])
 
-        mask = _compute_stale_negative_mask(
+        mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, config
         )
 
-        # Should be masked (negative advantage + high mean log-ratio)
+        # Should be masked (negative advantage + high mean negative log-ratio)
         assert mask[0] == pytest.approx(0.0)
 
 
@@ -244,9 +251,7 @@ class TestTrainInferGate:
 
         ratio = torch.tensor([0.5, 1.0, 1.5])
 
-        gated = torch.ops.flashrl_framework.trainer.grpo.loss_variants._apply_train_infer_gate(
-            ratio, config
-        )
+        gated = _apply_train_infer_gate(ratio, config)
 
         # Current implementation returns ratio unchanged
         assert gated[0] == pytest.approx(0.5)
@@ -257,11 +262,11 @@ class TestTrainInferGate:
 class TestGateCombinations:
     """Test combinations of different gates."""
 
-    def test_stale_negative_mask_and_importance_gating_interaction(self):
-        """Test interaction between stale negative mask and importance gating."""
+    def test_off_policy_sequence_masking_and_importance_gating_interaction(self):
+        """Test interaction between off-policy sequence mask and importance gating."""
         stale_config = GrpoConfig(
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0
         )
         gate_config = GrpoConfig(
             enable_importance_gating=True,
@@ -271,12 +276,13 @@ class TestGateCombinations:
 
         response_mask_bool = torch.tensor([[True, True, True]])
 
-        # Sequence that would be masked by stale negative mask
-        log_ratio = torch.tensor([[2.5, 2.5, 2.5]])
+        # Sequence that would be masked by off-policy sequence mask
+        # Note: Need negative log-ratio for off-policy mask to trigger
+        log_ratio = torch.tensor([[-2.5, -2.5, -2.5]])  # Mean = -2.5, so -mean = 2.5 > 2.0
         advantages = torch.tensor([-1.0])
 
-        # Apply stale negative mask
-        stale_mask = _compute_stale_negative_mask(
+        # Apply off-policy sequence mask
+        stale_mask = _compute_off_policy_sequence_masking(
             log_ratio, advantages, response_mask_bool, stale_config
         )
 
@@ -294,13 +300,13 @@ class TestGateCombinations:
     def test_multiple_gates_can_be_combined(self):
         """Test that multiple gates can be enabled simultaneously."""
         config = GrpoConfig(
-            enable_stale_negative_mask=True,
+            enable_off_policy_sequence_masking=True,
             enable_importance_gating=True,
-            stale_negative_mask_delta=2.0,
+            off_policy_sequence_masking_delta=2.0,
             importance_epsilon_low=0.8,
             importance_epsilon_high=1.2
         )
 
         # Both gates should be enabled
-        assert config.enable_stale_negative_mask is True
+        assert config.enable_off_policy_sequence_masking is True
         assert config.enable_importance_gating is True

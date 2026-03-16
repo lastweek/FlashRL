@@ -60,7 +60,7 @@ def load_script_module(
 
 reasoning_example = load_script_module(
     "flashrl_reasoning_math_train_for_metrics",
-    "flashrl/framework/examples/reasoning-math/train.py",
+    "flashrl/framework/examples/math/train.py",
     aliases=("train",),
 )
 
@@ -1939,7 +1939,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
 
     dataset = reasoning_example.build_math_train_dataset()
     trainer = FlashRL(
-        config_path="flashrl/framework/examples/reasoning-math/config.yaml",
+        config_path="flashrl/framework/examples/math/config.yaml",
         rollout_fn=reasoning_example.reasoning_rollout_fn,
         reward_fn=reasoning_example.math_reward_fn,
     )
@@ -2017,11 +2017,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert not Path("examples").exists()
     assert Path("flashrl/framework/examples/__init__.py").exists()
     assert not Path("flashrl/framework/examples/reasoning").exists()
-    assert Path("flashrl/framework/examples/reasoning-math/train.py").exists()
-    assert not Path("flashrl/framework/examples/reasoning-math/workflow.py").exists()
-    assert Path("flashrl/framework/examples/reasoning-math/eval.py").exists()
-    assert Path("flashrl/framework/examples/reasoning-math/config.yaml").exists()
-    assert Path("flashrl/framework/examples/reasoning-math/config_vllm.yaml").exists()
+    assert Path("flashrl/framework/examples/math/train.py").exists()
+    assert not Path("flashrl/framework/examples/math/workflow.py").exists()
+    assert Path("flashrl/framework/examples/math/eval.py").exists()
+    assert Path("flashrl/framework/examples/math/config.yaml").exists()
+    assert Path("flashrl/framework/examples/math/config_vllm.yaml").exists()
     assert Path("flashrl/framework/examples/reasoning-code/train.py").exists()
     assert not Path("flashrl/framework/examples/reasoning-code/workflow.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/eval.py").exists()
@@ -2030,7 +2030,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("flashrl/framework/examples/reasoning-code/config_vllm.yaml").exists()
 
     docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
-    reasoning_docs = Path("flashrl/framework/examples/reasoning-math/README.md").read_text(
+    reasoning_docs = Path("flashrl/framework/examples/math/README.md").read_text(
         encoding="utf-8"
     )
     reasoning_code_docs = Path(
@@ -2040,18 +2040,18 @@ def test_observability_stack_files_and_docs_exist() -> None:
     )
     root_docs = Path("README.md").read_text(encoding="utf-8")
     assert "tensorboard --logdir logs" in root_docs
-    assert "python3 flashrl/framework/examples/reasoning-math/train.py" in root_docs
+    assert "python3 flashrl/framework/examples/math/train.py" in root_docs
     assert "python3 -m flashrl.framework.examples.reasoning.train" not in root_docs
     assert "TensorBoard is the default local metrics path." in docs
     assert "metrics.pushgateway.enabled: true" in docs
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
-    assert "reasoning-math/README.md" in docs
+    assert "math/README.md" in docs
     assert "reasoning-code/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
-    assert "python3 flashrl/framework/examples/reasoning-math/train.py" in reasoning_docs
-    assert "python3 flashrl/framework/examples/reasoning-math/eval.py" in reasoning_docs
+    assert "python3 flashrl/framework/examples/math/train.py" in reasoning_docs
+    assert "python3 flashrl/framework/examples/math/eval.py" in reasoning_docs
     assert "FlashRL.from_yaml(...)" in reasoning_docs
     assert "python3 -m flashrl.framework.flashrl --config" not in reasoning_docs
     assert "config_vllm.yaml" in reasoning_docs
@@ -2092,11 +2092,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "FLASHRL_VLLM_PYTHON" in docs
     assert "optional `vllm` extra" in docs
 
-    example_yaml = Path("flashrl/framework/examples/reasoning-math/config.yaml").read_text(
+    example_yaml = Path("flashrl/framework/examples/math/config.yaml").read_text(
         encoding="utf-8"
     )
     vllm_example_yaml = Path(
-        "flashrl/framework/examples/reasoning-math/config_vllm.yaml"
+        "flashrl/framework/examples/math/config_vllm.yaml"
     ).read_text(
         encoding="utf-8"
     )

@@ -100,7 +100,7 @@ def _load_dataset_module():
         from datasets import load_dataset
     except ImportError as exc:  # pragma: no cover - exercised in live example usage
         raise RuntimeError(
-            "flashrl/framework/examples/reasoning-math requires the `datasets` package to load math datasets. "
+            "flashrl/framework/examples/math requires the `datasets` package to load math datasets. "
             "Install project dependencies or `pip install datasets`."
         ) from exc
     return load_dataset
@@ -376,26 +376,72 @@ def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
     return {}
 
 
-def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
-    """Compute the math reward from rollout metadata.
+def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
+    """Compute reasoning reward from <thinking> tags in response.
+
+    Evaluates reasoning quality based on:
+    1. Presence of <thinking> tags
+    2. Content quality within tags
+    3. Logical structure of reasoning (numbered lists, bullets, length)
+
+    Returns score in [0, 1] range.
+    """
+    text = rollout.text
+
+    # Extract thinking content
+    thinking_pattern = r'<thinking>(.*?)</thinking>'
+    matches = re.findall(thinking_pattern, text, re.IGNORECASE | re.DOTALL)
+
+    if not matches:
+        # No thinking tags found
+        return RewardOutput(
+            reward=0.0,
+            metadata={"reasoning_score": 0.0, "thinking_tags_found": False}
+        )
+
+    thinking_content = matches[0].strip()
+    if not thinking_content:
+        # Empty thinking tags
+        return RewardOutput(
+            reward=0.0,
+            metadata={"reasoning_score": 0.0, "thinking_tags_found": True, "empty": True}
+        )
+
+    # Score based on content quality
+    # Look for structural indicators: numbered steps, bullet points, clear logic
+    score = 0.5  # Base score for having tags
+
+    # Bonus for structured reasoning (numbered lists, bullets)
+    if re.search(r'\d+\.', thinking_content) or re.search(r'[-*]', thinking_content):
+        score += 0.2
+
+    # Bonus for length (more reasoning is generally better)
+    if len(thinking_content) > 100:
+        score += 0.2
+    elif len(thinking_content) > 50:
+        score += 0.1
+
+    # Cap at 1.0
+    score = min(score, 1.0)
+
+    return RewardOutput(
+        reward=score,
+        metadata={
+            "reasoning_score": score,
+            "thinking_tags_found": True,
+            "thinking_length": len(thinking_content)
+        },
+    )
+
+
+def _compute_math_score(rollout: RolloutOutput) -> RewardOutput:
+    """Compute pure math score (existing logic).
 
     Reward matrix:
-    - `1.1`: one non-empty `<answer>` block parses, the normalized answer
-      matches the prompt's `final_answer`, and the full response is exactly one
-      non-empty `<think>...</think><answer>...</answer>` sequence.
-      Example: `<think>...</think><answer>42</answer>`.
-    - `1.0`: the normalized answer still matches, but the strict format check
-      fails. Example: `<think>...</think><answer>42</answer> extra`.
-    - `0.1`: the strict format check passes, but the parsed answer is wrong.
-      Example: `<think>...</think><answer>41</answer>`.
-    - `0.0`: no single non-empty answer block can be parsed, or both checks
-      fail. Example: `<answer>42</answer><answer>42</answer>` or `<answer>42`.
-
-    `answer_parse_pass` only checks whether one non-empty answer block can be
-    extracted. `accuracy_pass` compares the normalized parsed answer against the
-    prompt metadata. `format_pass` is stricter: it requires exactly one
-    non-empty `<think>` block followed by exactly one non-empty `<answer>` block,
-    no non-whitespace text outside those tags, and no truncation.
+    - `1.1`: strict correct (format + accuracy)
+    - `1.0`: correct but malformed
+    - `0.1`: strict wrong (format only)
+    - `0.0`: invalid or both checks fail
     """
     text = rollout.text
     prompt_metadata = _prompt_metadata_from_rollout(rollout)
@@ -413,8 +459,8 @@ def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     has_non_empty_strict_blocks = bool(think_content and answer_content)
 
     # Format stays strict on purpose:
-    # - `<think>...</think><answer>42</answer>` can earn the `+0.1` bonus
-    # - `<think>...</think><answer>42</answer> extra` cannot
+    # - `...<answer>42</answer>` can earn the `+0.1` bonus
+    # - `...<answer>42</answer> extra` cannot
     # - duplicate tags, missing close tags, or `finish_reason == "length"` cannot
     format_pass = bool(
         strict_match is not None
@@ -429,7 +475,7 @@ def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     normalized_answer = _normalize_math_answer(parsed_answer or "")
     # Accuracy is intentionally independent from strict format:
     # - `<answer>$42.00.</answer>` still matches `42` after normalization
-    # - `<think>...</think><answer>42</answer> extra` still earns `1.0`
+    # - `...<answer>42</answer> extra` still earns `1.0`
     accuracy_pass = bool(answer_parse_pass and normalized_answer == expected_answer)
 
     # Reward examples:
@@ -458,6 +504,48 @@ def math_reward_fn(rollout: RolloutOutput) -> RewardOutput:
             "answer_char_count": len(answer_content),
         },
     )
+
+
+def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math") -> RewardOutput:
+    """Compute math reward from rollout metadata.
+
+    Args:
+        rollout: Rollout output with completion and metadata
+        training_mode: "math" for answer-only, "reasoning" for reasoning + answer
+
+    Returns:
+        RewardOutput with combined score (0-1.1 range for math mode, 0-1.0 for reasoning mode)
+
+    In "math" mode: Uses existing 4-tier reward system (1.1, 1.0, 0.1, 0.0)
+    In "reasoning" mode: Combines 70% reasoning score + 30% math score
+    """
+    if training_mode == "reasoning":
+        # Reasoning mode: Combine reasoning + math scores
+        reasoning_result = reasoning_reward_fn(rollout)
+        math_result = _compute_math_score(rollout)
+
+        # Combine: 70% reasoning + 30% math
+        combined_score = (
+            0.7 * reasoning_result.reward +
+            0.3 * math_result.reward
+        )
+
+        # Merge metadata
+        metadata = {
+            **reasoning_result.metadata,
+            **math_result.metadata,
+            "training_mode": "reasoning",
+            "combined_score": combined_score
+        }
+
+        return RewardOutput(
+            reward=combined_score,
+            metadata=metadata
+        )
+    else:
+        # Math mode: Use existing logic
+        return _compute_math_score(rollout)
+
 
 
 # Future code reasoning can live below as explicit `code_*` helpers later.
@@ -541,7 +629,7 @@ def prepare_reasoning_environment(config_path: str) -> None:
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the math example CLI parser."""
     parser = argparse.ArgumentParser(
-        description="Run the FlashRL reasoning-math example."
+        description="Run the FlashRL math example."
     )
     parser.add_argument(
         "--config",
@@ -560,11 +648,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional number of training questions to load.",
     )
+    parser.add_argument(
+        "--training-mode",
+        choices=["math", "reasoning"],
+        default="math",
+        help="Training mode: 'math' for pure math capability, 'reasoning' for reasoning quality + math",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the reasoning-math example from the selected FlashRL profile."""
+    """Run the math example from the selected FlashRL profile."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
     prepare_reasoning_environment(args.config)
@@ -572,14 +666,18 @@ def main(argv: list[str] | None = None) -> int:
     flashrl: FlashRL | None = None
     try:
         dataset = build_math_train_dataset(dataset=args.dataset, limit=args.train_limit)
+        # Create reward function wrapper that captures training_mode
+        def reward_fn_with_mode(rollout: RolloutOutput) -> RewardOutput:
+            return math_reward_fn(rollout, training_mode=args.training_mode)
+
         flashrl = FlashRL(
             config_path=args.config,
             rollout_fn=reasoning_rollout_fn,
-            reward_fn=math_reward_fn,
+            reward_fn=reward_fn_with_mode,
         )
         flashrl.train(dataset)
     except Exception as exc:
-        print(f"\nFlashRL reasoning-math example failed: {exc}", file=sys.stderr)
+        print(f"\nFlashRL math example failed: {exc}", file=sys.stderr)
         print(
             "\nNote: This example loads a base Qwen checkpoint and a Hugging Face math dataset.",
             file=sys.stderr,

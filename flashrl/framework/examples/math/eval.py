@@ -1,4 +1,4 @@
-"""Held-out evaluation for the strict reasoning-math example."""
+"""Held-out evaluation for the strict math example."""
 
 from __future__ import annotations
 
@@ -79,7 +79,7 @@ def evaluate_model(
 def build_argument_parser() -> argparse.ArgumentParser:
     """Build the CLI parser for held-out evaluation."""
     parser = argparse.ArgumentParser(
-        description="Evaluate the FlashRL reasoning-math example."
+        description="Evaluate the FlashRL math example."
     )
     parser.add_argument(
         "--config",
@@ -145,7 +145,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:
-        print(f"FlashRL reasoning-math evaluation failed: {exc}", file=sys.stderr)
+        print(f"FlashRL math evaluation failed: {exc}", file=sys.stderr)
         return 1
     finally:
         if flashrl is not None:

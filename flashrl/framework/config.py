@@ -213,9 +213,9 @@ class GrpoConfig(BaseConfig):
     enable_train_infer_gate: bool = False
     train_infer_gate_beta: float = 2.0  # β for pop(ρ, 1/β, β)
 
-    # Sequence-level stale-negative masking (DeepSeek-V3.2)
-    enable_stale_negative_mask: bool = False
-    stale_negative_mask_delta: float = 2.0  # δ threshold
+    # Sequence-level off-policy masking (DeepSeek-V3.2)
+    enable_off_policy_sequence_masking: bool = False
+    off_policy_sequence_masking_delta: float = 2.0  # δ threshold
 
     # Importance weight gating (MiMo-style)
     enable_importance_gating: bool = False

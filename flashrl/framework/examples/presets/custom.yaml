@@ -56,9 +56,9 @@ grpo:
   # Train/infer mismatch gate (GLM-5 style)
   enable_train_infer_gate: false  # Disabled for this experiment
 
-  # Sequence-level stale-negative masking (DeepSeek-V3.2)
-  enable_stale_negative_mask: true
-  stale_negative_mask_delta: 2.5  # Higher threshold
+  # Sequence-level off-policy masking (DeepSeek-V3.2)
+  enable_off_policy_sequence_masking: true
+  off_policy_sequence_masking_delta: 2.5  # Higher threshold
 
   # Importance weight gating (MiMo-style)
   enable_importance_gating: false  # Disabled for this experiment

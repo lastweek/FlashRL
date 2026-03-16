@@ -3,14 +3,14 @@
 Examples live in their own folders and can include a training entrypoint,
 evaluation helpers, one or more YAML configs, and an example-specific README.
 
-## Reasoning-Math Example
+## Math Example
 
-The reasoning-math example is a strict R1-Zero-style math prototype with explicit
+The math example is a strict R1-Zero-style math prototype with explicit
 dataset selection. It trains a base Qwen model with rule-based rewards, no
 system prompt, and a strict `<think>...</think><answer>...</answer>` output
 contract.
 
-See [flashrl/framework/examples/reasoning-math/README.md](reasoning-math/README.md) for:
+See [flashrl/framework/examples/math/README.md](math/README.md) for:
 
 - supported run modes
 - the CLI-first example workflow

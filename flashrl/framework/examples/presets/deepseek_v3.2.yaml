@@ -45,12 +45,11 @@ grpo:
 
   # Preset-applied parameters (do not override without loss_preset: "custom")
   # The deepseek_v3.2 preset applies:
-  # - clipping_mode: "asymmetric"
-  # - clip_ratio_lower: 0.1 (for negative advantages)
-  # - clip_ratio_upper: 0.2 (for positive advantages)
+  # - clipping_mode: "symmetric"
+  # - clip_ratio: 0.2 (epsilon for [1-ε, 1+ε] bounds)
   # - kl_mode: "unbiased" (unbiased token-level KL estimator)
-  # - enable_stale_negative_mask: true
-  # - stale_negative_mask_delta: 2.0
+  # - enable_off_policy_sequence_masking: true
+  # - off_policy_sequence_masking_delta: 2.0
   # - advantage_normalization: true
   # - advantage_mode: "group_centered"
   # - entropy_coefficient: 0.01

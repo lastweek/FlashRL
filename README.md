@@ -44,13 +44,13 @@ rm -rf .cache/
 
 ## Quick Start
 
-### Run the Reasoning-Math Example
+### Run the Math Example
 
-The reasoning-math example now lives in its own folder with a thin training script
+The math example now lives in its own folder with a thin training script
 and a YAML config:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py
+python3 flashrl/framework/examples/math/train.py
 ```
 
 See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.

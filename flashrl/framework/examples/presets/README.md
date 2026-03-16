@@ -9,7 +9,7 @@ Classical PPO-style symmetric clipping. Good baseline for most RLHF tasks.
 
 ### `deepseek_v3.2`
 DeepSeek-V3.2 implementation with:
-- Dual asymmetric clipping (different bounds for positive/negative advantages)
+- PPO-style symmetric clipping (standard [1-ε, 1+ε] bounds with ε=0.2)
 - Unbiased token-level KL estimator
 - Sequence-level stale-negative masking
 - Entropy regularization

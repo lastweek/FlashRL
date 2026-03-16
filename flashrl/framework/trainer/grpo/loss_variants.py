@@ -50,8 +50,8 @@ class GrpoPreset:
     log_ratio_penalty_coefficient: float = 0.0
     enable_train_infer_gate: bool = False
     train_infer_gate_beta: float = 2.0
-    enable_stale_negative_mask: bool = False
-    stale_negative_mask_delta: float = 2.0
+    enable_off_policy_sequence_masking: bool = False
+    off_policy_sequence_masking_delta: float = 2.0
     enable_importance_gating: bool = False
     importance_epsilon_low: float | None = None
     importance_epsilon_high: float | None = None
@@ -93,8 +93,8 @@ def _check_preset_conflicts(config: GrpoConfig, preset: GrpoPreset) -> list[str]
     if config.enable_train_infer_gate != preset.enable_train_infer_gate:
         conflicts.append("enable_train_infer_gate")
 
-    if config.enable_stale_negative_mask != preset.enable_stale_negative_mask:
-        conflicts.append("enable_stale_negative_mask")
+    if config.enable_off_policy_sequence_masking != preset.enable_off_policy_sequence_masking:
+        conflicts.append("enable_off_policy_sequence_masking")
 
     if config.enable_importance_gating != preset.enable_importance_gating:
         conflicts.append("enable_importance_gating")
@@ -181,11 +181,11 @@ def _merge_preset_with_config(preset: GrpoPreset, config: GrpoConfig) -> GrpoCon
         config_dict["train_infer_gate_beta"] = preset.train_infer_gate_beta
 
     if (
-        preset.enable_stale_negative_mask
-        and not config_dict["enable_stale_negative_mask"]
+        preset.enable_off_policy_sequence_masking
+        and not config_dict["enable_off_policy_sequence_masking"]
     ):
-        config_dict["enable_stale_negative_mask"] = True
-        config_dict["stale_negative_mask_delta"] = preset.stale_negative_mask_delta
+        config_dict["enable_off_policy_sequence_masking"] = True
+        config_dict["off_policy_sequence_masking_delta"] = preset.off_policy_sequence_masking_delta
 
     if preset.enable_importance_gating and not config_dict["enable_importance_gating"]:
         config_dict["enable_importance_gating"] = True
@@ -244,12 +244,11 @@ def resolve_loss_preset(config: GrpoConfig) -> GrpoConfig:
             advantage_mode="group_centered",
         ),
         "deepseek_v3.2": GrpoPreset(
-            clipping_mode="asymmetric",
-            clip_ratio_lower=0.1,
-            clip_ratio_upper=0.2,
+            clipping_mode="symmetric",
+            clip_ratio=0.2,
             kl_mode="unbiased",  # Unbiased token-level KL estimator
-            enable_stale_negative_mask=True,
-            stale_negative_mask_delta=2.0,
+            enable_off_policy_sequence_masking=True,
+            off_policy_sequence_masking_delta=2.0,
             advantage_normalization=True,
             advantage_mode="group_centered",
             entropy_coefficient=0.01,
@@ -590,13 +589,13 @@ def _get_clip_bounds(config: GrpoConfig) -> tuple[float, float]:
         return 0.0, 1.0
 
 
-def _compute_stale_negative_mask(
+def _compute_off_policy_sequence_masking(
     log_ratio: torch.Tensor,
     advantages: torch.Tensor,
     response_mask_bool: torch.Tensor,
     config: GrpoConfig,
 ) -> torch.Tensor:
-    """Compute sequence-level stale-negative mask (DeepSeek-V3.2 technique).
+    """Compute sequence-level off-policy mask (DeepSeek-V3.2 technique).
 
     MATH:
     For each sequence i:
@@ -620,7 +619,7 @@ def _compute_stale_negative_mask(
         log_ratio: Log ratio log(π_θ/π_old) for each token
         advantages: Advantage estimates for each sequence
         response_mask_bool: Boolean mask for response tokens
-        config: GRPO config with stale_negative_mask_delta parameter
+        config: GRPO config with off_policy_sequence_masking_delta parameter
 
     Returns:
         Sequence mask (batch_size,) broadcast to all tokens
@@ -634,7 +633,7 @@ def _compute_stale_negative_mask(
     sequence_log_ratio_tensor[sequence_counts == 1] = 0.0  # Handle empty masks
 
     # Check condition: advantage < 0 AND sequence_log_ratio > delta
-    delta = config.stale_negative_mask_delta
+    delta = config.off_policy_sequence_masking_delta
     is_stale_negative = (advantages < 0) & (sequence_log_ratio_tensor > delta)
 
     # Create sequence mask: 0 for stale negatives, 1 otherwise
@@ -1084,9 +1083,9 @@ def assemble_grpo_loss(
     # Process advantages (normalization)
     processed_advantages = _process_advantages(advantages, resolved_config)
 
-    # Apply sequence-level stale-negative masking (DeepSeek-V3.2)
-    if resolved_config.enable_stale_negative_mask:
-        sequence_mask = _compute_stale_negative_mask(
+    # Apply sequence-level off-policy masking (DeepSeek-V3.2)
+    if resolved_config.enable_off_policy_sequence_masking:
+        sequence_mask = _compute_off_policy_sequence_masking(
             log_ratio, processed_advantages, response_mask_bool, resolved_config
         )
         response_mask = response_mask * sequence_mask.unsqueeze(-1)

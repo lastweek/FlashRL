@@ -46,7 +46,7 @@ def load_script_module(module_name: str, relative_path: str):
 
 reasoning_math = load_script_module(
     "flashrl_reasoning_math_train_for_grpo",
-    "flashrl/framework/examples/reasoning-math/train.py",
+    "flashrl/framework/examples/math/train.py",
 )
 math_reward_fn = reasoning_math.math_reward_fn
 render_math_prompt = reasoning_math.render_math_prompt

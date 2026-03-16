@@ -37,12 +37,12 @@ def load_script_module(
 
 reasoning_example = load_script_module(
     "flashrl_reasoning_math_train",
-    "flashrl/framework/examples/reasoning-math/train.py",
+    "flashrl/framework/examples/math/train.py",
     aliases=("train",),
 )
 reasoning_eval = load_script_module(
     "flashrl_reasoning_math_eval",
-    "flashrl/framework/examples/reasoning-math/eval.py",
+    "flashrl/framework/examples/math/eval.py",
 )
 evaluate_model = reasoning_eval.evaluate_model
 
@@ -589,7 +589,7 @@ def test_prepare_reasoning_environment_sets_default_vllm_runtime(
     monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/reasoning-math/config_vllm.yaml"
+        "flashrl/framework/examples/math/config_vllm.yaml"
     )
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
@@ -604,7 +604,7 @@ def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
     monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/reasoning-math/config.yaml"
+        "flashrl/framework/examples/math/config.yaml"
     )
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ
@@ -612,7 +612,7 @@ def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
 
 def test_eval_module_imports_only_public_helpers_from_train() -> None:
     """eval.py should import the local train script instead of the old package path."""
-    source = Path("flashrl/framework/examples/reasoning-math/eval.py").read_text(encoding="utf-8")
+    source = Path("flashrl/framework/examples/math/eval.py").read_text(encoding="utf-8")
     tree = ast.parse(source)
     assert any(
         isinstance(node, ast.Import) and any(alias.name == "train" for alias in node.names)
@@ -623,9 +623,9 @@ def test_eval_module_imports_only_public_helpers_from_train() -> None:
 
 def test_reasoning_math_train_is_the_real_example_module() -> None:
     """train.py should hold the actual example logic without workflow indirection."""
-    train_source = Path("flashrl/framework/examples/reasoning-math/train.py").read_text(
+    train_source = Path("flashrl/framework/examples/math/train.py").read_text(
         encoding="utf-8"
     )
     assert "WORKFLOW_PATH" not in train_source
     assert "exec(compile(" not in train_source
-    assert not Path("flashrl/framework/examples/reasoning-math/workflow.py").exists()
+    assert not Path("flashrl/framework/examples/math/workflow.py").exists()

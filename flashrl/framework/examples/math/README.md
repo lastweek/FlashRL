@@ -1,4 +1,4 @@
-# FlashRL Reasoning-Math Example
+# FlashRL Math Example
 
 This example is a strict R1-Zero-style math prototype with explicit dataset
 selection. It trains a base Qwen model with rule-based rewards only, uses no
@@ -87,19 +87,19 @@ Training still runs if the optional Pushgateway stack is unavailable.
 ### Canonical managed vLLM training
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py
+python3 flashrl/framework/examples/math/train.py
 ```
 
 Equivalent explicit form:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py --config flashrl/framework/examples/reasoning-math/config_vllm.yaml
+python3 flashrl/framework/examples/math/train.py --config flashrl/framework/examples/math/config_vllm.yaml
 ```
 
 ### Local Hugging Face debug training
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py --config flashrl/framework/examples/reasoning-math/config.yaml
+python3 flashrl/framework/examples/math/train.py --config flashrl/framework/examples/math/config.yaml
 ```
 
 Use this when you want a smaller local run and `serving.debug_live_rollout`
@@ -116,11 +116,11 @@ Built-in datasets:
 Examples:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py --dataset aime25
+python3 flashrl/framework/examples/math/train.py --dataset aime25
 ```
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/eval.py --dataset aime25
+python3 flashrl/framework/examples/math/eval.py --dataset aime25
 ```
 
 Before training or evaluation starts, the selected dataset is printed to the
@@ -142,7 +142,7 @@ This summary is terminal-only. It is not copied into `console.log`.
 ### Held-out evaluation
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/eval.py
+python3 flashrl/framework/examples/math/eval.py
 ```
 
 By default, `eval.py` will try to load
@@ -152,14 +152,54 @@ the base model from the selected FlashRL profile.
 Explicit checkpoint form:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/eval.py \
-  --config flashrl/framework/examples/reasoning-math/config_vllm.yaml \
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
   --checkpoint /tmp/flashrl_reasoning_checkpoint.pt
 ```
 
 This example is intentionally script-run. Like `reasoning-code`, the folder is
 hyphenated, so `train.py` and `eval.py` load the YAML profiles directly and
 construct `FlashRL(...)` in code instead of using `FlashRL.from_yaml(...)`.
+
+## Training Modes
+
+This example supports two training modes:
+
+### Math Mode (Default)
+
+```bash
+python3 flashrl/framework/examples/math/train.py --training-mode math
+```
+
+- Evaluates only answer correctness
+- Ignores `<thinking>` tags
+- Uses existing 4-tier reward system (1.1, 1.0, 0.1, 0.0)
+- Best for: Pure math capability training
+
+### Reasoning Mode
+
+```bash
+python3 flashrl/framework/examples/math/train.py --training-mode reasoning
+```
+
+- Evaluates both reasoning quality and answer correctness
+- Requires `<thinking>...</thinking>` tags in responses
+- Combines: 70% reasoning score + 30% math score
+- Reasoning score evaluates:
+  - Presence of thinking tags
+  - Content structure (numbered lists, bullet points)
+  - Reasoning length
+- Best for: Training models to show their work
+
+**When to use reasoning mode:**
+- When you want the model to learn structured reasoning along with correct answers
+- When you care about the reasoning process, not just the final answer
+- When you're training models to explain their step-by-step thinking
+
+**When to use math mode (default):**
+- When you only care about answer correctness
+- When you want faster training without reasoning evaluation
+- When you're focusing on pure math capability
 
 ## Run-Time Knobs
 
@@ -168,8 +208,8 @@ construct `FlashRL(...)` in code instead of using `FlashRL.from_yaml(...)`.
 Useful flags:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py \
-  --config flashrl/framework/examples/reasoning-math/config.yaml \
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config.yaml \
   --dataset aime25 \
   --train-limit 64
 ```
@@ -179,6 +219,7 @@ Available flags:
 - `--config`: FlashRL runtime/training profile.
 - `--dataset`: choose `gsm8k` or `aime25`.
 - `--train-limit`: cap the number of training questions from the selected dataset.
+- `--training-mode`: choose `math` (default) or `reasoning`.
 
 Training checkpointing is configured in YAML. The shipped example configs already
 write a final checkpoint to `/tmp/flashrl_reasoning_checkpoint.pt`.
@@ -192,7 +233,7 @@ checkpointing:
   # Optional explicit resume:
   # resume_from: /tmp/flashrl_reasoning_checkpoint.pt
   # Optional managed latest resume:
-  # directory: logs/reasoning-math-checkpoints
+  # directory: logs/math-checkpoints
   # resume_from: latest
 ```
 
@@ -201,8 +242,8 @@ checkpointing:
 Useful flags:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/eval.py \
-  --config flashrl/framework/examples/reasoning-math/config.yaml \
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config.yaml \
   --dataset aime25 \
   --eval-limit 50 \
   --batch-size 4
@@ -227,11 +268,11 @@ Three knobs matter, and they do different things:
 Use these flags to control dataset size directly:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/train.py --train-limit 100
+python3 flashrl/framework/examples/math/train.py --train-limit 100
 ```
 
 ```bash
-python3 flashrl/framework/examples/reasoning-math/eval.py --eval-limit 50
+python3 flashrl/framework/examples/math/eval.py --eval-limit 50
 ```
 
 Related FlashRL profile knobs:
