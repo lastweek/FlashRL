@@ -236,13 +236,6 @@ def resolve_loss_preset(config: GrpoConfig) -> GrpoConfig:
             advantage_normalization=True,
             advantage_mode="group_centered",
         ),
-        "ppo_clipped": GrpoPreset(  # Alias for grpo_naive
-            clipping_mode="symmetric",
-            clip_ratio=0.2,
-            kl_mode="k3",
-            advantage_normalization=True,
-            advantage_mode="group_centered",
-        ),
         "deepseek_v3.2": GrpoPreset(
             clipping_mode="symmetric",
             clip_ratio=0.2,
@@ -254,9 +247,9 @@ def resolve_loss_preset(config: GrpoConfig) -> GrpoConfig:
             entropy_coefficient=0.01,
         ),
         "kimi_k2.5": GrpoPreset(
-            clipping_mode="hard_mask",
-            clip_log_ratio_alpha=-5.0,  # Typical values from paper
-            clip_log_ratio_beta=5.0,
+            clipping_mode="asymmetric",
+            clip_ratio_lower=0.1,  # Same as GLM-5
+            clip_ratio_upper=0.2,  # Same as GLM-5
             kl_mode="none",  # No explicit reference KL
             log_ratio_penalty_coefficient=0.01,  # τ for soft penalty
             advantage_normalization=True,
@@ -271,14 +264,6 @@ def resolve_loss_preset(config: GrpoConfig) -> GrpoConfig:
             icepop_token_gate_beta=2.0,
             advantage_normalization=True,
             advantage_mode="group_normalized",  # GLM uses group-normalized
-        ),
-        "mimo_v2": GrpoPreset(
-            clipping_mode="none",  # Uses importance gating instead
-            kl_mode="none",
-            enable_importance_gating=True,
-            importance_epsilon_low=1.0 - 0.2,
-            importance_epsilon_high=1.0 + 0.2,
-            advantage_normalization=False,  # Teacher provides advantage
         ),
     }
 
@@ -496,8 +481,7 @@ def _compute_ratio_statistics(
 def _apply_clipping(
     ratio: torch.Tensor,
     log_ratio: torch.Tensor,
-    advantages: torch.Tensor,
-    response_mask: torch.Tensor,
+    expanded_advantages: torch.Tensor,
     config: GrpoConfig,
 ) -> torch.Tensor:
     """Apply clipping to importance sampling ratio based on configured mode.
@@ -528,7 +512,7 @@ def _apply_clipping(
     Args:
         ratio: Importance sampling ratio ρ = π_θ/π_old
         log_ratio: Log ratio log(π_θ/π_old) for hard mask
-        advantages: Advantage estimates A (for asymmetric clipping)
+        expanded_advantages: Advantage estimates A expanded to token level (for asymmetric clipping)
         response_mask: Response token mask
         config: GRPO configuration with clipping parameters
 
@@ -546,7 +530,6 @@ def _apply_clipping(
 
     if config.clipping_mode == "asymmetric":
         # DeepSeek-V3.2 style: advantage-dependent clipping
-        expanded_advantages = advantages.unsqueeze(-1).expand_as(response_mask)
         clip_lower = torch.where(
             expanded_advantages > 0,
             1.0 - (config.clip_ratio_lower or 0.1),
@@ -642,6 +625,41 @@ def _compute_off_policy_sequence_masking(
     return sequence_mask
 
 
+def _apply_range_gate(
+    values: torch.Tensor,
+    lower_bound: float,
+    upper_bound: float,
+) -> torch.Tensor:
+    """Apply hard gate based on value range.
+
+    MATH:
+    g(x) = 0 if x < lower or x > upper
+         = x otherwise
+
+    INTUITION: Tokens with extreme values (outside [lower, upper]) are
+    considered "outliers" that should not contribute to the gradient. This
+    is similar to robust statistics - removing outliers before computing
+    the gradient update.
+
+    COMPARISON TO CLIPPING:
+    - Clipping: x_clipped = clamp(x, lower, upper) - soft constraint
+    - Gating: g(x) = x * I[lower ≤ x ≤ upper] - hard constraint
+
+    Gating is more aggressive than clipping - it completely removes outlier
+    tokens rather than just bounding their contribution.
+
+    Args:
+        values: Input tensor to gate
+        lower_bound: Lower threshold (inclusive)
+        upper_bound: Upper threshold (inclusive)
+
+    Returns:
+        Gated values (zeroed if outside range)
+    """
+    in_range = (values >= lower_bound) & (values <= upper_bound)
+    return values * in_range.float()
+
+
 def _apply_icepop_token_gate(
     ratio_train: torch.Tensor,          # r = π^train / π^train_old
     log_pi_train_old: torch.Tensor,     # π^train_old
@@ -693,12 +711,11 @@ def _apply_icepop_token_gate(
     # Apply pop() function: pop(ρ, 1/β, β)
     lower_bound = 1.0 / beta
     upper_bound = beta
-    in_range = (mismatch_ratio >= lower_bound) & (mismatch_ratio <= upper_bound)
 
     # Gate the training ratio: r_gated = r * I[ρ in [1/β, β]]
-    gated_ratio = ratio_train * in_range.float()
-
-    return gated_ratio
+    # Note: We gate ratio_train based on whether mismatch_ratio is in range
+    in_range = (mismatch_ratio >= lower_bound) & (mismatch_ratio <= upper_bound)
+    return ratio_train * in_range.float()
 
 
 def _apply_importance_gating(
@@ -740,10 +757,30 @@ def _apply_importance_gating(
     epsilon_high = config.importance_epsilon_high or 1.2
 
     # Check if ratio is within band
-    in_band = (ratio >= epsilon_low) & (ratio <= epsilon_high)
+    return _apply_range_gate(ratio, epsilon_low, epsilon_high)
 
-    # Apply hard gate
-    return ratio * in_band.float()
+
+def _compute_kl_terms(
+    log_pi_ref: torch.Tensor,
+    log_pi_theta: torch.Tensor,
+) -> torch.Tensor:
+    """Compute KL divergence terms between two policies.
+
+    Uses the identity: KL(p||q) = E_p[log(p/q)] = E_p[log(p) - log(q)]
+
+    In log-space: kl_terms = exp(log_p - log_q) - (log_p - log_q) - 1
+
+    This is the core computation used in multiple KL modes (K1, K3, UNBIASED).
+
+    Args:
+        log_pi_ref: Reference policy log probabilities (log π_ref)
+        log_pi_theta: Current policy log probabilities (log π_θ)
+
+    Returns:
+        KL divergence terms (same shape as inputs)
+    """
+    reference_log_gap = log_pi_ref - log_pi_theta
+    return torch.exp(reference_log_gap) - reference_log_gap - 1.0
 
 
 def _compute_kl_divergence_enhanced(
@@ -803,8 +840,7 @@ def _compute_kl_divergence_enhanced(
 
     if config.kl_mode == "k1":
         # Simple KL: aggregate once at the end
-        reference_log_gap = log_pi_ref - log_pi_theta
-        kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
+        kl_terms = _compute_kl_terms(log_pi_ref, log_pi_theta)
         masked_kl = kl_terms * response_mask
         kl_divergence = masked_kl.sum() / response_token_count
 
@@ -820,8 +856,7 @@ def _compute_kl_divergence_enhanced(
 
     elif config.kl_mode == "k3":
         # Per-token KL (standard implementation)
-        reference_log_gap = log_pi_ref - log_pi_theta
-        kl_terms = torch.exp(reference_log_gap) - reference_log_gap - 1.0
+        kl_terms = _compute_kl_terms(log_pi_ref, log_pi_theta)
         masked_kl = kl_terms * response_mask
         return masked_kl.sum() / response_token_count
 
@@ -829,8 +864,7 @@ def _compute_kl_divergence_enhanced(
         # DeepSeek-V3.2 unbiased token-level KL estimator
         # KL(π_θ || π_ref) ≈ (π_θ/π_old) * [(π_ref/π_θ - log(π_ref/π_θ) - 1)]
         ratio = torch.exp(log_pi_theta - log_pi_old)
-        reference_log_gap = log_pi_ref - log_pi_theta
-        kl_terms = ratio * (torch.exp(reference_log_gap) - reference_log_gap - 1.0)
+        kl_terms = ratio * _compute_kl_terms(log_pi_ref, log_pi_theta)
         masked_kl = kl_terms * response_mask
         return masked_kl.sum() / response_token_count
 
@@ -888,7 +922,7 @@ def _compute_surrogate_loss(
     ratio: torch.Tensor,
     clipped_ratio: torch.Tensor,
     log_ratio: torch.Tensor,
-    advantages: torch.Tensor,
+    expanded_advantages: torch.Tensor,
     response_mask: torch.Tensor,
     response_token_count: torch.Tensor,
     config: GrpoConfig,
@@ -929,7 +963,7 @@ def _compute_surrogate_loss(
         ratio: Unclipped importance sampling ratio ρ
         clipped_ratio: Clipped ratio (or masked ratio for hard_mask)
         log_ratio: Log ratio (not used directly, for API consistency)
-        advantages: Advantage estimates A
+        expanded_advantages: Advantage estimates A expanded to token level
         response_mask: Response token mask
         response_token_count: Response token count (for normalization)
         config: GRPO config with clipping parameters
@@ -937,7 +971,6 @@ def _compute_surrogate_loss(
     Returns:
         Surrogate loss (scalar tensor, negative because we maximize)
     """
-    expanded_advantages = advantages.unsqueeze(-1).expand_as(response_mask)
 
     if config.clipping_mode == "hard_mask":
         # Kimi-style: already masked in clipped_ratio, use directly
@@ -988,9 +1021,9 @@ def _compute_entropy_loss(
     if config.entropy_coefficient == 0.0:
         return torch.tensor(0.0, device=actor_logits.device, dtype=actor_logits.dtype)
 
-    # Compute entropy from logits
-    probs = F.softmax(actor_logits[:, :-1, :], dim=-1)
+    # Compute entropy from logits (optimized: only compute log_softmax once)
     log_probs = F.log_softmax(actor_logits[:, :-1, :], dim=-1)
+    probs = torch.exp(log_probs)  # Equivalent to F.softmax, but avoids redundant computation
     entropy = -(probs * log_probs).sum(dim=-1)
 
     # Apply response mask
@@ -1029,11 +1062,6 @@ def assemble_grpo_loss(
     RL CONTEXT (GRPO Algorithm):
     GRPO (Group Relative Policy Optimization) extends PPO with group-based
     advantage estimation and supports multiple advanced techniques:
-
-    1. DEEPSEEK-V3.2: Asymmetric clipping + stale negative masking + unbiased KL
-    2. GLM-5: Train/infer mismatch gate + group-normalized advantages
-    3. KIMI K2.5: Hard log-ratio masking + soft quadratic penalty
-    4. MIMO-V2: Importance weight gating (no explicit clipping)
 
     DATA FLOW (CRITICAL):
 
@@ -1110,8 +1138,16 @@ def assemble_grpo_loss(
     # Compute importance sampling ratio
     ratio = torch.exp(log_ratio)
 
+    # Cache original ratio for statistics BEFORE any modifications
+    # Statistics should reflect true importance sampling ratio, not gated/clipped version
+    ratio_for_stats = ratio.clone()
+
     # Process advantages (normalization)
     processed_advantages = _process_advantages(advantages, resolved_config)
+
+    # Cache expanded advantages to avoid duplicate expansion
+    # Used by both _apply_clipping and _compute_surrogate_loss
+    expanded_advantages = processed_advantages.unsqueeze(-1).expand_as(response_mask)
 
     # Apply sequence-level off-policy masking (DeepSeek-V3.2)
     if resolved_config.enable_off_policy_sequence_masking:
@@ -1135,7 +1171,7 @@ def assemble_grpo_loss(
 
     # Apply clipping based on mode
     clipped_ratio = _apply_clipping(
-        ratio, log_ratio, processed_advantages, response_mask, resolved_config
+        ratio, log_ratio, expanded_advantages, resolved_config
     )
 
     # Compute surrogate loss
@@ -1143,7 +1179,7 @@ def assemble_grpo_loss(
         ratio,
         clipped_ratio,
         log_ratio,
-        processed_advantages,
+        expanded_advantages,
         response_mask,
         response_token_count,
         resolved_config,
@@ -1182,7 +1218,7 @@ def assemble_grpo_loss(
     clip_lower, clip_upper = _get_clip_bounds(resolved_config)
 
     stats = _compute_ratio_statistics(
-        ratio,
+        ratio_for_stats,  # Use original ratio before modifications
         response_mask_bool,
         clip_lower,
         clip_upper,

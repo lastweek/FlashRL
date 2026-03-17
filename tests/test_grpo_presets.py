@@ -20,18 +20,6 @@ class TestPresetResolution:
         assert resolved.advantage_normalization is True
         assert resolved.advantage_mode == "group_centered"
 
-    def test_ppo_clipped_is_alias_for_grpo_naive(self):
-        """Test that ppo_clipped is an alias for grpo_naive."""
-        config_naive = GrpoConfig(loss_preset="grpo_naive")
-        config_ppo = GrpoConfig(loss_preset="ppo_clipped")
-
-        resolved_naive = resolve_loss_preset(config_naive)
-        resolved_ppo = resolve_loss_preset(config_ppo)
-
-        assert resolved_naive.clipping_mode == resolved_ppo.clipping_mode
-        assert resolved_naive.clip_ratio == resolved_ppo.clip_ratio
-        assert resolved_naive.kl_mode == resolved_ppo.kl_mode
-
     def test_deepseek_v32_applies_symmetric_clipping(self):
         """Test that deepseek_v3.2 applies symmetric clipping and unbiased KL."""
         config = GrpoConfig(
@@ -47,16 +35,16 @@ class TestPresetResolution:
         assert resolved.off_policy_sequence_masking_delta == 2.0
         assert resolved.entropy_coefficient == 0.01
 
-    def test_kimi_k25_applies_hard_mask_and_penalty(self):
-        """Test that kimi_k2.5 applies hard mask and log-ratio penalty."""
+    def test_kimi_k25_applies_asymmetric_clipping_and_penalty(self):
+        """Test that kimi_k2.5 applies asymmetric clipping and log-ratio penalty."""
         # Note: Due to bug in conflict detection, we can't set log_ratio_penalty_coefficient
         # But preset resolution still works correctly and sets it to 0.01
         config = GrpoConfig(loss_preset="kimi_k2.5")
         resolved = resolve_loss_preset(config)
 
-        assert resolved.clipping_mode == "hard_mask"
-        assert resolved.clip_log_ratio_alpha == -5.0
-        assert resolved.clip_log_ratio_beta == 5.0
+        assert resolved.clipping_mode == "asymmetric"
+        assert resolved.clip_ratio_lower == 0.1
+        assert resolved.clip_ratio_upper == 0.2
         assert resolved.kl_mode == "none"
         # Preset sets penalty coefficient to 0.01 even though we can't explicitly set it
         # assert resolved.log_ratio_penalty_coefficient == 0.01  # Skip due to conflict detection bug
@@ -76,13 +64,6 @@ class TestPresetResolution:
         assert resolved.enable_icepop_token_gate is True
         assert resolved.icepop_token_gate_beta == 2.0
         assert resolved.advantage_mode == "group_normalized"
-
-    def test_mimo_v2_applies_importance_gating(self):
-        """Test that mimo_v2 applies importance gating with no clipping."""
-        # Note: Due to bugs in conflict detection, we can't test mimo_v2 properly
-        # The conflict detection treats default values as "explicitly set" values
-        # Skip this test until the preset system is fixed
-        pytest.skip("mimo_v2 preset test skipped due to conflict detection bugs")
 
 
 class TestPresetConflictDetection:

@@ -16,11 +16,9 @@ _ENV_VAR_PATTERN = re.compile(r"\$\{([A-Z0-9_]+)\}")
 class LossPreset(str, Enum):
     """GRPO loss preset options."""
     GRPO_NAIVE = "grpo_naive"
-    PPO_CLIPPED = "ppo_clipped"
     DEEPSEEK_V3_2 = "deepseek_v3.2"
     KIMI_K2_5 = "kimi_k2.5"
     GLM_5 = "glm_5"
-    MIMO_V2 = "mimo_v2"
     CUSTOM = "custom"
 
 
@@ -185,11 +183,9 @@ class GrpoConfig(BaseConfig):
     # Preset selection
     loss_preset: Literal[
         "grpo_naive",  # PPO-style symmetric clipping
-        "ppo_clipped",  # Alias for grpo_naive
         "deepseek_v3.2",  # Token-level GRPO + reference KL + sequence masking
-        "kimi_k2.5",  # Hard token clip + soft log-ratio penalty
+        "kimi_k2.5",  # Asymmetric clipping + soft log-ratio penalty
         "glm_5",  # Train/infer mismatch gate + teacher distillation
-        "mimo_v2",  # Teacher distillation + importance gating
         "custom",  # Use explicit config parameters
     ] = "grpo_naive"
 

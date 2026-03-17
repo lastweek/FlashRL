@@ -56,12 +56,6 @@ def create_preset_config(preset_name: str) -> GrpoConfig:
             loss_preset=preset_name,
             enable_icepop_token_gate=True,
         )
-    elif preset_name == "mimo_v2":
-        return GrpoConfig(
-            loss_preset=preset_name,
-            enable_importance_gating=True,
-            advantage_normalization=False,
-        )
     else:
         return GrpoConfig(loss_preset=preset_name)
 
@@ -71,11 +65,9 @@ class TestPresetIntegration:
 
     @pytest.mark.parametrize("preset_name", [
         "grpo_naive",
-        "ppo_clipped",  # Alias for grpo_naive
         "deepseek_v3.2",
         "glm_5",
         "kimi_k2.5",
-        "mimo_v2",
     ])
     def test_preset_loss_assembly_is_finite(self, preset_name):
         """Test that each preset assembles a finite loss."""
@@ -107,7 +99,6 @@ class TestPresetIntegration:
         "deepseek_v3.2",
         "glm_5",
         "kimi_k2.5",
-        "mimo_v2",
     ])
     def test_preset_loss_is_negative(self, preset_name):
         """Test that loss is negative (we minimize negative objective)."""
@@ -173,8 +164,8 @@ class TestPresetIntegration:
         # KL should be computed (unbiased mode with ref_logits)
         assert result.kl_divergence.item() > 0
 
-    def test_kimi_k25_uses_hard_mask(self):
-        """Test that kimi_k2.5 uses hard mask clipping."""
+    def test_kimi_k25_uses_asymmetric_clipping(self):
+        """Test that kimi_k2.5 uses asymmetric clipping."""
         config = GrpoConfig(loss_preset="kimi_k2.5")
         data = create_test_data()
 
@@ -211,27 +202,6 @@ class TestPresetIntegration:
         )
 
         # Loss should be finite with group-normalized advantages
-        assert torch.isfinite(result.loss)
-        # KL should be zero (no reference)
-        assert result.kl_divergence.item() == pytest.approx(0.0)
-
-    def test_mimo_v2_uses_importance_gating(self):
-        """Test that mimo_v2 uses importance gating."""
-        config = GrpoConfig(loss_preset="mimo_v2")
-        data = create_test_data()
-
-        result = assemble_grpo_loss(
-            input_ids=data["input_ids"],
-            attention_mask=data["attention_mask"],
-            prompt_lengths=data["prompt_lengths"],
-            actor_logits=data["actor_logits"],
-            ref_logits=None,  # No KL for MiMo
-            rollout_response_log_probs=data["rollout_response_log_probs"],
-            advantages=data["advantages"],
-            config=config,
-        )
-
-        # Loss should be finite with importance gating
         assert torch.isfinite(result.loss)
         # KL should be zero (no reference)
         assert result.kl_divergence.item() == pytest.approx(0.0)

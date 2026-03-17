@@ -38,9 +38,9 @@ grpo:
 
   # Preset-applied parameters (do not override without loss_preset: "custom")
   # The kimi_k2.5 preset applies:
-  # - clipping_mode: "hard_mask"
-  # - clip_log_ratio_alpha: -5.0 (lower bound for log-ratio)
-  # - clip_log_ratio_beta: 5.0 (upper bound for log-ratio)
+  # - clipping_mode: "asymmetric"
+  # - clip_ratio_lower: 0.1
+  # - clip_ratio_upper: 0.2
   # - kl_mode: "none" (no explicit reference KL)
   # - log_ratio_penalty_coefficient: 0.01 (τ for soft penalty)
   # - advantage_normalization: true

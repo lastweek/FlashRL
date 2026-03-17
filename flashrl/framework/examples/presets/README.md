@@ -16,7 +16,7 @@ DeepSeek-V3.2 implementation with:
 
 ### `kimi_k2.5`
 Kimi K2.5 implementation with:
-- Hard token-level gradient mask (rejects tokens outside log-ratio band)
+- Asymmetric clipping (same as GLM-5)
 - Soft quadratic log-ratio penalty
 - No explicit reference KL
 
@@ -25,12 +25,6 @@ GLM-5 implementation with:
 - Train/infer mismatch gate (IcePop-style)
 - Group-normalized advantages
 - No explicit KL in reasoning RL backbone
-
-### `mimo_v2`
-MiMo-V2-Flash implementation with:
-- Importance weight gating (gates tokens outside importance band)
-- Teacher distillation
-- No explicit clipping
 
 ### `custom`
 Use explicit configuration parameters for full control.
@@ -42,4 +36,4 @@ See individual YAML files for complete examples of each preset.
 ## Research Paper Reference
 
 These implementations are based on techniques from:
-"DeepSeek-V3.2, GLM-5, MiMo-V2-Flash, and Kimi K2.5: A Comparative Analysis of GRPO Variants"
+"DeepSeek-V3.2, GLM-5, and Kimi K2.5: A Comparative Analysis of GRPO Variants"
