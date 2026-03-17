@@ -105,6 +105,161 @@ python3 flashrl/framework/examples/math/train.py --config flashrl/framework/exam
 Use this when you want a smaller local run and `serving.debug_live_rollout`
 support for rollout debugging.
 
+## Common Run Scripts
+
+### Quick Debug Runs (64 Samples)
+
+**GSM8K, Math Mode (no reasoning tags):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode math \
+  --train-limit 64
+```
+
+**GSM8K, Reasoning Mode (requires `<thinking>` tags):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode reasoning \
+  --train-limit 64
+```
+
+**AIME25, Math Mode (no reasoning tags):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset aime25 \
+  --training-mode math \
+  --train-limit 64
+```
+
+**AIME25, Reasoning Mode (requires `<thinking>` tags):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset aime25 \
+  --training-mode reasoning \
+  --train-limit 64
+```
+
+### Medium Training Runs (256 Samples)
+
+**GSM8K, Math Mode:**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode math \
+  --train-limit 256
+```
+
+**GSM8K, Reasoning Mode:**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode reasoning \
+  --train-limit 256
+```
+
+**AIME25, Math Mode:**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset aime25 \
+  --training-mode math \
+  --train-limit 256
+```
+
+**AIME25, Reasoning Mode:**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset aime25 \
+  --training-mode reasoning \
+  --train-limit 256
+```
+
+### Local Debug Runs (Smaller Model)
+
+**GSM8K with 0.5B model:**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config.yaml \
+  --dataset gsm8k \
+  --training-mode math \
+  --train-limit 64
+```
+
+### Quick Evaluation Runs
+
+**Evaluate trained checkpoint on GSM8K (50 samples):**
+
+```bash
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --checkpoint /tmp/flashrl_reasoning_checkpoint.pt \
+  --eval-limit 50
+```
+
+**Evaluate trained checkpoint on AIME25 (25 samples):**
+
+```bash
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset aime25 \
+  --checkpoint /tmp/flashrl_reasoning_checkpoint.pt \
+  --eval-limit 25
+```
+
+**Evaluate base model on GSM8K (no checkpoint):**
+
+```bash
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --eval-limit 50
+```
+
+### Batch Size Variations
+
+**Larger batch for faster training (batch_size=8, 4 prompts per step):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode math \
+  --train-limit 256 \
+  --batch-size 8 \
+  --group-size 4
+```
+
+**Smaller batch for debugging (batch_size=4, 2 prompts per step):**
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode math \
+  --train-limit 64 \
+  --batch-size 4 \
+  --group-size 2
+```
+
 ### Dataset selection
 
 Built-in datasets:
@@ -192,11 +347,13 @@ python3 flashrl/framework/examples/math/train.py --training-mode reasoning
 - Best for: Training models to show their work
 
 **When to use reasoning mode:**
+
 - When you want the model to learn structured reasoning along with correct answers
 - When you care about the reasoning process, not just the final answer
 - When you're training models to explain their step-by-step thinking
 
 **When to use math mode (default):**
+
 - When you only care about answer correctness
 - When you want faster training without reasoning evaluation
 - When you're focusing on pure math capability

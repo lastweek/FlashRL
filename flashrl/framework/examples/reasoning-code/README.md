@@ -48,6 +48,169 @@ python3 flashrl/framework/examples/reasoning-code/train.py \
   --config flashrl/framework/examples/reasoning-code/config.yaml
 ```
 
+## Common Run Scripts
+
+### Quick Debug Runs (64 Samples)
+
+**Codeforces, Easy Problems (rating <= 1400):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 64 \
+  --rating-max 1400
+```
+
+**Codeforces, Medium Problems (rating <= 1600, default):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 64 \
+  --rating-max 1600
+```
+
+### Medium Training Runs (256 Samples)
+
+**Codeforces, Easy Problems (rating <= 1400):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 256 \
+  --rating-max 1400
+```
+
+**Codeforces, Medium Problems (rating <= 1600):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 256 \
+  --rating-max 1600
+```
+
+### Local Debug Runs (Smaller Model)
+
+**Quick debug with 0.5B Coder model:**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config.yaml \
+  --train-limit 64 \
+  --rating-max 1400
+```
+
+### Quick Evaluation Runs
+
+**Evaluate trained checkpoint (32 samples, rating <= 1400):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/eval.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --checkpoint /tmp/flashrl_reasoning_code_checkpoint.pt \
+  --eval-limit 32 \
+  --rating-max 1400
+```
+
+**Evaluate trained checkpoint (50 samples, rating <= 1600):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/eval.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --checkpoint /tmp/flashrl_reasoning_code_checkpoint.pt \
+  --eval-limit 50 \
+  --rating-max 1600
+```
+
+**Evaluate base model without checkpoint:**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/eval.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --eval-limit 32 \
+  --rating-max 1400
+```
+
+### Batch Size Variations
+
+**Larger batch for faster training (batch_size=8, 4 prompts per step):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 256 \
+  --rating-max 1400 \
+  --batch-size 8 \
+  --group-size 4
+```
+
+**Smaller batch for debugging (batch_size=4, 2 prompts per step):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 64 \
+  --rating-max 1400 \
+  --batch-size 4 \
+  --group-size 2
+```
+
+### Execution Time Limits
+
+**Fast execution (3 second timeout):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 64 \
+  --rating-max 1400 \
+  --run-timeout-seconds 3 \
+  --memory-limit-mb 256
+```
+
+**Standard execution (10 second timeout):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 64 \
+  --rating-max 1400 \
+  --run-timeout-seconds 10 \
+  --memory-limit-mb 512
+```
+
+### Problem Difficulty Ranges
+
+**Very Easy Problems (rating <= 1200):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 128 \
+  --rating-max 1200
+```
+
+**Easy Problems (rating 800-1400):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 128 \
+  --rating-min 800 \
+  --rating-max 1400
+```
+
+**Medium Problems (rating 1200-1800):**
+
+```bash
+python3 flashrl/framework/examples/reasoning-code/train.py \
+  --config flashrl/framework/examples/reasoning-code/config_vllm.yaml \
+  --train-limit 128 \
+  --rating-min 1200 \
+  --rating-max 1800
+```
+
 ### Held-out evaluation
 
 ```bash

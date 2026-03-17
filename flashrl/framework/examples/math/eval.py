@@ -50,7 +50,10 @@ def evaluate_model(
     for start in range(0, len(dataset), batch_size):
         prompts = dataset[start:start + batch_size]
         rollouts = reasoning_math_example.reasoning_rollout_fn(prompts, flashrl._serving_backend)
-        rewards = [reasoning_math_example.math_reward_fn(rollout) for rollout in rollouts]
+        rewards = [
+            reasoning_math_example.math_reward_fn(rollout, training_mode=args.training_mode)
+            for rollout in rollouts
+        ]
         for reward in rewards:
             sample_count += 1
             total_reward += float(reward.reward)
@@ -109,6 +112,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=reasoning_math_example.DEFAULT_REASONING_EVAL_BATCH_SIZE,
         help="Optional number of prompts to evaluate per generate_batch call.",
     )
+    parser.add_argument(
+        "--training-mode",
+        choices=["math", "reasoning"],
+        default="math",
+        help="Training mode for evaluation: 'math' for pure math, 'reasoning' for reasoning + math",
+    )
     return parser
 
 
@@ -123,6 +132,7 @@ def main(argv: list[str] | None = None) -> int:
         dataset = reasoning_math_example.build_math_eval_dataset(
             dataset=args.dataset,
             limit=args.eval_limit,
+            training_mode=args.training_mode,  # NEW
         )
         batch_size = args.batch_size
         checkpoint = args.checkpoint

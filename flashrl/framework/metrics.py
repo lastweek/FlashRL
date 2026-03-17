@@ -201,6 +201,13 @@ class TensorBoardMetricsSink:
             self._add_scalar(writer, "tokens/prompt_max", payload["prompt_tokens_max"], step)
             self._add_scalar(writer, "tokens/response_mean", payload["response_tokens_mean"], step)
             self._add_scalar(writer, "tokens/response_max", payload["response_tokens_max"], step)
+
+            # Log LLM call rounds
+            self._add_scalar(writer, "rollout/llm_call_rounds", payload.get("llm_call_rounds"), step)
+
+            # Log tool calls
+            self._add_scalar(writer, "rollout/tool_calls_total", payload.get("tool_calls_total"), step)
+
             return
 
         if stage == "reward":

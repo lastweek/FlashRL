@@ -21,6 +21,7 @@ from flashrl.framework.observability import (
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
+from flashrl.framework.rollout_metrics import count_llm_call_rounds, count_tool_calls
 from flashrl.framework.training import OptimizationResult
 from flashrl.framework.training.optimization import optimize_grpo_batch
 from flashrl.framework.trainer.grpo.grpo_helpers import (
@@ -176,6 +177,11 @@ class GRPOTrainer:
         for rollout in rollouts:
             prompt_lengths.append(len(rollout.prompt_token_ids))
             response_lengths.append(len(rollout.response_token_ids))
+
+        # Compute additional rollout metrics
+        llm_call_rounds = count_llm_call_rounds(rollouts)
+        tool_calls_total = count_tool_calls(rollouts)
+
         self._log_stage(
             context,
             StageResult(
@@ -187,6 +193,8 @@ class GRPOTrainer:
                     "prompt_tokens_max": max(prompt_lengths, default=0),
                     "response_tokens_mean": mean(response_lengths),
                     "response_tokens_max": max(response_lengths, default=0),
+                    "llm_call_rounds": llm_call_rounds,
+                    "tool_calls_total": tool_calls_total,
                 },
             ),
         )
