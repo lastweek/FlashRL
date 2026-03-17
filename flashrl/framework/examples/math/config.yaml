@@ -1,10 +1,10 @@
 # FlashRL runtime/training profile for the math example.
 actor:
-  model_name: Qwen/Qwen2.5-0.5B
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
   num_threads: 1
 
 serving:
-  model_name: Qwen/Qwen2.5-0.5B
+  model_name: Qwen/Qwen2.5-0.5B-Instruct
   num_threads: 1
   debug_live_rollout: true
 

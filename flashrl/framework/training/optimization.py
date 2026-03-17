@@ -102,6 +102,9 @@ def prepare_learner_inputs(
         input_ids[index, :length] = torch.tensor(token_ids, dtype=torch.long, device=device)
         attention_mask[index, :length] = 1
 
+    # Clean up temporary list that is no longer needed
+    del full_sequences
+
     prompt_length_tensor = torch.tensor(prompt_lengths, dtype=torch.long, device=device)
     if any(sample_log_probs is None for sample_log_probs in rollout_response_log_probs):
         computed_log_probs = compute_rollout_log_probs_from_actor(
@@ -118,6 +121,8 @@ def prepare_learner_inputs(
                 strict=True,
             )
         ]
+    # Clean up prompt_lengths list after converting to tensor
+    del prompt_lengths
     return (
         input_ids,
         attention_mask,
@@ -296,6 +301,17 @@ def optimize_grpo_batch(
             ),
         ]
     )
+
+    # Explicitly delete large tensors to free MPS memory before next step
+    del input_ids
+    del attention_mask
+    del prompt_lengths
+    del actor_logits
+    if ref_logits is not None:
+        del ref_logits
+    del advantages
+    if training_old_response_log_probs is not None:
+        del training_old_response_log_probs
 
     return OptimizationResult(
         loss=float(loss_result.loss.item()),

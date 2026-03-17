@@ -151,6 +151,9 @@ class GRPOTrainer:
                     step_payloads=epoch_step_payloads,
                 )
                 self.run_logger.log_epoch_summary(epoch_summary)
+                # Clear step payloads and dataset to free memory before next epoch
+                epoch_step_payloads.clear()
+                del epoch_dataset
 
     def _run_logged_step(
         self,
@@ -257,6 +260,8 @@ class GRPOTrainer:
         )
 
         learner_batch = self._build_learner_batch(batch, advantages)
+        # Explicitly delete the advantages tensor to free memory early
+        del advantages
         result = self._optimize_batch(learner_batch, context)
         all_stage_timings = {
             "rollout": rollout_seconds,

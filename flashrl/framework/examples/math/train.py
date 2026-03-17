@@ -320,14 +320,21 @@ def _extract_math_target_answer(raw_answer: str) -> str:
         raise ValueError(f"GSM8K answer normalized to empty text: {raw_answer[:80]!r}")
     return normalized
 def _extract_answer_block(response_text: str) -> str | None:
-    """Extract the single parsed answer block when one exists."""
+    """Extract the single parsed answer block when one exists.
+    Falls back to extracting the last number from free-form text when no tags found."""
+    # First try structured <answer> blocks (for reasoning mode compatibility)
     matches = ANSWER_BLOCK_PATTERN.findall(response_text)
-    if len(matches) != 1:
-        return None
-    answer_text = matches[0].strip()
-    if not answer_text:
-        return None
-    return answer_text
+    if len(matches) == 1:
+        answer_text = matches[0].strip()
+        if answer_text:
+            return answer_text
+    # Fallback: Extract last number from free-form text (for math mode)
+    # Handles patterns like "The answer is 42." or "Answer: 13.25"
+    number_pattern = re.compile(r'-?\d+(?:\.\d+)?|\d+/\d+')
+    numbers = number_pattern.findall(response_text)
+    if numbers:
+        return numbers[-1]  # Return the last number found in the text
+    return None
 # Reward logic
 def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
     """Recover the original prompt metadata attached by the rollout hook."""
@@ -335,7 +342,7 @@ def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
     if isinstance(prompt_metadata, dict):
         return prompt_metadata
     return {}
-def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
+def reasoning_reward_fn(rollout: RolloutOutput, debug_reward: bool = False) -> RewardOutput:
     """Compute reasoning reward from <thinking> tags in response.
     Evaluates reasoning quality based on:
     1. Presence of <thinking> tags
@@ -349,6 +356,8 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     matches = re.findall(thinking_pattern, text, re.IGNORECASE | re.DOTALL)
     if not matches:
         # No thinking tags found
+        if debug_reward:
+            print(f"reward:reasoning  tags_found=False  score=0.0", flush=True)
         return RewardOutput(
             reward=0.0,
             metadata={"reasoning_score": 0.0, "thinking_tags_found": False}
@@ -356,6 +365,8 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
     thinking_content = matches[0].strip()
     if not thinking_content:
         # Empty thinking tags
+        if debug_reward:
+            print(f"reward:reasoning  tags_found=True  empty=True  score=0.0", flush=True)
         return RewardOutput(
             reward=0.0,
             metadata={"reasoning_score": 0.0, "thinking_tags_found": True, "empty": True}
@@ -373,6 +384,14 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
         score += 0.1
     # Cap at 1.0
     score = min(score, 1.0)
+    if debug_reward:
+        has_structure = bool(re.search(r'\d+\.', thinking_content) or re.search(r'[-*]', thinking_content))
+        print(
+            f"reward:reasoning  tags_found=True  empty=False  "
+            f"length={len(thinking_content)}  has_structure={has_structure}  "
+            f"score={score:.3f}",
+            flush=True
+        )
     return RewardOutput(
         reward=score,
         metadata={
@@ -381,7 +400,7 @@ def reasoning_reward_fn(rollout: RolloutOutput) -> RewardOutput:
             "thinking_length": len(thinking_content)
         },
     )
-def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math") -> RewardOutput:
+def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math", debug_reward: bool = False) -> RewardOutput:
     """Compute pure math score (existing logic).
     Reward matrix for math mode (no format restrictions):
     - `1.0`: correct answer
@@ -412,7 +431,7 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math") -> 
         answer_parse_pass = parsed_answer is not None
         normalized_answer = _normalize_math_answer(parsed_answer or "")
         accuracy_pass = bool(answer_parse_pass and normalized_answer == expected_answer)
-        return RewardOutput(
+        result = RewardOutput(
             reward=1.0 if accuracy_pass else 0.0,  # Only accuracy in math mode
             metadata={
                 "expected_answer": expected_answer,
@@ -424,6 +443,20 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math") -> 
                 "finish_reason": finish_reason,
             },
         )
+        if debug_reward:
+            print(
+                f"reward:math  mode=math  "
+                f"expected={expected_answer!r}  "
+                f"parsed={repr(parsed_answer) if parsed_answer else 'None'}  "
+                f"normalized={repr(normalized_answer) if normalized_answer else 'None'}  "
+                f"parse_pass={answer_parse_pass}  "
+                f"accuracy_pass={accuracy_pass}  "
+                f"truncated={truncated}  "
+                f"finish_reason={finish_reason or 'None'}  "
+                f"reward={result.reward:.1f}",
+                flush=True
+            )
+        return result
     # Format stays strict on purpose:
     # - `...<answer>42</answer>` can earn the `+0.1` bonus
     # - `...<answer>42</answer> extra` cannot
@@ -450,7 +483,7 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math") -> 
     accuracy_reward = 1.0 if accuracy_pass else 0.0
     format_reward = 0.1 if format_pass else 0.0
     reward = accuracy_reward + format_reward
-    return RewardOutput(
+    result = RewardOutput(
         reward=reward,
         metadata={
             "expected_answer": expected_answer,
@@ -467,11 +500,29 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math") -> 
             "answer_char_count": len(answer_content),
         },
     )
-def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math") -> RewardOutput:
+    if debug_reward:
+        print(
+            f"reward:math  mode=reasoning  "
+            f"expected={expected_answer!r}  "
+            f"parsed={repr(parsed_answer) if parsed_answer else 'None'}  "
+            f"normalized={repr(normalized_answer) if normalized_answer else 'None'}  "
+            f"parse_pass={answer_parse_pass}  "
+            f"accuracy_pass={accuracy_pass}  "
+            f"format_pass={format_pass}  "
+            f"truncated={truncated}  "
+            f"finish_reason={finish_reason or 'None'}  "
+            f"think_blocks={len(think_blocks)}  "
+            f"answer_blocks={len(answer_blocks)}  "
+            f"reward={result.reward:.1f}",
+            flush=True
+        )
+    return result
+def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math", debug_reward: bool = False) -> RewardOutput:
     """Compute math reward from rollout metadata.
     Args:
         rollout: Rollout output with completion and metadata
         training_mode: "math" for answer-only, "reasoning" for reasoning + answer
+        debug_reward: Enable detailed logging of reward computation
     Returns:
         RewardOutput with combined score (0-1.0 range for math mode, 0-1.1 for reasoning mode)
     In "math" mode: Only checks answer correctness (0-1.0 range)
@@ -479,8 +530,8 @@ def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math") -> Rewar
     """
     if training_mode == "reasoning":
         # Reasoning mode: Combine reasoning + math scores
-        reasoning_result = reasoning_reward_fn(rollout)
-        math_result = _compute_math_score(rollout, training_mode="reasoning")  # Pass mode
+        reasoning_result = reasoning_reward_fn(rollout, debug_reward=debug_reward)
+        math_result = _compute_math_score(rollout, training_mode="reasoning", debug_reward=debug_reward)  # Pass mode
         # Combine: 70% reasoning + 30% math
         combined_score = (
             0.7 * reasoning_result.reward +
@@ -493,13 +544,21 @@ def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math") -> Rewar
             "training_mode": "reasoning",
             "combined_score": combined_score
         }
+        if debug_reward:
+            print(
+                f"reward:combined  mode=reasoning  "
+                f"reasoning_score={reasoning_result.reward:.3f} (70%)  "
+                f"math_score={math_result.reward:.1f} (30%)  "
+                f"combined_score={combined_score:.3f}",
+                flush=True
+            )
         return RewardOutput(
             reward=combined_score,
             metadata=metadata
         )
     else:
         # Math mode: Only check answer accuracy
-        return _compute_math_score(rollout, training_mode="math")  # Pass mode
+        return _compute_math_score(rollout, training_mode="math", debug_reward=debug_reward)  # Pass mode
 # Future code reasoning can live below as explicit `code_*` helpers later.
 # Keep this example concrete until we have real code-task data and verifiers.
 # Rollout hook
@@ -591,6 +650,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="math",
         help="Training mode: 'math' for pure math capability, 'reasoning' for reasoning quality + math",
     )
+    parser.add_argument(
+        "--debug-reward",
+        action="store_true",
+        help="Enable detailed reward computation logging for debugging",
+    )
     return parser
 def main(argv: list[str] | None = None) -> int:
     """Run the math example from the selected FlashRL profile."""
@@ -606,7 +670,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         # Create reward function wrapper that captures training_mode
         def reward_fn_with_mode(rollout: RolloutOutput) -> RewardOutput:
-            return math_reward_fn(rollout, training_mode=args.training_mode)
+            return math_reward_fn(rollout, training_mode=args.training_mode, debug_reward=args.debug_reward)
         flashrl = FlashRL(
             config_path=args.config,
             rollout_fn=reasoning_rollout_fn,
