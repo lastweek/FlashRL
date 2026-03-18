@@ -117,7 +117,7 @@ def register_routes() -> None:
         """List available models (OpenAI compatible)."""
         return jsonify({
             "object": "list",
-            "data": [{"id": engine.engine_args.model if engine else ""}],
+            "data": [{"id": engine.engine_core.model if engine else ""}],
         })
 
     @app.route("/v1/completions", methods=["POST"])
