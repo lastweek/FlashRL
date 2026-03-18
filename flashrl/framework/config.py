@@ -117,6 +117,7 @@ class ServingConfig(ModelConfig):
     num_replicas: int = Field(default=1, ge=1)
     vllm_args: list[str] = Field(default_factory=list)
     debug_live_rollout: bool = False
+    log_dir: str | Path | None = None
 
 
 class FSDP2Config(BaseConfig):

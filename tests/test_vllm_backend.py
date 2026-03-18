@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from io import StringIO
 from pathlib import Path
+import os
+import signal
 import time
 from types import SimpleNamespace
 
@@ -31,6 +33,7 @@ from flashrl.framework.serving import (
     VLLMServingBackend,
     create_serving_backend,
 )
+from flashrl.framework.serving.vllm.backend import _Replica
 from flashrl.framework.training import ActorTrainingBackend
 from tests.conftest import TinyActor
 
@@ -313,7 +316,7 @@ def _patch_current_vllm_environment(
     tmp_path: Path,
 ) -> Path:
     python_path = _make_fake_runtime(tmp_path)
-    monkeypatch.setattr(vllm_module.sys, "executable", str(python_path))
+    monkeypatch.setattr(sys, "executable", str(python_path))
     return python_path
 
 
@@ -503,7 +506,7 @@ def test_vllm_backend_retries_startup_with_local_snapshot_after_remote_failure(
         if model_source == "fake/model":
             raise RuntimeError("remote startup failed")
         return [
-            vllm_module._Replica(
+            _Replica(
                 index=0,
                 port=8100,
                 process=process,
@@ -579,7 +582,7 @@ def test_vllm_backend_sync_generate_and_close(
     monkeypatch.setattr(VLLMServingBackend, "_spawn_process", fake_spawn)
     monkeypatch.setattr(VLLMServingBackend, "_request_json", fake_request)
     monkeypatch.setattr(
-        vllm_module.tempfile,
+        tempfile,
         "mkdtemp",
         lambda prefix: str(tmp_path / "snapshot"),
     )
@@ -697,9 +700,9 @@ def test_vllm_backend_close_uses_process_group_teardown(
         "_request_json",
         lambda self, url, *, method, payload=None, timeout: {"data": [{"id": self.config.model_name}]},
     )
-    monkeypatch.setattr(vllm_module.os, "getpgid", lambda pid: pid + 1)
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid + 1)
     monkeypatch.setattr(
-        vllm_module.os,
+        os,
         "killpg",
         lambda pgid, sig: killpg_calls.append((pgid, sig)),
     )
@@ -713,7 +716,7 @@ def test_vllm_backend_close_uses_process_group_teardown(
     )
     backend.close()
 
-    assert killpg_calls == [(4322, vllm_module.signal.SIGTERM)]
+    assert killpg_calls == [(4322, signal.SIGTERM)]
     assert process.terminate_calls == 0
     assert process.kill_calls == 0
 

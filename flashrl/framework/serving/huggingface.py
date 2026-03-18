@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Callable
 from typing import Any
 
@@ -12,14 +13,19 @@ from flashrl.framework.serving.base import ServingBackend
 
 
 class HuggingFaceServingBackend(ServingBackend):
-    """In-process Hugging Face serving backend."""
+    """In-process Hugging Face serving backend.
+
+    Supports weight loading without restart via in-memory state dict loading.
+    This is the optimal approach for in-process backends.
+    """
 
     def __init__(
         self,
         config: ServingConfig,
         startup_logger: Callable[[str], None] | None = None,
+        log_dir: str | Path | None = None,
     ) -> None:
-        del startup_logger
+        del startup_logger, log_dir
         self.config = config
 
         # Set CPU thread limit before loading model.

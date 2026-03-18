@@ -284,6 +284,11 @@ class FlashRL:
         self._apply_random_seed()
         self._emit_bootstrap_banner()
 
+        self._run_logger = RunLogger(
+            self.logging_config,
+            model_name=self.actor_config.model_name,
+        )
+
         self._emit_bootstrap_stage(
             "startup",
             "actor_backend",
@@ -367,6 +372,7 @@ class FlashRL:
                 startup_logger=(
                     self._emit_bootstrap_console if self._bootstrap_console_enabled() else None
                 ),
+                log_dir=self._run_logger.run_dir,
             )
         )
         startup_total_seconds += duration_seconds
@@ -666,6 +672,30 @@ class FlashRL:
         self._actor_backend = None
         self._reference_backend = None
 
+    def pause_serving(self) -> None:
+        """Pause serving (if supported by backend)."""
+        if self._serving_backend is None:
+            return
+
+        # Delegate to backend's pause method if it exists
+        if hasattr(self._serving_backend, "pause_inference"):
+            self._serving_backend.pause_inference()
+        else:
+            # Alternative approach for backends without pause support
+            pass
+
+    def resume_serving(self) -> None:
+        """Resume serving (if supported by backend)."""
+        if self._serving_backend is None:
+            return
+
+        # Delegate to backend's resume method if it exists
+        if hasattr(self._serving_backend, "resume_inference"):
+            self._serving_backend.resume_inference()
+        else:
+            # Alternative approach for backends without resume support
+            pass
+
     def _resolve_train_dataset(
         self,
         dataset: list[Prompt] | list[str] | None,
@@ -719,7 +749,8 @@ class FlashRL:
     def _open_run_logger(self, run_state: TrainRunState) -> RunLogger:
         """Open and initialize the run-scoped logger for one training invocation."""
         if self._run_logger is not None:
-            self._run_logger.close()
+            if self._managed_resume is None:
+                return self._run_logger
 
         assert self._actor_backend is not None
         assert self._serving_backend is not None

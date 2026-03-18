@@ -1,4 +1,4 @@
-"""Unit tests for the reasoning-code example."""
+"""Unit tests for the code-single-turn example."""
 
 from __future__ import annotations
 
@@ -33,30 +33,30 @@ def load_script_module(
     return module
 
 
-reasoning_code_executor = load_script_module(
-    "flashrl_reasoning_code_executor",
-    "flashrl/framework/examples/reasoning-code/executor.py",
+code_basic_executor = load_script_module(
+    "flashrl_code_basic_executor",
+    "flashrl.framework.examples.code-single-turn/executor.py",
     aliases=("executor",),
 )
-reasoning_code = load_script_module(
-    "flashrl_reasoning_code_train",
-    "flashrl/framework/examples/reasoning-code/train.py",
+code_basic = load_script_module(
+    "flashrl_code_basic_train",
+    "flashrl.framework.examples.code-single-turn/train.py",
     aliases=("train",),
 )
-reasoning_code_eval = load_script_module(
-    "flashrl_reasoning_code_eval",
-    "flashrl/framework/examples/reasoning-code/eval.py",
+code_basic_eval = load_script_module(
+    "flashrl_code_basic_eval",
+    "flashrl.framework.examples.code-single-turn/eval.py",
 )
 
 
 def make_prompt(*, task_id: str = "codeforces-train-1", rating: int = 1200) -> Prompt:
     """Build one strict code prompt with minimal metadata."""
     return Prompt(
-        text=reasoning_code.render_code_prompt("Write a program that prints 42."),
+        text=code_basic.render_code_prompt("Write a program that prints 42."),
         metadata={
             "task_id": task_id,
-            "source": reasoning_code.DEFAULT_CODEFORCES_HF_DATASET,
-            "config": reasoning_code.DEFAULT_CODEFORCES_HF_CONFIG,
+            "source": code_basic.DEFAULT_CODEFORCES_HF_DATASET,
+            "config": code_basic.DEFAULT_CODEFORCES_HF_CONFIG,
             "split": "train",
             "language": "python",
             "rating": rating,
@@ -93,7 +93,7 @@ def make_rollout(
 
 def test_render_code_prompt_enforces_strict_contract() -> None:
     """The code example should keep the same visible strict output contract."""
-    prompt = reasoning_code.render_code_prompt("Solve X.")
+    prompt = code_basic.render_code_prompt("Solve X.")
 
     assert "<think>...</think>" in prompt
     assert "<answer>...</answer>" in prompt
@@ -108,9 +108,9 @@ def test_build_code_train_dataset_filters_python_stdio_rating_and_prints_summary
     """Dataset loading should keep only the supported Python Codeforces rows."""
 
     def fake_load_dataset(dataset_name: str, config_name: str, *, split: str):
-        assert dataset_name == reasoning_code.DEFAULT_CODEFORCES_HF_DATASET
-        assert config_name == reasoning_code.DEFAULT_CODEFORCES_HF_CONFIG
-        assert split == reasoning_code.DEFAULT_CODEFORCES_TRAIN_SPLIT
+        assert dataset_name == code_basic.DEFAULT_CODEFORCES_HF_DATASET
+        assert config_name == code_basic.DEFAULT_CODEFORCES_HF_CONFIG
+        assert split == code_basic.DEFAULT_CODEFORCES_TRAIN_SPLIT
         return [
             {
                 "problem_id": "1000A",
@@ -162,7 +162,7 @@ def test_build_code_train_dataset_filters_python_stdio_rating_and_prints_summary
 
     monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
 
-    dataset = reasoning_code.build_code_train_dataset(limit=1, max_tests_per_problem=1)
+    dataset = code_basic.build_code_train_dataset(limit=1, max_tests_per_problem=1)
     output = capsys.readouterr().out
 
     assert len(dataset) == 1
@@ -174,7 +174,7 @@ def test_build_code_train_dataset_filters_python_stdio_rating_and_prints_summary
     assert "available=4  selected=1" in output
     assert "language=python" in output
     assert "rating=<= 1600" in output
-    assert reasoning_code.CODEFORCES_EXECUTION_PAYLOADS["codeforces-train-1000A"]["official_tests"] == [
+    assert code_basic.CODEFORCES_EXECUTION_PAYLOADS["codeforces-train-1000A"]["official_tests"] == [
         {"input": "20 22\n", "output": "42\n"}
     ]
 
@@ -204,10 +204,10 @@ def test_build_code_eval_dataset_uses_test_split(
 
     monkeypatch.setitem(sys.modules, "datasets", SimpleNamespace(load_dataset=fake_load_dataset))
 
-    dataset = reasoning_code.build_code_eval_dataset(limit=1)
+    dataset = code_basic.build_code_eval_dataset(limit=1)
 
-    assert seen_splits == [reasoning_code.DEFAULT_CODEFORCES_EVAL_SPLIT]
-    assert dataset[0].metadata["split"] == reasoning_code.DEFAULT_CODEFORCES_EVAL_SPLIT
+    assert seen_splits == [code_basic.DEFAULT_CODEFORCES_EVAL_SPLIT]
+    assert dataset[0].metadata["split"] == code_basic.DEFAULT_CODEFORCES_EVAL_SPLIT
 
 
 def test_score_code_rollout_uses_execution_reward_and_strict_format(
@@ -216,7 +216,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
 ) -> None:
     """Reward cases should mirror the code example's 1.1 / 1.0 / 0.1 / 0.0 behavior."""
     prompt = make_prompt()
-    reasoning_code.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
+    code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
         "time_limit_seconds": 1.0,
@@ -226,7 +226,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
     def fake_run_python_solution(code: str, **kwargs):
         del kwargs
         if "print(42)" in code:
-            return reasoning_code_executor.ExecutionResult(
+            return code_basic_executor.ExecutionResult(
                 passed_tests=1,
                 total_tests=1,
                 pass_rate=1.0,
@@ -234,7 +234,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
                 failure_reason=None,
                 checker_used=False,
             )
-        return reasoning_code_executor.ExecutionResult(
+        return code_basic_executor.ExecutionResult(
             passed_tests=0,
             total_tests=1,
             pass_rate=0.0,
@@ -243,9 +243,9 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
             checker_used=False,
         )
 
-    monkeypatch.setattr(reasoning_code.executor, "run_python_solution", fake_run_python_solution)
+    monkeypatch.setattr(code_basic.executor, "run_python_solution", fake_run_python_solution)
 
-    perfect = reasoning_code.score_code_rollout(
+    perfect = code_basic.score_code_rollout(
         make_rollout(
             prompt,
             "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
@@ -253,7 +253,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
     )
-    trailing = reasoning_code.score_code_rollout(
+    trailing = code_basic.score_code_rollout(
         make_rollout(
             prompt,
             "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>\nextra",
@@ -261,7 +261,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
     )
-    strict_wrong = reasoning_code.score_code_rollout(
+    strict_wrong = code_basic.score_code_rollout(
         make_rollout(
             prompt,
             "<think>Try print.</think><answer>```python\nprint(0)\n```</answer>",
@@ -269,7 +269,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
     )
-    missing_fence = reasoning_code.score_code_rollout(
+    missing_fence = code_basic.score_code_rollout(
         make_rollout(
             prompt,
             "<think>Try print.</think><answer>print(42)</answer>",
@@ -314,16 +314,16 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
 ) -> None:
     """Length truncation should remove the format bonus even when tests pass."""
     prompt = make_prompt(task_id="codeforces-train-trunc")
-    reasoning_code.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
+    code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
         "time_limit_seconds": 1.0,
         "memory_limit_mb": 256,
     }
     monkeypatch.setattr(
-        reasoning_code.executor,
+        code_basic.executor,
         "run_python_solution",
-        lambda code, **kwargs: reasoning_code_executor.ExecutionResult(
+        lambda code, **kwargs: code_basic_executor.ExecutionResult(
             passed_tests=1,
             total_tests=1,
             pass_rate=1.0,
@@ -333,7 +333,7 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
         ),
     )
 
-    reward = reasoning_code.score_code_rollout(
+    reward = code_basic.score_code_rollout(
         make_rollout(
             prompt,
             "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
@@ -355,14 +355,14 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
 
 def test_run_python_solution_handles_success_and_checker_path() -> None:
     """The executor should support direct stdout matches and optional checkers."""
-    direct = reasoning_code_executor.run_python_solution(
+    direct = code_basic_executor.run_python_solution(
         "import sys\nprint(sum(map(int, sys.stdin.read().split())))\n",
         official_tests=[{"input": "20 22\n", "output": "42\n"}],
         checker_code=None,
         timeout_seconds=1.0,
         memory_limit_mb=256,
     )
-    checker = reasoning_code_executor.run_python_solution(
+    checker = code_basic_executor.run_python_solution(
         "print('3 2 1')\n",
         official_tests=[{"input": "", "output": "1 2 3\n"}],
         checker_code=(
@@ -393,7 +393,7 @@ def test_run_python_solution_handles_success_and_checker_path() -> None:
 )
 def test_run_python_solution_failure_modes(code: str, expected_reason: str) -> None:
     """The executor should surface the main local failure modes clearly."""
-    result = reasoning_code_executor.run_python_solution(
+    result = code_basic_executor.run_python_solution(
         code,
         official_tests=[{"input": "", "output": "42\n"}],
         checker_code=None,
@@ -405,9 +405,9 @@ def test_run_python_solution_failure_modes(code: str, expected_reason: str) -> N
     assert result.failure_reason == expected_reason
 
 
-def test_reasoning_code_cli_help_uses_explicit_flag_surface() -> None:
+def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
     """The example CLIs should expose the intended explicit operator knobs."""
-    train_help = reasoning_code.build_argument_parser().format_help()
+    train_help = code_basic.build_argument_parser().format_help()
     assert "--config" in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" not in train_help
@@ -418,7 +418,7 @@ def test_reasoning_code_cli_help_uses_explicit_flag_surface() -> None:
     assert "--memory-limit-mb" in train_help
     assert "--max-tests-per-problem" in train_help
 
-    eval_help = reasoning_code_eval.build_argument_parser().format_help()
+    eval_help = code_basic_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
     assert "--eval-limit" in eval_help
     assert "--batch-size" in eval_help
@@ -429,26 +429,26 @@ def test_reasoning_code_cli_help_uses_explicit_flag_surface() -> None:
     assert "--max-tests-per-problem" in eval_help
 
 
-def test_prepare_reasoning_code_environment_sets_default_vllm_runtime(
+def test_prepare_code_basic_environment_sets_default_vllm_runtime(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The script entrypoint should auto-fill the default vLLM runtime."""
     monkeypatch.delenv("FLASHRL_VLLM_PYTHON", raising=False)
     monkeypatch.setattr(
-        reasoning_code,
+        code_basic,
         "find_default_vllm_python",
         lambda: "/tmp/fake-vllm-python",
     )
 
-    reasoning_code.prepare_reasoning_code_environment(
-        "flashrl/framework/examples/reasoning-code/config_vllm.yaml"
+    code_basic.prepare_code_basic_environment(
+        "flashrl.framework.examples.code-single-turn/config_vllm.yaml"
     )
 
     assert "FLASHRL_VLLM_PYTHON" in sys.modules["os"].environ
     sys.modules["os"].environ.pop("FLASHRL_VLLM_PYTHON", None)
 
 
-def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
+def test_code_basic_main_uses_profile_aware_flashrl_constructor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The code example should pass config_path into FlashRL instead of parsing YAML locally."""
@@ -464,13 +464,13 @@ def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(reasoning_code, "FlashRL", FakeFlashRL)
-    monkeypatch.setattr(reasoning_code, "build_code_train_dataset", lambda **kwargs: [])
+    monkeypatch.setattr(code_basic, "FlashRL", FakeFlashRL)
+    monkeypatch.setattr(code_basic, "build_code_train_dataset", lambda **kwargs: [])
 
-    exit_code = reasoning_code.main(
+    exit_code = code_basic.main(
         [
             "--config",
-            "flashrl/framework/examples/reasoning-code/config.yaml",
+            "flashrl.framework.examples.code-single-turn/config.yaml",
             "--run-timeout-seconds",
             "2.5",
             "--memory-limit-mb",
@@ -479,24 +479,24 @@ def test_reasoning_code_main_uses_profile_aware_flashrl_constructor(
     )
 
     assert exit_code == 0
-    assert captured["config_path"] == "flashrl/framework/examples/reasoning-code/config.yaml"
+    assert captured["config_path"] == "flashrl.framework.examples.code-single-turn/config.yaml"
     assert callable(captured["rollout_fn"])
     assert callable(captured["reward_fn"])
     assert "checkpoint_out" not in captured
 
 
-def test_reasoning_code_train_is_the_real_example_module() -> None:
+def test_code_basic_train_is_the_real_example_module() -> None:
     """train.py should hold the actual code example logic without workflow indirection."""
-    train_source = Path("flashrl/framework/examples/reasoning-code/train.py").read_text(
+    train_source = Path("flashrl.framework.examples.code-single-turn/train.py").read_text(
         encoding="utf-8"
     )
-    eval_source = Path("flashrl/framework/examples/reasoning-code/eval.py").read_text(
+    eval_source = Path("flashrl.framework.examples.code-single-turn/eval.py").read_text(
         encoding="utf-8"
     )
     assert "WORKFLOW_PATH" not in train_source
     assert "exec(compile(" not in train_source
     assert "import train as code_example" in eval_source
-    assert not Path("flashrl/framework/examples/reasoning-code/workflow.py").exists()
+    assert not Path("flashrl.framework.examples.code-single-turn/workflow.py").exists()
 
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
@@ -507,13 +507,13 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
         make_prompt(task_id="codeforces-test-1", rating=900),
         make_prompt(task_id="codeforces-test-2", rating=1000),
     ]
-    reasoning_code.CODEFORCES_EXECUTION_PAYLOADS[prompts[0].metadata["task_id"]] = {
+    code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompts[0].metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
         "time_limit_seconds": 1.0,
         "memory_limit_mb": 256,
     }
-    reasoning_code.CODEFORCES_EXECUTION_PAYLOADS[prompts[1].metadata["task_id"]] = {
+    code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompts[1].metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
         "time_limit_seconds": 1.0,
@@ -523,7 +523,7 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
     def fake_run_python_solution(code: str, **kwargs):
         del kwargs
         if "print(42)" in code:
-            return reasoning_code_executor.ExecutionResult(
+            return code_basic_executor.ExecutionResult(
                 passed_tests=1,
                 total_tests=1,
                 pass_rate=1.0,
@@ -531,7 +531,7 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
                 failure_reason=None,
                 checker_used=False,
             )
-        return reasoning_code_executor.ExecutionResult(
+        return code_basic_executor.ExecutionResult(
             passed_tests=0,
             total_tests=1,
             pass_rate=0.0,
@@ -540,7 +540,7 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
             checker_used=False,
         )
 
-    monkeypatch.setattr(reasoning_code.executor, "run_python_solution", fake_run_python_solution)
+    monkeypatch.setattr(code_basic.executor, "run_python_solution", fake_run_python_solution)
 
     class FakeServingBackend:
         def __init__(self) -> None:
@@ -579,14 +579,14 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
                     )
             return outputs
 
-    prompts[0].text = reasoning_code.render_code_prompt("Write code that prints 42.")
-    prompts[1].text = reasoning_code.render_code_prompt("Write code that prints 0.")
+    prompts[0].text = code_basic.render_code_prompt("Write code that prints 42.")
+    prompts[1].text = code_basic.render_code_prompt("Write code that prints 0.")
     flashrl = SimpleNamespace(
         _serving_backend=FakeServingBackend(),
         rollout_config=SimpleNamespace(max_new_tokens=96),
     )
 
-    metrics = reasoning_code_eval.evaluate_model(
+    metrics = code_basic_eval.evaluate_model(
         flashrl,
         dataset=prompts,
         batch_size=2,

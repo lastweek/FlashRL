@@ -2027,14 +2027,14 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("flashrl/framework/examples/reasoning-code/eval.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/executor.py").exists()
     assert Path("flashrl/framework/examples/reasoning-code/config.yaml").exists()
-    assert Path("flashrl/framework/examples/reasoning-code/config_vllm.yaml").exists()
+    assert Path("flashrl/framework/examples/code-single-turn/config_vllm.yaml").exists()
 
     docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
     reasoning_docs = Path("flashrl/framework/examples/math/README.md").read_text(
         encoding="utf-8"
     )
-    reasoning_code_docs = Path(
-        "flashrl/framework/examples/reasoning-code/README.md"
+    code_basic_docs = Path(
+        "flashrl/framework/examples/code-single-turn/README.md"
     ).read_text(
         encoding="utf-8"
     )
@@ -2071,19 +2071,19 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "serving.backend" in reasoning_docs
     assert "reference" in reasoning_docs
     assert "grpo.group_size" in reasoning_docs
-    assert "python3 flashrl/framework/examples/reasoning-code/train.py" in reasoning_code_docs
-    assert "python3 flashrl/framework/examples/reasoning-code/eval.py" in reasoning_code_docs
-    assert "strict R1-style Codeforces prototype" in reasoning_code_docs
-    assert "does not support direct" in reasoning_code_docs
-    assert "official tests only in v1" in reasoning_code_docs
-    assert "`rating <= 1600`" in reasoning_code_docs
-    assert "--run-timeout-seconds" in reasoning_code_docs
-    assert "--memory-limit-mb" in reasoning_code_docs
-    assert "--max-tests-per-problem" in reasoning_code_docs
-    assert "not copied into `console.log`" in reasoning_code_docs
-    assert "execution_status" in reasoning_code_docs
-    assert "code_preview" in reasoning_code_docs
-    assert "checkpointing:" in reasoning_code_docs
+    assert "python3 flashrl/framework/examples/reasoning-code/train.py" in code_basic_docs
+    assert "python3 flashrl/framework/examples/reasoning-code/eval.py" in code_basic_docs
+    assert "strict R1-style Codeforces prototype" in code_basic_docs
+    assert "does not support direct" in code_basic_docs
+    assert "official tests only in v1" in code_basic_docs
+    assert "`rating <= 1600`" in code_basic_docs
+    assert "--run-timeout-seconds" in code_basic_docs
+    assert "--memory-limit-mb" in code_basic_docs
+    assert "--max-tests-per-problem" in code_basic_docs
+    assert "not copied into `console.log`" in code_basic_docs
+    assert "execution_status" in code_basic_docs
+    assert "code_preview" in code_basic_docs
+    assert "checkpointing:" in code_basic_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
@@ -2132,19 +2132,19 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "  num_threads: 1" in example_yaml
     assert "  debug_live_rollout: true" in example_yaml
     assert "save_on_run_end: true" in example_yaml
-    assert "final_path: /tmp/flashrl_reasoning_checkpoint.pt" in example_yaml
+    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in example_yaml
     assert "debug_live_rollout:" in docs
     assert "backend: vllm" in vllm_example_yaml
     assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
     assert "checkpointing:" in vllm_example_yaml
-    assert "final_path: /tmp/flashrl_reasoning_checkpoint.pt" in vllm_example_yaml
+    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in vllm_example_yaml
     assert "hooks:" not in vllm_example_yaml
     assert "hooks:" not in code_example_yaml
     assert "hooks:" not in code_vllm_example_yaml
     assert "checkpointing:" in code_example_yaml
-    assert "final_path: /tmp/flashrl_reasoning_code_checkpoint.pt" in code_example_yaml
+    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in code_example_yaml
     assert "checkpointing:" in code_vllm_example_yaml
-    assert "final_path: /tmp/flashrl_reasoning_code_checkpoint.pt" in code_vllm_example_yaml
+    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in code_vllm_example_yaml
     assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
     assert "Qwen/Qwen2.5-Coder-1.5B" in code_vllm_example_yaml
     assert "~/.venv-vllm" not in vllm_example_yaml

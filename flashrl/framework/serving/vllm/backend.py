@@ -17,7 +17,7 @@ import sys
 import tempfile
 from threading import Lock, Thread
 import time
-from typing import Callable
+from typing import Callable, TextIO
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
@@ -54,6 +54,8 @@ class _Replica:
     stderr_lines: list[str] = field(default_factory=list)
     stderr_lock: Lock = field(default_factory=Lock)
     stderr_thread: Thread | None = None
+    stderr_file_path: Path | None = None
+    stderr_file: TextIO | None = None
 
     @property
     def base_url(self) -> str:
@@ -67,12 +69,13 @@ class _Replica:
 
 
 class VLLMServingBackend(ServingBackend):
-    """Serving backend backed by managed local `vllm serve` replicas."""
+    """Serving backend backed by managed `vllm serve` replicas."""
 
     def __init__(
         self,
         config: ServingConfig,
         startup_logger: Callable[[str], None] | None = None,
+        log_dir: str | Path | None = None,
     ) -> None:
         self.config = config
         self.device: Any = config.device or "auto"
@@ -84,6 +87,7 @@ class VLLMServingBackend(ServingBackend):
         self._snapshot_dir: Path | None = None
         self._replicas: list[_Replica] = []
         self._admin_replicas: list[_Replica] = []
+        self._log_dir = Path(log_dir) if log_dir else None
 
         self._validate_environment()
 
@@ -284,17 +288,33 @@ class VLLMServingBackend(ServingBackend):
 
     def _launch_replicas(self, model_source: str) -> list[_Replica]:
         replicas: list[_Replica] = []
+        vllm_log_dir: Path | None = None
+        if self._log_dir is not None:
+            vllm_log_dir = self._log_dir / "vllm"
+            vllm_log_dir.mkdir(parents=True, exist_ok=True)
         try:
             for index in range(self.config.num_replicas):
                 port = self._reserve_port()
                 command = self._build_command(model_source, port)
                 process = self._spawn_process(command)
+                stderr_file_path: Path | None = None
+                stderr_file: TextIO | None = None
+                if vllm_log_dir is not None:
+                    stderr_file_path = vllm_log_dir / f"replica-{index}.log"
+                    stderr_file = open(stderr_file_path, "a", encoding="utf-8")
+                    stderr_file.write(f"\n{'=' * 72}\n")
+                    stderr_file.write(f"VLLM Replica {index} started at {utc_now_iso()}\n")
+                    stderr_file.write(f"Command: {' '.join(command)}\n")
+                    stderr_file.write(f"{'=' * 72}\n\n")
+                    stderr_file.flush()
                 replica = _Replica(
                     index=index,
                     port=port,
                     process=process,
                     model_source=model_source,
                     command=command,
+                    stderr_file_path=stderr_file_path,
+                    stderr_file=stderr_file,
                 )
                 replica.stderr_thread = Thread(
                     target=self._drain_stderr,
@@ -337,7 +357,7 @@ class VLLMServingBackend(ServingBackend):
         self._replicas = self._launch_replicas(model_source)
 
     def _build_command(self, model_source: str, port: int) -> list[str]:
-        return [
+        command = [
             str(self._vllm_executable),
             "serve",
             model_source,
@@ -347,10 +367,9 @@ class VLLMServingBackend(ServingBackend):
             str(port),
             "--served-model-name",
             self.config.model_name,
-            "--generation-config",
-            "vllm",
-            *self.config.vllm_args,
         ]
+        command.extend(self.config.vllm_args)
+        return command
 
     def _spawn_process(self, command: list[str]) -> subprocess.Popen[str]:
         return subprocess.Popen(
@@ -371,14 +390,20 @@ class VLLMServingBackend(ServingBackend):
             if not normalized:
                 continue
             with replica.stderr_lock:
+                if replica.stderr_file is not None:
+                    replica.stderr_file.write(normalized + "\n")
+                    replica.stderr_file.flush()
                 replica.stderr_lines.append(normalized)
                 if len(replica.stderr_lines) > 200:
                     replica.stderr_lines[:] = replica.stderr_lines[-200:]
-            self._maybe_emit_startup_log(replica, normalized)
+            if replica.stderr_file is None:
+                self._maybe_emit_startup_log(replica, normalized)
 
     def _maybe_emit_startup_log(self, replica: _Replica, line: str) -> None:
         """Surface replica initialization stderr lines in the parent console."""
         if self._startup_logger is None:
+            return
+        if replica.stderr_file is not None:
             return
         if replica.ready_at is not None or replica.phase != "Starting":
             return
@@ -752,6 +777,13 @@ class VLLMServingBackend(ServingBackend):
         replica.phase = "Closed"
         if replica.process.stderr is not None:
             replica.process.stderr.close()
+        if replica.stderr_file is not None:
+            replica.stderr_file.write(f"\n{'=' * 72}\n")
+            replica.stderr_file.write(f"VLLM Replica {replica.index} stopped at {utc_now_iso()}\n")
+            replica.stderr_file.write(f"Exit code: {replica.exit_code}\n")
+            replica.stderr_file.write(f"{'=' * 72}\n\n")
+            replica.stderr_file.close()
+            replica.stderr_file = None
 
     def _reserve_port(self) -> int:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:

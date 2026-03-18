@@ -27,6 +27,7 @@ def evaluate_model(
     batch_size: int,
     run_timeout_seconds: float,
     memory_limit_mb: int | None,
+    training_mode: str = "code",
 ) -> dict[str, float | int]:
     """Run held-out evaluation against the current serving backend."""
     if batch_size < 1:
@@ -46,6 +47,7 @@ def evaluate_model(
     reward_fn = code_example.make_code_reward_fn(
         run_timeout_seconds=run_timeout_seconds,
         memory_limit_mb=memory_limit_mb,
+        training_mode=training_mode,
     )
     total_reward = 0.0
     solved = 0
@@ -143,6 +145,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional cap on official tests per problem for smoke runs.",
     )
+    parser.add_argument(
+        "--training-mode",
+        choices=code_example.SUPPORTED_TRAINING_MODES,
+        default="code",
+        help="Training mode: 'code' for pure code capability, 'reasoning-code' for reasoning + code",
+    )
     return parser
 
 
@@ -159,6 +167,7 @@ def main(argv: list[str] | None = None) -> int:
             rating_min=args.rating_min,
             rating_max=args.rating_max,
             max_tests_per_problem=args.max_tests_per_problem,
+            training_mode=args.training_mode,
         )
         checkpoint = args.checkpoint
         if checkpoint is None:
@@ -172,6 +181,7 @@ def main(argv: list[str] | None = None) -> int:
             reward_fn=code_example.make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),
                 memory_limit_mb=args.memory_limit_mb,
+                training_mode=args.training_mode,
             ),
         )
         if checkpoint:
@@ -182,6 +192,7 @@ def main(argv: list[str] | None = None) -> int:
             batch_size=args.batch_size,
             run_timeout_seconds=float(args.run_timeout_seconds),
             memory_limit_mb=args.memory_limit_mb,
+            training_mode=args.training_mode,
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:

@@ -27,7 +27,7 @@ execution reward. It keeps the same visible `<think>...</think><answer>...</answ
 contract as the math example, but the final answer is a fenced Python code
 block that is executed against official tests.
 
-See [flashrl/framework/examples/reasoning-code/README.md](reasoning-code/README.md) for:
+See [flashrl/framework/examples/code-single-turn/README.md](code-single-turn/README.md) for:
 
 - the script-based train and eval commands
 - dataset filtering and rating defaults

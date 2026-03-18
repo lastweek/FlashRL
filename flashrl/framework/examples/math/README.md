@@ -312,7 +312,7 @@ python3 flashrl/framework/examples/math/eval.py \
   --checkpoint /tmp/flashrl_reasoning_checkpoint.pt
 ```
 
-This example is intentionally script-run. Like `reasoning-code`, the folder is
+This example is intentionally script-run. Like `code-single-turn`, the folder is
 hyphenated, so `train.py` and `eval.py` load the YAML profiles directly and
 construct `FlashRL(...)` in code instead of using `FlashRL.from_yaml(...)`.
 

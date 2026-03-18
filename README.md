@@ -61,7 +61,7 @@ The first code example is a script-based Codeforces prototype with local
 execution reward:
 
 ```bash
-python3 flashrl/framework/examples/reasoning-code/train.py
+python3 flashrl/framework/examples/code-single-turn/train.py
 ```
 
 ### Inspect Run Artifacts

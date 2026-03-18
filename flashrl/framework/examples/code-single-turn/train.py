@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import os
 from pathlib import Path
 import re
@@ -40,6 +41,8 @@ DEFAULT_RUN_TIMEOUT_SECONDS = 4.0
 DEFAULT_MEMORY_LIMIT_MB = 512
 CODE_PREVIEW_MAX_LINES = 6
 CODE_PREVIEW_MAX_CHARS = 240
+SUPPORTED_TRAINING_MODES = ("code", "reasoning-code")
+DEFAULT_GENERATED_CODE_LOG_DIR = "generated_code"
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_BLOCK_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -59,16 +62,30 @@ CODEFORCES_EXECUTION_PAYLOADS: dict[str, dict[str, Any]] = {}
 # Prompt contract
 
 
-def render_code_prompt(problem_prompt: str) -> str:
-    """Render one strict user prompt around the dataset-provided problem text."""
-    return (
+def render_code_prompt(problem_prompt: str, training_mode: str = "code") -> str:
+    """Render one user prompt around the dataset-provided problem text.
+    Args:
+        problem_prompt: The problem statement from the dataset
+        training_mode: "code" for simple code generation, "reasoning-code" for strict format
+    Returns:
+        Formatted prompt string
+    """
+    if training_mode == "reasoning-code":
+        # Reasoning-code mode: Require thinking blocks AND answer blocks with code
+        return (
         "Solve the following Codeforces problem in Python.\n"
         "Respond with exactly one <think>...</think> block followed immediately by "
         "exactly one <answer>...</answer> block.\n"
         "Inside <answer>, output exactly one fenced Python code block.\n"
         "Do not output any text before <think> or after </answer>.\n\n"
         f"{problem_prompt.strip()}"
-    )
+        )
+    else:
+        # Code mode: Simple code generation without thinking blocks
+        return (
+            "Solve the following Codeforces problem in Python.\n\n"
+            f"{problem_prompt.strip()}"
+        )
 
 
 # Dataset loading
@@ -358,6 +375,7 @@ def build_code_train_dataset(
     rating_min: int | None = None,
     rating_max: int | None = DEFAULT_CODE_RATING_MAX,
     max_tests_per_problem: int | None = None,
+    training_mode: str = "code",
 ) -> list[Prompt]:
     """Build the Codeforces training dataset used by the example CLI."""
     rows = _load_codeforces_split(
@@ -369,7 +387,7 @@ def build_code_train_dataset(
     )
     return [
         Prompt(
-            text=render_code_prompt(row["prompt"]),
+            text=render_code_prompt(row["prompt"], training_mode=training_mode),
             metadata={
                 "task_id": row["task_id"],
                 "source": row["source"],
@@ -390,6 +408,7 @@ def build_code_eval_dataset(
     rating_min: int | None = None,
     rating_max: int | None = DEFAULT_CODE_RATING_MAX,
     max_tests_per_problem: int | None = None,
+    training_mode: str = "code",
 ) -> list[Prompt]:
     """Build the held-out Codeforces evaluation dataset."""
     rows = _load_codeforces_split(
@@ -401,7 +420,7 @@ def build_code_eval_dataset(
     )
     return [
         Prompt(
-            text=render_code_prompt(row["prompt"]),
+            text=render_code_prompt(row["prompt"], training_mode=training_mode),
             metadata={
                 "task_id": row["task_id"],
                 "source": row["source"],
@@ -449,6 +468,27 @@ def _extract_python_code(answer_text: str) -> str | None:
     return code
 
 
+def _extract_python_code_anywhere(response_text: str) -> str | None:
+    """Extract the first fenced Python block from anywhere in the response.
+    Used for "code" mode where format restrictions are relaxed.
+    """
+    # First try to find a code block in an answer block
+    answer_text = _extract_answer_block(response_text)
+    if answer_text:
+        code = _extract_python_code(answer_text)
+        if code:
+            return code
+
+    # If not found in answer block, try to find any code block directly
+    matches = CODE_BLOCK_PATTERN.findall(response_text)
+    if matches:
+        code = matches[0].strip()
+        if code:
+            return code
+
+    return None
+
+
 def _build_code_preview(text: str | None) -> str:
     """Keep a short readable preview of the generated answer or code."""
     if text is None:
@@ -474,12 +514,14 @@ def _print_code_reward_summary(
     truncated: bool,
     execution_result: executor.ExecutionResult,
     code_preview: str,
+    training_mode: str = "code",
 ) -> None:
     """Print a compact execution summary for the current rollout."""
     status = "passed" if execution_result.failure_reason is None else execution_result.failure_reason
     line = (
         "code     "
         f"task={task_id or 'unknown'}  "
+        f"mode={training_mode}  "
         f"tests={execution_result.passed_tests}/{execution_result.total_tests}  "
         f"pass_rate={execution_result.pass_rate:.2f}  "
         f"format={'ok' if format_pass else 'bad'}  "
@@ -501,6 +543,7 @@ def score_code_rollout(
     *,
     run_timeout_seconds: float,
     memory_limit_mb: int | None,
+    training_mode: str = "code",
 ) -> RewardOutput:
     """Score one generated Codeforces rollout with local test execution."""
     text = rollout.text
@@ -512,22 +555,30 @@ def score_code_rollout(
     official_tests = execution_payload.get("official_tests") or []
     checker_code = execution_payload.get("checker_code")
 
-    think_blocks = THINK_BLOCK_PATTERN.findall(text)
-    answer_blocks = ANSWER_BLOCK_PATTERN.findall(text)
-    strict_match = STRICT_RESPONSE_PATTERN.fullmatch(text)
-    strict_answer = strict_match.group("answer").strip() if strict_match is not None else ""
-    strict_code = _extract_python_code(strict_answer) if strict_answer else None
-    format_pass = bool(
-        strict_match is not None
-        and len(think_blocks) == 1
-        and len(answer_blocks) == 1
-        and strict_match.group("think").strip()
-        and strict_code is not None
-        and not truncated
-    )
+    if training_mode == "reasoning-code":
+        # Reasoning-code mode: Strict format validation
+        think_blocks = THINK_BLOCK_PATTERN.findall(text)
+        answer_blocks = ANSWER_BLOCK_PATTERN.findall(text)
+        strict_match = STRICT_RESPONSE_PATTERN.fullmatch(text)
+        strict_answer = strict_match.group("answer").strip() if strict_match is not None else ""
+        strict_code = _extract_python_code(strict_answer) if strict_answer else None
+        format_pass = bool(
+            strict_match is not None
+            and len(think_blocks) == 1
+            and len(answer_blocks) == 1
+            and strict_match.group("think").strip()
+            and strict_code is not None
+            and not truncated
+        )
 
-    answer_text = _extract_answer_block(text)
-    extracted_code = _extract_python_code(answer_text or "") if answer_text else None
+        answer_text = _extract_answer_block(text)
+        extracted_code = _extract_python_code(answer_text or "") if answer_text else None
+    else:
+        # Code mode: Relaxed format, extract code from anywhere
+        format_pass = False  # No format bonus in code mode
+        extracted_code = _extract_python_code_anywhere(text)
+        answer_text = None  # Not used in code mode
+
     execution_result: executor.ExecutionResult
     if extracted_code is None or not official_tests:
         execution_result = executor.ExecutionResult(
@@ -535,7 +586,7 @@ def score_code_rollout(
             total_tests=len(official_tests),
             pass_rate=0.0,
             execution_seconds=0.0,
-            failure_reason="missing_code" if answer_text is None else "invalid_code_fence",
+            failure_reason="missing_code" if extracted_code is None else "invalid_code_fence",
             checker_used=False,
         )
         if not official_tests:
@@ -565,7 +616,12 @@ def score_code_rollout(
         execution_result.total_tests > 0
         and execution_result.passed_tests == execution_result.total_tests
     )
-    reward = float(execution_result.pass_rate) + (0.1 if format_pass else 0.0)
+    if training_mode == "reasoning-code":
+        # Reasoning-code mode: pass_rate + format bonus (0.0 to 1.1)
+        reward = float(execution_result.pass_rate) + (0.1 if format_pass else 0.0)
+    else:
+        # Code mode: pass_rate only (0.0 to 1.0)
+        reward = float(execution_result.pass_rate)
     code_preview = _build_code_preview(extracted_code or answer_text or text)
     execution_status = "passed" if accuracy_pass else execution_result.failure_reason or "failed"
 
@@ -576,6 +632,7 @@ def score_code_rollout(
         truncated=truncated,
         execution_result=execution_result,
         code_preview=code_preview,
+        training_mode=training_mode,
     )
 
     return RewardOutput(
@@ -603,15 +660,51 @@ def make_code_reward_fn(
     *,
     run_timeout_seconds: float,
     memory_limit_mb: int | None,
+    training_mode: str = "code",
+    log_dir: str = DEFAULT_GENERATED_CODE_LOG_DIR,
 ) -> Callable[[RolloutOutput], RewardOutput]:
     """Build one reward function with the selected local execution limits."""
 
+    # Create logging directory
+    log_path = Path(log_dir)
+    log_path.mkdir(parents=True, exist_ok=True)
+
     def reward_fn(rollout: RolloutOutput) -> RewardOutput:
-        return score_code_rollout(
+        result = score_code_rollout(
             rollout,
             run_timeout_seconds=run_timeout_seconds,
             memory_limit_mb=memory_limit_mb,
+            training_mode=training_mode,
         )
+
+        # Log generated code and reward
+        task_id = result.metadata.get("task_id", "unknown")
+        # Sanitize task_id to replace special characters that are problematic in filenames
+        safe_task_id = task_id.replace("/", "_").replace("\\", "_")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        filename = f"{safe_task_id}_{timestamp}.txt"
+        filepath = log_path / filename
+
+        with open(filepath, "w") as f:
+            f.write(f"Task ID: {task_id}\n")
+            f.write(f"Timestamp: {timestamp}\n")
+            f.write(f"Log File: {filename}\n")
+            f.write(f"Reward: {result.reward:.4f}\n")
+            f.write(f"Pass Rate: {result.metadata.get('pass_rate', 0):.4f}\n")
+            f.write(f"Passed/Total Tests: {result.metadata.get('passed_tests', 0)}/{result.metadata.get('total_tests', 0)}\n")
+            f.write(f"Format Pass: {result.metadata.get('format_pass', False)}\n")
+            f.write(f"Execution Status: {result.metadata.get('execution_status', 'unknown')}\n")
+            f.write(f"Execution Time: {result.metadata.get('execution_seconds', 0):.3f}s\n")
+            f.write("\n" + "="*80 + "\n")
+            f.write("GENERATED CODE:\n")
+            f.write("="*80 + "\n")
+            code_preview = result.metadata.get("code_preview", "")
+            if code_preview:
+                f.write(code_preview)
+            else:
+                f.write("No code preview available")
+
+        return result
 
     return reward_fn
 
@@ -734,6 +827,18 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional cap on official tests per problem for smoke runs.",
     )
+    parser.add_argument(
+        "--training-mode",
+        choices=SUPPORTED_TRAINING_MODES,
+        default="code",
+        help="Training mode: 'code' for pure code capability, 'reasoning-code' for reasoning + code",
+    )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory to save generated code and rewards. Defaults to 'generated_code/' in the current directory.",
+    )
     return parser
 
 
@@ -750,6 +855,7 @@ def main(argv: list[str] | None = None) -> int:
             rating_min=args.rating_min,
             rating_max=args.rating_max,
             max_tests_per_problem=args.max_tests_per_problem,
+            training_mode=args.training_mode,
         )
         flashrl = FlashRL(
             config_path=args.config,
@@ -757,6 +863,8 @@ def main(argv: list[str] | None = None) -> int:
             reward_fn=make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),
                 memory_limit_mb=args.memory_limit_mb,
+                training_mode=args.training_mode,
+                log_dir=args.log_dir if args.log_dir is not None else DEFAULT_GENERATED_CODE_LOG_DIR,
             ),
         )
         flashrl.train(dataset)
