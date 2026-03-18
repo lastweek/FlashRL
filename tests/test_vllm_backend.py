@@ -445,8 +445,10 @@ def test_create_serving_backend_returns_vllm_backend(
     assert isinstance(backend, VLLMServingBackend)
     assert backend._snapshot_dir is None
     assert len(spawned_commands) == 2
-    assert spawned_commands[0][:3] == [str(python_path.with_name("vllm")), "serve", "fake/model"]
-    assert "--served-model-name" in spawned_commands[0]
+    # Custom server uses Python module, not vllm serve
+    assert spawned_commands[0][:3] == [str(python_path), "-m", "flashrl.framework.serving.vllm.server"]
+    assert spawned_commands[0][4] == "fake/model"  # --model flag
+    assert spawned_commands[0][6] == "127.0.0.1"  # --host flag
     backend.close()
 
 
@@ -543,7 +545,7 @@ def test_vllm_backend_sync_generate_and_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The backend should route completions over HTTP, restart on sync, and clean up."""
+    """The backend should route completions over HTTP, sync weights in-process, and clean up."""
     python_path = _make_fake_runtime(tmp_path)
     spawned_commands: list[list[str]] = []
     processes: list[FakeProcess] = []
@@ -619,13 +621,21 @@ def test_vllm_backend_sync_generate_and_close(
     assert backend._snapshot_dir is not None
     assert (backend._snapshot_dir / "model.safetensors").exists()
     assert len(training_actor.model.saved_paths) == 1
-    assert len(spawned_commands) == 4
-    assert spawned_commands[0][2] == "fake/model"
-    assert spawned_commands[2][2] == str(backend._snapshot_dir)
+    # With in-process weight loading, no process restarts occur
+    assert len(spawned_commands) == 2  # Only initial launches, no restarts
+    assert spawned_commands[0][4] == "fake/model"  # --model flag
+    # Check that sync made HTTP request to load_weights_from_disk
+    sync_requests = [
+        (method, url, payload)
+        for method, url, payload in requests
+        if method == "POST" and "/v1/load_weights_from_disk" in url
+    ]
+    assert len(sync_requests) == 2  # One per replica
     assert synced_admin_objects[0]["spec"]["modelSource"] == str(backend._snapshot_dir)
     assert synced_admin_objects[0]["status"]["phase"] == "Ready"
-    assert processes[0].terminate_calls == 1
-    assert processes[1].terminate_calls == 1
+    # Processes should not be terminated (no restart)
+    assert processes[0].terminate_calls == 0
+    assert processes[1].terminate_calls == 0
 
     snapshot_dir = backend._snapshot_dir
     backend.close()
@@ -899,3 +909,55 @@ def test_flashrl_train_computes_missing_rollout_logprobs_from_training_actor(
         trainer.close()
 
     assert serving_backend.close_calls >= 1
+
+
+def test_vllm_backend_pause_and_resume_inference(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Pause and resume inference should work correctly."""
+    python_path = _make_fake_runtime(tmp_path)
+    admin_requests: list[tuple[str, str, dict[str, object] | None]] = []
+
+    def fake_request(self, url, *, method, payload=None, timeout):
+        del timeout
+        admin_requests.append((method, url, payload))
+        # Return appropriate responses
+        if "/admin/pause" in url:
+            return {"status": "inference_paused"}
+        elif "/admin/resume" in url:
+            return {"status": "inference_resumed"}
+        elif "/v1/models" in url:
+            return {"data": [{"id": "fake/model"}]}
+        raise RuntimeError(f"Unexpected request to {url}")
+
+    monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: 8100)
+    monkeypatch.setattr(VLLMServingBackend, "_spawn_process", lambda self, command: FakeProcess())
+    monkeypatch.setattr(VLLMServingBackend, "_request_json", fake_request)
+
+    backend = VLLMServingBackend(
+        ServingConfig(
+            model_name="fake/model",
+            backend="vllm",
+            runtime_python=str(python_path),
+        )
+    )
+
+    try:
+        # Pause inference
+        backend.pause_inference()
+        assert len(admin_requests) == 1
+        method, url, payload = admin_requests[0]
+        assert method == "POST"
+        assert "/admin/pause" in url
+        assert payload is None
+
+        # Resume inference
+        backend.resume_inference()
+        assert len(admin_requests) == 2
+        method, url, payload = admin_requests[1]
+        assert method == "POST"
+        assert "/admin/resume" in url
+        assert payload is None
+    finally:
+        backend.close()

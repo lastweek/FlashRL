@@ -200,8 +200,53 @@ class VLLMServingBackend(ServingBackend):
         return items
 
     def sync_from_training_actor(self, training_actor: ActorModel) -> None:
+        """Sync weights from training actor to serving backend.
+
+        Uses in-process weight loading via HTTP endpoint to avoid process restart.
+        """
         snapshot_dir = self._write_snapshot(training_actor)
-        self._restart_replicas(str(snapshot_dir))
+
+        # Use load_weights_from_disk endpoint for in-process model swap
+        for replica in self._replicas:
+            try:
+                self._request_json(
+                    f"{replica.base_url}/v1/load_weights_from_disk",
+                    method="POST",
+                    payload={"model_source": str(snapshot_dir)},
+                    timeout=60.0,  # Allow time for weight load
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to load weights into replica {replica.index}: {exc}"
+                ) from exc
+
+    def pause_inference(self) -> None:
+        """Pause inference for all replicas."""
+        for replica in self._replicas:
+            try:
+                self._request_json(
+                    f"{replica.base_url}/admin/pause",
+                    method="POST",
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to pause inference for replica {replica.index}: {exc}"
+                ) from exc
+
+    def resume_inference(self) -> None:
+        """Resume inference for all replicas."""
+        for replica in self._replicas:
+            try:
+                self._request_json(
+                    f"{replica.base_url}/admin/resume",
+                    method="POST",
+                    timeout=30.0,
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Failed to resume inference for replica {replica.index}: {exc}"
+                ) from exc
 
     def close(self) -> None:
         if self._closed:
@@ -357,19 +402,15 @@ class VLLMServingBackend(ServingBackend):
         self._replicas = self._launch_replicas(model_source)
 
     def _build_command(self, model_source: str, port: int) -> list[str]:
-        command = [
-            str(self._vllm_executable),
-            "serve",
-            model_source,
-            "--host",
-            "127.0.0.1",
-            "--port",
-            str(port),
-            "--served-model-name",
-            self.config.model_name,
+        """Build command to launch custom vLLM wrapper server."""
+        return [
+            str(self._python_executable),
+            "-m",
+            "flashrl.framework.serving.vllm.server",
+            "--model", model_source,
+            "--host", "127.0.0.1",
+            "--port", str(port),
         ]
-        command.extend(self.config.vllm_args)
-        return command
 
     def _spawn_process(self, command: list[str]) -> subprocess.Popen[str]:
         return subprocess.Popen(
