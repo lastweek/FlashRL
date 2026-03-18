@@ -30,6 +30,10 @@ app: Flask | None = None
 engine: LLMEngine | None = None
 _model_lock: threading.Lock = threading.Lock()
 _inference_paused: bool = False
+_loading_thread: threading.Thread | None = None
+_loading_complete: threading.Event = threading.Event()
+_loading_success: bool = True
+_loading_error: str | None = None
 
 
 def create_server(model_source: str, host: str, port: int) -> None:
@@ -99,15 +103,37 @@ def register_routes() -> None:
     # Health check
     @app.route("/health", methods=["GET"])
     def health_check():
-        return jsonify({"status": "healthy", "inference_paused": _inference_paused})
+        global _loading_thread, _loading_complete, _loading_success
+        loading_status = "idle"
+        if _loading_thread is not None and _loading_thread.is_alive():
+            loading_status = "loading"
+        elif _loading_complete.is_set():
+            loading_status = "success" if _loading_success else "error"
+
+        return jsonify({
+            "status": "healthy",
+            "inference_paused": _inference_paused,
+            "model_loading": loading_status,
+        })
 
     # OpenAI-compatible endpoints
     @app.route("/v1/models", methods=["GET"])
     def list_models():
         """List available models (OpenAI compatible)."""
+        global _loading_thread, _loading_complete, _loading_success
+        loading_status = "idle"
+        if _loading_thread is not None and _loading_thread.is_alive():
+            loading_status = "loading"
+        elif _loading_complete.is_set():
+            loading_status = "success" if _loading_success else "error"
+
         return jsonify({
             "object": "list",
-            "data": [{"id": engine.engine_args.model if engine else ""}],
+            "data": [{
+                "id": engine.engine_args.model if engine else "",
+                "loading_status": loading_status,
+                "loading_error": _loading_error if not _loading_success and loading_status == "error" else None,
+            }],
         })
 
     @app.route("/v1/completions", methods=["POST"])
@@ -115,6 +141,15 @@ def register_routes() -> None:
         """Generate completions (OpenAI compatible)."""
         if _inference_paused:
             return jsonify({"error": {"message": "Inference is paused"}}), 503
+
+        # Check if model is loading
+        global _loading_thread, _loading_complete
+        if _loading_thread is not None and _loading_thread.is_alive():
+            return jsonify({"error": {"message": "Model is currently loading"}}), 503
+
+        # Check if previous load failed
+        if _loading_complete.is_set() and not _loading_success:
+            return jsonify({"error": {"message": f"Model loading failed: {_loading_error}"}}), 500
 
         data = flask_request.get_json()
         if not isinstance(data, dict):
@@ -201,7 +236,10 @@ def register_routes() -> None:
     # Custom endpoints for FlashRL
     @app.route("/v1/load_weights_from_disk", methods=["POST"])
     def load_weights_from_disk():
-        """Load model weights from disk without restarting process."""
+        """Load model weights from disk without restarting process.
+
+        Returns immediately and loads model in background thread.
+        """
         data = flask_request.get_json()
         if not isinstance(data, dict):
             return jsonify({"error": {"message": "Invalid request body"}}), 400
@@ -210,14 +248,63 @@ def register_routes() -> None:
         if not isinstance(model_source, str):
             return jsonify({"error": {"message": "model_source must be a string"}}), 400
 
-        try:
-            # Load new model with weights
-            load_model(model_source)
-            return jsonify({"status": "success", "model_source": model_source})
-        except Exception as exc:
+        # Check if already loading
+        global _loading_thread, _loading_complete
+        if _loading_thread is not None and _loading_thread.is_alive():
             return jsonify(
-                {"error": {"message": f"Failed to load weights: {str(exc)}"}}
-            ), 500
+                {"status": "loading_in_progress", "message": "Model loading is already in progress"}
+            ), 202
+
+        # Start loading in background thread
+        _loading_thread = threading.Thread(
+            target=_load_model_async,
+            args=(model_source,),
+            daemon=True,
+        )
+        _loading_thread.start()
+
+        return jsonify({
+            "status": "loading_started",
+            "message": "Model loading started in background",
+            "model_source": model_source,
+        })
+
+    @app.route("/v1/load_status", methods=["GET"])
+    def load_status():
+        """Check model loading status."""
+        global _loading_thread, _loading_complete, _loading_success, _loading_error
+
+        if _loading_thread is None:
+            return jsonify({"status": "idle"})
+
+        if _loading_thread.is_alive():
+            return jsonify({"status": "loading", "message": "Model loading in progress"})
+
+        if _loading_complete.is_set():
+            if _loading_success:
+                return jsonify({"status": "success", "message": "Model loaded successfully"})
+            else:
+                return jsonify({
+                    "status": "error",
+                    "message": f"Model loading failed: {_loading_error}"
+                }), 500
+
+        return jsonify({"status": "unknown"})
+
+
+def _load_model_async(model_source: str) -> None:
+    """Load model asynchronously in background thread."""
+    global engine, _loading_complete, _loading_success, _loading_error
+
+    try:
+        # Load new model with weights
+        load_model(model_source)
+        _loading_success = True
+    except Exception as exc:
+        _loading_success = False
+        _loading_error = str(exc)
+    finally:
+        _loading_complete.set()
 
     # Admin endpoints
     @app.route("/admin/pause", methods=["POST"])
