@@ -126,7 +126,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=reasoning_math_example.SUPPORTED_MATH_ROLLOUT_MODES,
         default=reasoning_math_example.DEFAULT_MATH_ROLLOUT_MODE,
         help="Rollout implementation: 'blackbox' uses the example rollout hook, "
-        "'whitebox' uses FlashRL's built-in ReAct rollout.",
+        "'whitebox' uses FlashRL's traced agent building blocks.",
     )
     return parser
 

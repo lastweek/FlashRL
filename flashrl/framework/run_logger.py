@@ -14,7 +14,7 @@ import textwrap
 from typing import Any
 from uuid import uuid4
 
-from flashrl.framework import log_paths, rollout_logging
+from . import log_paths, rollout_logging
 from flashrl.framework.config import LoggingConfig
 from flashrl.framework.observability import RuntimeEvent
 
@@ -976,7 +976,7 @@ class RunLogger:
                 )
             )
 
-    def log_exception(self, exc: Exception, context: dict[str, Any]) -> None:
+    def log_exception(self, exc: BaseException, context: dict[str, Any]) -> None:
         """Log an exception during training."""
         payload = {
             "type": type(exc).__name__,

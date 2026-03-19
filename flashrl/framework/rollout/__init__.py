@@ -1,5 +1,3 @@
-"""Rollout generation and collection."""
+"""Internal rollout-generator implementations."""
 
-from flashrl.framework.rollout.user_defined import UserDefinedRollout
-
-__all__ = ["UserDefinedRollout"]
+__all__: list[str] = []

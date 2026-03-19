@@ -1,4 +1,4 @@
-"""Minimal custom-loop demo built from explicit agent primitives."""
+"""Dynamic tool gating demo built from the core agent primitives."""
 
 from __future__ import annotations
 
@@ -17,7 +17,7 @@ for candidate in (REPO_ROOT, EXAMPLE_DIR):
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
 
-from flashrl.framework.agent import Agent, Tool
+from flashrl.framework.agent import Agent, Tool, WindowedContextManager
 from flashrl.framework.data_models import Prompt, ToolCall
 
 
@@ -30,7 +30,7 @@ class _Decision:
 
 
 class DemoServingBackend:
-    """Scripted backend that demonstrates one parallel tool step then one final step."""
+    """Scripted backend that uses tools once, then finishes without tools."""
 
     def __init__(self) -> None:
         self.generation_defaults: dict[str, object] = {}
@@ -42,9 +42,9 @@ class DemoServingBackend:
     def generate_batch(self, prompts: list[str], **kwargs):
         del kwargs
         responses_by_step = [
-            'Action: [{"tool": "add", "arguments": {"a": 20, "b": 22}}, '
-            '{"tool": "multiply", "arguments": {"a": 6, "b": 7}}]',
-            "Final: The sum is 42 and the product is 42.",
+            'Action: [{"tool": "lookup_note", "arguments": {"note_id": "alpha"}}, '
+            '{"tool": "lookup_note", "arguments": {"note_id": "beta"}}]',
+            "Final: Alpha is the stronger default choice because it leads Beta on reliability.",
         ]
         response_text = responses_by_step[min(self._call_index, len(responses_by_step) - 1)]
         self._call_index += 1
@@ -104,17 +104,28 @@ def _parse_response(raw_text: str) -> _Decision:
     return _Decision(kind="final", final_text=raw_text)
 
 
-def build_demo_agent() -> Agent:
-    """Build one explicit custom agent loop using the core Agent methods."""
+def _dynamic_tools(state) -> list[Tool]:
+    if any(message.role == "tool" for message in state.conversation.messages):
+        return []
     entrypoint_module = "flashrl.framework.examples.agent_tools_helpers"
+    return [
+        Tool(
+            name="lookup_note",
+            description="Read one short comparison note by id.",
+            entrypoint=f"{entrypoint_module}:lookup_note_tool",
+        )
+    ]
+
+
+def build_demo_agent() -> Agent:
+    """Build the dynamic-tools example agent."""
 
     def run(agent: Agent) -> None:
         agent.add_message(
             "system",
-            "You are a tool-using assistant.\n"
-            "Use `Action:` with JSON tool calls when you need tools.\n"
-            "Use `Final:` when you are ready to answer.\n"
-            "After any tool use, finish with a concise answer after `Final:`.",
+            "Inspect the available notes before giving a concise recommendation.\n"
+            "Use tools when you need more information.\n"
+            "Reply with `Action:` when calling tools and `Final:` when you are ready to answer.",
         )
         while not agent.done:
             available_tools = agent.available_tools()
@@ -143,29 +154,17 @@ def build_demo_agent() -> Agent:
 
     return Agent(
         run_fn=run,
-        tools=[
-            Tool(
-                name="add",
-                description="Add two integers.",
-                entrypoint=f"{entrypoint_module}:add_tool",
-            ),
-            Tool(
-                name="multiply",
-                description="Multiply two integers.",
-                entrypoint=f"{entrypoint_module}:multiply_tool",
-            ),
-        ],
+        tools=_dynamic_tools,
+        context_manager=WindowedContextManager(max_messages=4),
         max_steps=3,
     )
 
 
 def main() -> int:
-    """Run one demo rollout and print the resulting transcript."""
-    prompt = Prompt(text="Compute 20 + 22 and 6 * 7.")
+    """Run the dynamic-tools example and print the rollout trace."""
+    prompt = Prompt(text="Compare Alpha and Beta, then recommend the safer default.")
     rollout_output = build_demo_agent()([prompt], DemoServingBackend())[0]
-    print(
-        json.dumps(rollout_output.model_dump(), ensure_ascii=True, indent=2, sort_keys=True)
-    )
+    print(json.dumps(rollout_output.model_dump(), ensure_ascii=True, indent=2, sort_keys=True))
     return 0
 
 

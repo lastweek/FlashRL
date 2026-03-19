@@ -1,67 +1,45 @@
-"""User-defined rollout generator."""
+"""Internal rollout-generator base and factory helpers."""
 
-from typing import Callable
+from __future__ import annotations
+
+from typing import Any
 
 from flashrl.framework.config import RolloutConfig
 from flashrl.framework.data_models import (
+    Conversation,
     Prompt,
     RolloutOutput,
-    Conversation,
     WeightVersionInfo,
 )
 from flashrl.framework.serving import ServingBackend
 
 
-class UserDefinedRollout:
-    """Rollout generator that wraps a user-provided function.
-
-    This allows users to pass simple functions for rollout generation
-    without needing to inherit from base classes.
-
-    Example:
-        def my_rollout_fn(prompts, serving_backend):
-            samples = serving_backend.generate_batch([p.text for p in prompts])
-            return [...]
-
-        rollout = UserDefinedRollout(my_rollout_fn, serving_backend, config)
-        rollouts = rollout.generate(prompts)
-    """
+class BaseRolloutGenerator:
+    """Internal base for grouped rollout generation."""
 
     def __init__(
         self,
-        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]],
+        *,
         serving_backend: ServingBackend,
         config: RolloutConfig,
     ) -> None:
-        """Initialize UserDefinedRollout.
-
-        Args:
-            rollout_fn: User-provided function that generates rollouts.
-                Takes (list[Prompt], ServingBackend) and returns exactly one
-                RolloutOutput per input prompt.
-            serving_backend: Serving backend to use for generation.
-            config: Rollout configuration.
-        """
-        self.config = config
-        self.rollout_fn = rollout_fn
         self.serving_backend = serving_backend
+        self.config = config
         self._apply_generation_defaults()
 
     def _generation_kwargs(self) -> dict[str, int | float | bool]:
         """Return generation defaults derived from rollout config."""
-        generation_kwargs: dict[str, int | float | bool] = {
+        return {
             "max_new_tokens": getattr(self.config, "max_new_tokens", 512),
             "temperature": getattr(self.config, "temperature", 1.0),
             "top_p": getattr(self.config, "top_p", 0.9),
             "top_k": getattr(self.config, "top_k", 0),
             "do_sample": getattr(self.config, "do_sample", True),
         }
-        return generation_kwargs
 
     def _apply_generation_defaults(self) -> None:
         """Apply generation defaults to the serving backend."""
-        generation_kwargs = self._generation_kwargs()
-        self.serving_backend.set_generation_defaults(**generation_kwargs)
+        self.serving_backend.set_generation_defaults(**self._generation_kwargs())
 
     def generate(self, prompts: list[Prompt]) -> list[RolloutOutput]:
         """Generate exactly one rollout per prompt."""
@@ -105,7 +83,7 @@ class UserDefinedRollout:
     ) -> list[RolloutOutput]:
         """Generate one rollout per prompt and validate the flat output shape."""
         self._apply_generation_defaults()
-        rollouts = self.rollout_fn(prompts, self.serving_backend)
+        rollouts = self._call_rollout(prompts)
         if len(rollouts) != len(prompts):
             raise ValueError(
                 "Rollout must return exactly one output per input prompt "
@@ -119,6 +97,13 @@ class UserDefinedRollout:
             self._validate_rollout_output(rollout)
             validated.append(rollout)
         return validated
+
+    def _call_rollout(
+        self,
+        prompts: list[Prompt],
+    ) -> list[RolloutOutput]:
+        """Generate one raw rollout per prompt before validation."""
+        raise NotImplementedError
 
     def _current_weight_version(self) -> WeightVersionInfo | None:
         getter = getattr(self.serving_backend, "current_weight_version", None)
@@ -175,20 +160,10 @@ class UserDefinedRollout:
         prompt: Prompt,
         max_turns: int = 10,
     ) -> Conversation:
-        """Generate a multi-turn conversation.
-
-        For simple rollout functions, this defaults to single-turn.
-
-        Args:
-            prompt: Initial prompt.
-            max_turns: Maximum number of turns (ignored for single-turn).
-
-        Returns:
-            Generated conversation.
-        """
+        """Generate a multi-turn conversation for diagnostic helpers."""
         del max_turns
         self._apply_generation_defaults()
-        rollouts = self.rollout_fn([prompt], self.serving_backend)
+        rollouts = self._call_rollout([prompt])
         if rollouts:
             if len(rollouts) != 1:
                 raise ValueError(
@@ -199,3 +174,32 @@ class UserDefinedRollout:
             self._validate_rollout_output(rollout)
             return rollout.conversation
         return Conversation(messages=[])
+
+
+def build_rollout_generator(
+    *,
+    rollout_fn: Any,
+    serving_backend: ServingBackend,
+    config: RolloutConfig,
+) -> BaseRolloutGenerator:
+    """Normalize the public rollout hook into one internal rollout generator."""
+    from flashrl.framework.agent import Agent
+    from flashrl.framework.rollout.agent import AgentRolloutGenerator
+    from flashrl.framework.rollout.function import FunctionRolloutGenerator
+
+    if isinstance(rollout_fn, Agent):
+        return AgentRolloutGenerator(
+            agent=rollout_fn,
+            serving_backend=serving_backend,
+            config=config,
+        )
+    if callable(rollout_fn):
+        return FunctionRolloutGenerator(
+            rollout_fn=rollout_fn,
+            serving_backend=serving_backend,
+            config=config,
+        )
+    raise TypeError(
+        "rollout_fn must be a callable or flashrl.framework.agent.Agent "
+        f"(got {type(rollout_fn).__name__})."
+    )

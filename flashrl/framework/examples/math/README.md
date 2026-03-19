@@ -5,7 +5,8 @@ selection. It trains a base Qwen model with rule-based rewards only, sets the
 system prompt explicitly in user code, and now supports both:
 
 - blackbox rollouts, where the example provides its own rollout function
-- whitebox rollouts, where the example builds a built-in `ReActRollout`
+- whitebox rollouts, where the example builds a traced custom loop from
+  `flashrl.framework.agent` primitives
 
 In reasoning mode, the final answer must contain exactly one
 `<think>...</think>` block followed by one `<answer>...</answer>` block.
@@ -96,7 +97,7 @@ The example supports two rollout implementations:
 - `--rollout-mode blackbox`: the historical path where `train.py` / `eval.py`
   pass a user-defined rollout function into `FlashRL(...)`
 - `--rollout-mode whitebox`: the new path where user code builds
-  `ReActRollout(system_prompt=..., tools=...)`
+  `Agent(...)` plus an explicit `run_fn(agent)`
 
 The choice stays explicit in the example scripts. It is not hidden in YAML.
 
@@ -132,8 +133,14 @@ python3 flashrl/framework/examples/math/train.py \
   --train-limit 64
 ```
 
-In whitebox mode, the example constructs a built-in `ReActRollout` with an
-explicit `system_prompt` and a subprocess-backed calculator tool.
+In whitebox mode, the example constructs a traced `Agent` with an
+explicit custom loop, explicit system prompt, and a subprocess-backed
+calculator tool.
+
+The whitebox policy and output contract live entirely in that explicit system
+prompt. `Agent.build_prompt(...)` renders the visible tools and transcript for
+the current step, then appends the final `Assistant:` cue expected by the
+completion-style serving path.
 
 ## Common Run Scripts
 
@@ -421,8 +428,8 @@ Available flags:
 - `--rollout-mode`: choose `blackbox` (default) or `whitebox`.
 
 The script constructs the system prompt explicitly in Python code through
-`build_math_system_prompt(...)`. In whitebox mode, that prompt is passed into
-`ReActRollout(system_prompt=...)`. In blackbox mode, the same prompt is prefixed
+`build_math_system_prompt(...)`. In whitebox mode, that prompt is added inside
+the custom `Agent` loop. In blackbox mode, the same prompt is prefixed
 into the example-owned rollout prompt so both paths stay behaviorally aligned.
 
 Training checkpointing is configured in YAML. The shipped example configs already

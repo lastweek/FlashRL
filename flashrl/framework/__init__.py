@@ -1,5 +1,10 @@
 """Framework layer: Core RL training APIs."""
 
+from __future__ import annotations
+
+from importlib import import_module
+from typing import TYPE_CHECKING, Any
+
 from flashrl.framework.config import (
     AdminConfig,
     CheckpointingConfig,
@@ -11,12 +16,12 @@ from flashrl.framework.config import (
     ModelConfig,
     PushgatewayMetricsConfig,
     RewardConfig,
-    RunConfig,
     RolloutConfig,
+    RunConfig,
     ServingConfig,
-    TrainingConfig,
     TensorBoardMetricsConfig,
     TrainerConfig,
+    TrainingConfig,
 )
 from flashrl.framework.data_models import (
     AssistantTurn,
@@ -30,21 +35,42 @@ from flashrl.framework.data_models import (
     ToolResult,
     TrainingBatch,
 )
-from flashrl.framework.agent import ReActRollout
-from flashrl.framework.flashrl import FlashRL
-from flashrl.framework.serving import (
-    HuggingFaceServingBackend,
-    ServingBackend,
-    VLLMServingBackend,
-    create_serving_backend,
-)
-from flashrl.framework.tools import SubprocessToolRuntime, Tool
-from flashrl.framework.training import (
-    FSDP2TrainingBackend,
-    HuggingFaceTrainingBackend,
-    TrainingBackend,
-    create_training_backend,
-)
+
+if TYPE_CHECKING:
+    from flashrl.framework.agent import (
+        Agent,
+        SubprocessToolRuntime,
+        Tool,
+    )
+    from flashrl.framework.flashrl import FlashRL
+    from flashrl.framework.serving import (
+        HuggingFaceServingBackend,
+        ServingBackend,
+        VLLMServingBackend,
+        create_serving_backend,
+    )
+    from flashrl.framework.training import (
+        FSDP2TrainingBackend,
+        HuggingFaceTrainingBackend,
+        TrainingBackend,
+        create_training_backend,
+    )
+
+
+_LAZY_EXPORTS = {
+    "FlashRL": ("flashrl.framework.flashrl", "FlashRL"),
+    "Agent": ("flashrl.framework.agent", "Agent"),
+    "Tool": ("flashrl.framework.agent", "Tool"),
+    "SubprocessToolRuntime": ("flashrl.framework.agent", "SubprocessToolRuntime"),
+    "ServingBackend": ("flashrl.framework.serving", "ServingBackend"),
+    "HuggingFaceServingBackend": ("flashrl.framework.serving", "HuggingFaceServingBackend"),
+    "VLLMServingBackend": ("flashrl.framework.serving", "VLLMServingBackend"),
+    "create_serving_backend": ("flashrl.framework.serving", "create_serving_backend"),
+    "TrainingBackend": ("flashrl.framework.training", "TrainingBackend"),
+    "HuggingFaceTrainingBackend": ("flashrl.framework.training", "HuggingFaceTrainingBackend"),
+    "FSDP2TrainingBackend": ("flashrl.framework.training", "FSDP2TrainingBackend"),
+    "create_training_backend": ("flashrl.framework.training", "create_training_backend"),
+}
 
 __all__ = [
     "FlashRL",
@@ -77,7 +103,7 @@ __all__ = [
     "RewardOutput",
     "TrainingBatch",
     # Agent and tools
-    "ReActRollout",
+    "Agent",
     "Tool",
     "SubprocessToolRuntime",
     # Backends
@@ -90,3 +116,19 @@ __all__ = [
     "FSDP2TrainingBackend",
     "create_training_backend",
 ]
+
+
+def __getattr__(name: str) -> Any:
+    """Lazily resolve heavyweight public exports on first access."""
+    target = _LAZY_EXPORTS.get(name)
+    if target is None:
+        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
+    module_name, attr_name = target
+    value = getattr(import_module(module_name), attr_name)
+    globals()[name] = value
+    return value
+
+
+def __dir__() -> list[str]:
+    """Expose lazy exports in interactive discovery tools."""
+    return sorted(set(globals()) | set(__all__) | set(_LAZY_EXPORTS))

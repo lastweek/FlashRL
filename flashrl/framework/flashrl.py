@@ -12,7 +12,7 @@ import shutil
 import sys
 import tempfile
 import time
-from typing import Any, Callable, Sequence
+from typing import TYPE_CHECKING, Any, Callable, Sequence
 from uuid import uuid4
 
 from . import runtime_support
@@ -38,11 +38,14 @@ from .data_models import Prompt, RewardOutput, RolloutOutput, WeightVersionInfo
 from .metrics import MetricsSink, build_metrics_sink
 from .observability import timed_call
 from .reward.user_defined import UserDefinedReward
-from .rollout.user_defined import UserDefinedRollout
+from .rollout.base import BaseRolloutGenerator, build_rollout_generator
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
 from .training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend, create_training_backend
 from .trainer.grpo.trainer import GRPOTrainer
+
+if TYPE_CHECKING:
+    from .agent import Agent
 
 
 @dataclass
@@ -68,7 +71,7 @@ class FlashRL:
         serving_config: ServingConfig | None = None,
         trainer_config: TrainerConfig | None = None,
         grpo_config: GrpoConfig | None = None,
-        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]] | None = None,
+        rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]] | Agent | None = None,
         reward_fn: Callable[[RolloutOutput], RewardOutput] | None = None,
         logging_config: LoggingConfig | None = None,
         metrics_config: MetricsConfig | None = None,
@@ -171,7 +174,7 @@ class FlashRL:
         self._actor_backend: ActorTrainingBackend | None = None
         self._reference_backend: ReferenceTrainingBackend | None = None
         self._serving_backend: ServingBackend | None = None
-        self._rollout_generator: UserDefinedRollout | None = None
+        self._rollout_generator: BaseRolloutGenerator | None = None
         self._reward: UserDefinedReward | None = None
         self._trainer: GRPOTrainer | None = None
         self._run_logger: RunLogger | None = None
@@ -395,7 +398,7 @@ class FlashRL:
             )
         )
 
-        self._rollout_generator = UserDefinedRollout(
+        self._rollout_generator = build_rollout_generator(
             rollout_fn=self.rollout_fn,
             serving_backend=self._serving_backend,
             config=self.rollout_config,
@@ -1078,18 +1081,31 @@ class FlashRL:
         self._runtime_phase = "Training"
         self._trainer.train(dataset)
 
-    def _handle_train_failure(self, exc: Exception) -> None:
+    def _handle_train_failure(self, exc: BaseException) -> None:
         """Preserve the current runtime and logging failure behavior."""
         assert self._trainer is not None
-        self._runtime_phase = "Failed"
+        self._runtime_phase = (
+            "Interrupted"
+            if isinstance(exc, (KeyboardInterrupt, SystemExit))
+            else "Failed"
+        )
         self._last_runtime_error = f"{type(exc).__name__}: {exc}"
+        active_context = self._trainer.active_step_context
         if self._run_logger is not None:
             self._run_logger.log_exception(
                 exc,
                 context={
                     "stage": "train",
-                    "step": self._trainer.total_steps,
-                    "epoch": self._trainer.current_epoch + 1,
+                    "step": (
+                        active_context.step
+                        if active_context is not None
+                        else self._trainer.total_steps
+                    ),
+                    "epoch": (
+                        active_context.epoch
+                        if active_context is not None
+                        else self._trainer.current_epoch + 1
+                    ),
                 },
             )
         if self._serving_backend is not None:
@@ -1104,6 +1120,10 @@ class FlashRL:
             if status == "completed":
                 self._save_final_checkpoint_if_enabled()
                 self._runtime_phase = "Ready"
+        except (KeyboardInterrupt, SystemExit) as exc:
+            final_status = "interrupted"
+            self._handle_train_failure(exc)
+            raise
         except Exception as exc:
             final_status = "failed"
             self._handle_train_failure(exc)
@@ -1137,6 +1157,10 @@ class FlashRL:
         training_loop_started_at = time.perf_counter()
         try:
             self._execute_training_loop(run_state.dataset)
+        except (KeyboardInterrupt, SystemExit) as exc:
+            status = "interrupted"
+            self._handle_train_failure(exc)
+            raise
         except Exception as exc:
             status = "failed"
             self._handle_train_failure(exc)

@@ -25,10 +25,11 @@ python3 -m playwright install chromium
 ```
 flashrl/
 ├── framework/       # Core RL training APIs
+│   ├── agent/       # Agent building blocks: runtime, tools, and context
 │   ├── trainer/     # Training algorithms
 │   ├── rollout/     # Generation and rollout
 │   ├── reward/      # Reward computation
-│   ├── tools/       # Tool execution
+│   ├── tools/       # Compatibility shim for relocated agent tools
 │   └── models/      # Model wrappers
 └── platform/        # Orchestration and scaling (coming later)
 ```
@@ -48,7 +49,7 @@ rm -rf .cache/
 
 The math example now lives in its own folder with a thin training script
 and a YAML config. It supports both the historical blackbox rollout path and
-the new built-in whitebox `ReActRollout` path:
+an explicit whitebox path built from `flashrl.framework.agent` primitives:
 
 ```bash
 python3 flashrl/framework/examples/math/train.py
@@ -59,14 +60,23 @@ python3 flashrl/framework/examples/math/train.py --rollout-mode whitebox
 ```
 
 See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.
+See [flashrl/framework/agent/README.md](flashrl/framework/agent/README.md) for the agent toolbox overview.
 
 ### Run the Agent Tools Demo
 
-The whitebox agent/tools demo is a small offline script that shows explicit
-`system_prompt`, subprocess-backed tools, and parallel tool calls:
+The whitebox agent examples are small offline scripts that show the public
+agent toolbox in increasing complexity:
 
 ```bash
 python3 flashrl/framework/examples/agent-tools/run.py
+```
+
+```bash
+python3 flashrl/framework/examples/agent-react/run.py
+```
+
+```bash
+python3 flashrl/framework/examples/agent-dynamic-tools/run.py
 ```
 
 ### Run the Code Example
@@ -119,10 +129,10 @@ Older `.flashrl-runs/` directories remain viewable if you already have them.
 - Model wrappers (Actor, Reference, Critic)
 - GRPO trainer structure
 - Training pipeline examples
-- Whitebox ReAct rollouts with subprocess-backed tools
+- Whitebox agent building blocks with explicit runtimes and subprocess-backed tools
 
 **Next steps:**
 - Real rollout generation with models
 - Real GRPO loss computation
-- Strategy libraries on top of the whitebox agent loop
+- Additional agent examples and higher-level patterns built on the traced runtime
 - Additional safe runtimes beyond subprocess isolation

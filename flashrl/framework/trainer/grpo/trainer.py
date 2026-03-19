@@ -26,7 +26,7 @@ from flashrl.framework.observability import (
     timed_call,
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
-from flashrl.framework.rollout.user_defined import UserDefinedRollout
+from flashrl.framework.rollout.base import BaseRolloutGenerator
 from flashrl.framework.rollout_metrics import count_llm_call_rounds, count_tool_calls
 from flashrl.framework.training import OptimizationResult
 from flashrl.framework.training.optimization import optimize_grpo_batch
@@ -60,7 +60,7 @@ class GRPOTrainer:
         reference_backend: "ReferenceTrainingBackend | None",
         serving_backend: "ServingBackend",
         reward_fn: UserDefinedReward,
-        rollout_generator: UserDefinedRollout,
+        rollout_generator: BaseRolloutGenerator,
         run_logger: "RunLogger | None" = None,
         metrics_sink: "MetricsSink | None" = None,
         on_step_complete: Callable[[dict[str, Any]], None] | None = None,
@@ -71,6 +71,7 @@ class GRPOTrainer:
         self.metrics_sink = metrics_sink
         self.current_epoch = 0
         self.total_steps = 0
+        self._active_step_context: StepContext | None = None
         self.actor_backend = actor_backend
         self.reference_backend = reference_backend
         self.serving_backend = serving_backend
@@ -92,6 +93,12 @@ class GRPOTrainer:
         """Reset per-run trainer state."""
         self.current_epoch = 0
         self.total_steps = 0
+        self._active_step_context = None
+
+    @property
+    def active_step_context(self) -> StepContext | None:
+        """Return the currently running step context when a step is in progress."""
+        return self._active_step_context
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
@@ -135,9 +142,11 @@ class GRPOTrainer:
                     planned_prompts_per_step=prompts_per_step,
                     planned_samples_per_step=prompts_per_step * self.grpo_config.group_size,
                 )
+                self._active_step_context = context
                 step_payload = self._run_logged_step(prompts, context)
                 epoch_step_payloads.append(step_payload)
                 self.total_steps = context.step
+                self._active_step_context = None
                 if self.on_step_complete is not None:
                     self.on_step_complete(
                         {
@@ -160,6 +169,7 @@ class GRPOTrainer:
                 # Clear step payloads and dataset to free memory before next epoch
                 epoch_step_payloads.clear()
                 del epoch_dataset
+        self._active_step_context = None
 
     def _run_logged_step(
         self,

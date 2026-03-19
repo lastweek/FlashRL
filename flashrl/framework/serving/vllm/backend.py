@@ -171,6 +171,63 @@ class VLLMServingBackend(ServingBackend):
         """Update the backend-owned artifact directory for future snapshots/logs."""
         with self._lifecycle_lock:
             self._log_dir = Path(log_dir) if log_dir else None
+            self._rebind_replica_stderr_files()
+
+    def _rebind_replica_stderr_files(self) -> None:
+        """Move active replica stderr capture into the current run directory."""
+        vllm_log_dir = self._vllm_log_dir()
+        if vllm_log_dir is None:
+            return
+        for replica in self._replicas:
+            self._attach_replica_stderr_file(
+                replica,
+                vllm_log_dir=vllm_log_dir,
+                reason="rebound" if replica.stderr_file_path is not None else "started",
+            )
+
+    def _vllm_log_dir(self) -> Path | None:
+        if self._log_dir is None:
+            return None
+        vllm_log_dir = self._log_dir / "vllm"
+        vllm_log_dir.mkdir(parents=True, exist_ok=True)
+        return vllm_log_dir
+
+    def _attach_replica_stderr_file(
+        self,
+        replica: _Replica,
+        *,
+        vllm_log_dir: Path,
+        reason: str,
+    ) -> None:
+        """Attach one replica's stderr stream to a concrete file under ``vllm/``."""
+        target_path = vllm_log_dir / f"replica-{replica.index}.log"
+        previous_path = replica.stderr_file_path
+        with replica.stderr_lock:
+            if previous_path is not None and previous_path == target_path and replica.stderr_file is not None:
+                return
+
+            previous_file = replica.stderr_file
+            handle = open(target_path, "a", encoding="utf-8")
+            handle.write(f"\n{'=' * 72}\n")
+            if reason == "started":
+                handle.write(f"VLLM Replica {replica.index} started at {utc_now_iso()}\n")
+            else:
+                handle.write(f"VLLM Replica {replica.index} log rebound at {utc_now_iso()}\n")
+                if previous_path is not None:
+                    handle.write(f"Previous log path: {previous_path}\n")
+            handle.write(f"Command: {' '.join(replica.command)}\n")
+            if replica.stderr_lines:
+                handle.write("Buffered stderr tail:\n")
+                for line in replica.stderr_lines:
+                    handle.write(line + "\n")
+            handle.write(f"{'=' * 72}\n\n")
+            handle.flush()
+
+            replica.stderr_file_path = target_path
+            replica.stderr_file = handle
+
+            if previous_file is not None:
+                previous_file.close()
 
     def list_admin_objects(self) -> list[dict[str, Any]]:
         """Return one admin object per managed vLLM replica."""
@@ -424,34 +481,25 @@ class VLLMServingBackend(ServingBackend):
 
     def _launch_replicas(self, model_source: str) -> list[_Replica]:
         replicas: list[_Replica] = []
-        vllm_log_dir: Path | None = None
-        if self._log_dir is not None:
-            vllm_log_dir = self._log_dir / "vllm"
-            vllm_log_dir.mkdir(parents=True, exist_ok=True)
+        vllm_log_dir = self._vllm_log_dir()
         try:
             for index in range(self.config.num_replicas):
                 port = self._reserve_port()
                 command = self._build_command(model_source, port)
                 process = self._spawn_process(command)
-                stderr_file_path: Path | None = None
-                stderr_file: TextIO | None = None
-                if vllm_log_dir is not None:
-                    stderr_file_path = vllm_log_dir / f"replica-{index}.log"
-                    stderr_file = open(stderr_file_path, "a", encoding="utf-8")
-                    stderr_file.write(f"\n{'=' * 72}\n")
-                    stderr_file.write(f"VLLM Replica {index} started at {utc_now_iso()}\n")
-                    stderr_file.write(f"Command: {' '.join(command)}\n")
-                    stderr_file.write(f"{'=' * 72}\n\n")
-                    stderr_file.flush()
                 replica = _Replica(
                     index=index,
                     port=port,
                     process=process,
                     model_source=model_source,
                     command=command,
-                    stderr_file_path=stderr_file_path,
-                    stderr_file=stderr_file,
                 )
+                if vllm_log_dir is not None:
+                    self._attach_replica_stderr_file(
+                        replica,
+                        vllm_log_dir=vllm_log_dir,
+                        reason="started",
+                    )
                 replica.stderr_thread = Thread(
                     target=self._drain_stderr,
                     args=(replica,),

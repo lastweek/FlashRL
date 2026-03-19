@@ -990,6 +990,63 @@ def test_vllm_backend_surfaces_startup_stderr_lines(
         backend.close()
 
 
+def test_vllm_backend_rebinds_replica_logs_into_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Active replica stderr should move from startup artifacts into each run directory."""
+    python_path = _make_fake_runtime(tmp_path)
+    startup_dir = tmp_path / "startup-artifacts"
+    run_dir_one = tmp_path / "run-one"
+    run_dir_two = tmp_path / "run-two"
+
+    monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: 8100)
+    monkeypatch.setattr(
+        VLLMServingBackend,
+        "_request_json",
+        lambda self, url, *, method, payload=None, timeout: {"data": [{"id": self.config.model_name}]},
+    )
+
+    process = FakeProcess()
+    process.stderr = StringIO("INFO engine: loading weights\nINFO engine: warming up\n")
+    monkeypatch.setattr(VLLMServingBackend, "_spawn_process", lambda self, command: process)
+
+    backend = VLLMServingBackend(
+        ServingConfig(
+            model_name="fake/model",
+            backend="vllm",
+            runtime_python=str(python_path),
+        ),
+        log_dir=startup_dir,
+    )
+
+    try:
+        for _ in range(50):
+            if backend._replicas and backend._replicas[0].stderr_lines:
+                break
+            time.sleep(0.01)
+
+        backend.set_log_dir(run_dir_one)
+        first_log_path = run_dir_one / "vllm" / "replica-0.log"
+        assert first_log_path.exists()
+        first_log_text = first_log_path.read_text(encoding="utf-8")
+        assert "VLLM Replica 0 log rebound" in first_log_text
+        assert "INFO engine: loading weights" in first_log_text
+        assert "INFO engine: warming up" in first_log_text
+        assert backend._replicas[0].stderr_file_path == first_log_path
+
+        backend.set_log_dir(run_dir_two)
+        second_log_path = run_dir_two / "vllm" / "replica-0.log"
+        assert second_log_path.exists()
+        second_log_text = second_log_path.read_text(encoding="utf-8")
+        assert "VLLM Replica 0 log rebound" in second_log_text
+        assert "Previous log path:" in second_log_text
+        assert "INFO engine: loading weights" in second_log_text
+        assert backend._replicas[0].stderr_file_path == second_log_path
+    finally:
+        backend.close()
+
+
 def test_vllm_backend_close_uses_process_group_teardown(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

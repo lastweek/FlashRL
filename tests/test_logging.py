@@ -15,6 +15,7 @@ import torch.nn.functional as F
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
+from flashrl.framework.agent import Agent
 from flashrl.framework.config import AdminConfig, RunConfig, ServingConfig, TrainerConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
@@ -25,7 +26,8 @@ from flashrl.framework.data_models import (
     WeightVersionInfo,
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
-from flashrl.framework.rollout.user_defined import UserDefinedRollout
+from flashrl.framework.rollout.agent import AgentRolloutGenerator
+from flashrl.framework.rollout.function import FunctionRolloutGenerator
 from flashrl.framework.run_logger import RunLogger, _factor_shared_messages
 from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
@@ -432,6 +434,20 @@ def build_flashrl(
         logging_config=logging_config or LoggingConfig(log_dir=tmp_path, console=False, file=True),
         metrics_config=metrics_config or MetricsConfig(enabled=False),
         admin_config=AdminConfig(admin_enabled=True),
+    )
+
+
+def build_whitebox_test_agent(agent_cls: type[Agent] = Agent) -> Agent:
+    """Build one minimal whitebox agent for FlashRL normalization tests."""
+
+    def run(agent: Agent) -> None:
+        sample = agent.generate(agent.prompt.text)
+        agent.record_generation(sample)
+        agent.finish(sample.text)
+
+    return agent_cls(
+        run_fn=run,
+        max_steps=1,
     )
 
 
@@ -1485,11 +1501,6 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
         "trainer": 0,
     }
 
-    class CountingRollout(UserDefinedRollout):
-        def __init__(self, *args, **kwargs) -> None:
-            counts["rollout"] += 1
-            super().__init__(*args, **kwargs)
-
     class CountingReward(UserDefinedReward):
         def __init__(self, *args, **kwargs) -> None:
             counts["reward"] += 1
@@ -1500,7 +1511,17 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
             counts["trainer"] += 1
             super().__init__(*args, **kwargs)
 
-    monkeypatch.setattr(flashrl_module, "UserDefinedRollout", CountingRollout)
+    real_build_rollout_generator = flashrl_module.build_rollout_generator
+
+    def counting_build_rollout_generator(*args, **kwargs):
+        counts["rollout"] += 1
+        return real_build_rollout_generator(*args, **kwargs)
+
+    monkeypatch.setattr(
+        flashrl_module,
+        "build_rollout_generator",
+        counting_build_rollout_generator,
+    )
     monkeypatch.setattr(flashrl_module, "UserDefinedReward", CountingReward)
     monkeypatch.setattr(flashrl_module, "GRPOTrainer", CountingTrainer)
 
@@ -1566,6 +1587,62 @@ def test_flashrl_eagerly_initializes_runtime_and_reuses_components(
     trainer._run_logger.close()
 
 
+def test_flashrl_builds_function_rollout_generator_for_plain_functions(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """FlashRL should normalize plain rollout functions through the function adapter."""
+    patch_backends(monkeypatch)
+
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="function", repeat=1),
+        reward_callback=reward_fn,
+    )
+
+    assert isinstance(trainer._rollout_generator, FunctionRolloutGenerator)
+
+
+def test_flashrl_builds_agent_rollout_generator_and_bypasses_agent_call(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Training with an Agent should use the direct agent generator, not Agent.__call__."""
+    patch_backends(monkeypatch)
+
+    class NonCallableAgent(Agent):
+        def __call__(self, prompts, serving_backend):  # type: ignore[override]
+            del prompts, serving_backend
+            raise AssertionError("FlashRL should not call Agent.__call__ during training.")
+
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=build_whitebox_test_agent(NonCallableAgent),
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
+    )
+
+    assert isinstance(trainer._rollout_generator, AgentRolloutGenerator)
+    trainer.train([Prompt(text="prompt 0"), Prompt(text="prompt 1")])
+    assert trainer._trainer is not None
+    assert trainer._trainer.total_steps == 2
+
+
+def test_flashrl_rejects_invalid_rollout_hook_type(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Rollout hook normalization should fail clearly for invalid inputs."""
+    patch_backends(monkeypatch)
+
+    with pytest.raises(TypeError, match="callable or flashrl.framework.agent.Agent"):
+        build_flashrl(
+            tmp_path,
+            rollout_callback=object(),
+            reward_callback=reward_fn,
+        )
+
+
 def test_flashrl_train_orchestrates_private_run_helpers_in_order(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1627,7 +1704,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     """Default local trainer path should run without a reference model."""
     training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
     serving_backend = FakeServingBackend(config=None)
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=make_rollout_fn(response_suffix="sample", repeat=20),
         serving_backend=serving_backend,
         config=SimpleNamespace(),
@@ -1815,7 +1892,7 @@ def test_reward_metadata_rates_are_logged_at_step_level(tmp_path: Path) -> None:
     """Reward metadata booleans should be aggregated into per-step and per-epoch rates."""
     training_backend = FakeTrainingBackend(config=None, learning_rate=1e-2)
     serving_backend = FakeServingBackend(config=None)
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=make_rollout_fn(response_suffix="rates", repeat=1),
         serving_backend=serving_backend,
         config=SimpleNamespace(),
@@ -1970,10 +2047,10 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     assert result_with_ref.loss.item() == pytest.approx(expected_total)
 
 
-def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_count() -> None:
-    """Grouped rollout should flatten prompt-major candidates and validate grouped shape."""
+def test_function_rollout_generator_generate_grouped_is_prompt_major_and_validates_count() -> None:
+    """Grouped function rollout should flatten prompt-major candidates and validate grouped shape."""
     serving_backend = FakeServingBackend(config=None)
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=make_rollout_fn(response_suffix="group", repeat=1),
         serving_backend=serving_backend,
         config=SimpleNamespace(),
@@ -1996,7 +2073,7 @@ def test_user_defined_rollout_generate_grouped_is_prompt_major_and_validates_cou
     assert prompt_indices == [0, 0, 1, 1]
     assert candidate_indices == [0, 1, 0, 1]
 
-    invalid_rollout = UserDefinedRollout(
+    invalid_rollout = FunctionRolloutGenerator(
         rollout_fn=lambda prompts, serving_backend: make_rollout_fn(
             response_suffix="invalid",
             repeat=1,
@@ -2018,7 +2095,7 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
         serving_backend=trainer_serving_backend,
         reference_backend=None,
         reward_fn=UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace()),
-        rollout_generator=UserDefinedRollout(
+        rollout_generator=FunctionRolloutGenerator(
             rollout_fn=make_rollout_fn(response_suffix="adv", repeat=1),
             serving_backend=trainer_serving_backend,
             config=SimpleNamespace(),
@@ -2512,6 +2589,7 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
     assert "response_preview" in reward_exception["payload"]["context"]
 
     run_finished = next(event for event in events if event["event"] == "run_finished")
+    assert run_finished["payload"]["status"] == "failed"
     assert run_finished["payload"]["no_training_steps_completed"] is True
     assert run_finished["payload"]["stage_totals"] == {}
     step_stages = [event for event in events if event["event"] == "step_stage"]
@@ -2521,5 +2599,99 @@ def test_flashrl_no_step_summary_is_explicit_on_early_failure(
 
     transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "no training steps completed" in transcript
+
+    trainer._run_logger.close()
+
+
+def test_flashrl_keyboard_interrupt_marks_run_interrupted(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Interrupted runs should not be finalized as completed."""
+    patch_backends(monkeypatch)
+
+    def interrupted_rollout(prompts: list[Prompt], serving_backend) -> list[RolloutOutput]:
+        del prompts, serving_backend
+        raise KeyboardInterrupt()
+
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=interrupted_rollout,
+        reward_callback=reward_fn,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+
+    with pytest.raises(KeyboardInterrupt):
+        trainer.train([Prompt(text="interrupt me")])
+
+    events = read_events(trainer._run_logger.run_dir)
+    train_exception = next(
+        event
+        for event in events
+        if event["event"] == "exception"
+        and event["payload"].get("type") == "KeyboardInterrupt"
+        and event["payload"].get("context", {}).get("stage") == "train"
+    )
+    assert train_exception["payload"]["context"]["step"] == 1
+    assert train_exception["payload"]["context"]["epoch"] == 1
+
+    run_finished = next(event for event in events if event["event"] == "run_finished")
+    assert run_finished["payload"]["status"] == "interrupted"
+    assert run_finished["payload"]["no_training_steps_completed"] is True
+
+    transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
+    assert "run interrupted" in transcript
+
+    trainer._run_logger.close()
+
+
+def test_flashrl_train_failure_uses_active_step_context(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Top-level train failures should report the in-flight step, not the last completed one."""
+    patch_backends(monkeypatch)
+    reward_call_count = 0
+
+    def fail_on_second_step(rollout: RolloutOutput) -> RewardOutput:
+        nonlocal reward_call_count
+        reward_call_count += 1
+        if reward_call_count >= 3:
+            raise RuntimeError(f"step two failure for {rollout.text[:12]}")
+        return RewardOutput(reward=1.0)
+
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(),
+        reward_callback=fail_on_second_step,
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
+        logging_config=LoggingConfig(
+            log_dir=tmp_path,
+            console=False,
+            file=True,
+        ),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+    dataset = [Prompt(text="first prompt"), Prompt(text="second prompt")]
+
+    with pytest.raises(RuntimeError, match="step two failure"):
+        trainer.train(dataset)
+
+    events = read_events(trainer._run_logger.run_dir)
+    train_exception = next(
+        event
+        for event in events
+        if event["event"] == "exception"
+        and event["payload"].get("context", {}).get("stage") == "train"
+    )
+
+    assert train_exception["payload"]["context"]["step"] == 2
+    assert train_exception["payload"]["context"]["epoch"] == 1
 
     trainer._run_logger.close()

@@ -10,10 +10,13 @@ dataset selection. It trains a base Qwen model with rule-based rewards and now
 supports both:
 
 - blackbox rollout construction in user code
-- whitebox rollout construction through built-in `ReActRollout`
+- whitebox rollout construction from `flashrl.framework.agent` building blocks
 
-The example sets its system prompt explicitly in Python code and keeps the same
-strict `<think>...</think><answer>...</answer>` reasoning contract.
+The example keeps the same strict
+`<think>...</think><answer>...</answer>` reasoning contract and shows both:
+
+- a plain user-defined rollout function
+- a traced custom loop built with `Agent`, `Tool`, and optional context helpers
 
 See [flashrl/framework/examples/math/README.md](math/README.md) for:
 
@@ -26,19 +29,34 @@ See [flashrl/framework/examples/math/README.md](math/README.md) for:
 - expected outputs and logs
 - troubleshooting
 
-## Agent Tools Demo
+## Agent Learning Ladder
 
-The `agent-tools` example is a tiny offline whitebox demo. It focuses only on
-the new agent/tool API surface:
+The agent examples are meant to be read in order:
 
-- explicit `ReActRollout(system_prompt=...)`
-- subprocess-backed tools
-- parallel tool calls in one assistant step
+- `agent-tools/`: the smallest custom loop using the core primitives directly
+- `agent-react/`: a reusable ReAct recipe built in normal example code
+- `agent-dynamic-tools/`: dynamic tool gating plus `WindowedContextManager`
+- `math/`: the training-integrated whitebox example
+
+These examples all use the same public toolbox under
+`flashrl.framework.agent`. There is no separate preset API to learn, and the
+agent policy lives in explicit system messages rather than a separate
+instruction section. `Agent.build_prompt(...)` then renders the visible tools
+and transcript into a completion-ready prompt that ends at the assistant turn.
+See [flashrl/framework/agent/README.md](../agent/README.md) for the core runtime model.
 
 Run it with:
 
 ```bash
 python3 flashrl/framework/examples/agent-tools/run.py
+```
+
+```bash
+python3 flashrl/framework/examples/agent-react/run.py
+```
+
+```bash
+python3 flashrl/framework/examples/agent-dynamic-tools/run.py
 ```
 
 ## Reasoning-Code Example

@@ -1,5 +1,5 @@
-"""Built-in tool runtime support."""
+"""Compatibility shim for the relocated agent tool runtime."""
 
-from flashrl.framework.tools.runtime import SubprocessToolRuntime, Tool
+from flashrl.framework.agent.tools import SubprocessToolRuntime, Tool
 
 __all__ = ["Tool", "SubprocessToolRuntime"]

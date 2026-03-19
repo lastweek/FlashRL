@@ -2,27 +2,38 @@
 from __future__ import annotations
 import ast
 import argparse
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
+import json
 import os
 from pathlib import Path
 import re
 import shutil
 import sys
-from typing import Any
+from typing import Any, Literal
+from uuid import uuid4
 EXAMPLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLE_DIR.parents[3]
 for candidate in (REPO_ROOT, EXAMPLE_DIR):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
-from flashrl.framework import FlashRL, ReActRollout, SubprocessToolRuntime, Tool
+from flashrl.framework import (
+    FlashRL,
+)
+from flashrl.framework.agent import (
+    Agent,
+    SubprocessToolRuntime,
+    Tool,
+)
 from flashrl.framework.data_models import (
     Conversation,
     Message,
     Prompt,
     RewardOutput,
     RolloutOutput,
+    ToolCall,
 )
 DEFAULT_MATH_DATASET = "gsm8k"
 SUPPORTED_MATH_DATASETS = ("gsm8k", "aime25")
@@ -50,20 +61,81 @@ STRICT_RESPONSE_PATTERN = re.compile(
 )
 
 
+@dataclass(frozen=True)
+class _MathDecision:
+    kind: Literal["action", "final"]
+    tool_calls: list[ToolCall] = field(default_factory=list)
+    final_text: str = ""
+    parse_error: str | None = None
+
+
 def build_math_system_prompt(training_mode: str = "math") -> str:
     """Return the explicit system prompt used by the whitebox math rollout."""
     if training_mode == "reasoning":
         return (
             "You are a careful math assistant. Use the calculator tool when arithmetic "
-            "would help. When you finish, the content after `Final:` must contain exactly "
-            "one <think>...</think> block followed immediately by one "
-            "<answer>...</answer> block."
+            "would help.\n"
+            "When you need tools, respond with exactly one line that starts with `Action:` "
+            "followed by either one JSON object or a JSON array of objects.\n"
+            "Each object must have the keys `tool` and `arguments`.\n"
+            "When you are ready to answer, respond with `Final:` followed by the final answer content.\n"
+            "The content after `Final:` must contain exactly one <think>...</think> block "
+            "followed immediately by one <answer>...</answer> block."
         )
     return (
         "You are a careful math assistant. Use the calculator tool when arithmetic "
-        "would help. When you finish, the content after `Final:` should contain only "
-        "the final answer."
+        "would help.\n"
+        "When you need tools, respond with exactly one line that starts with `Action:` "
+        "followed by either one JSON object or a JSON array of objects.\n"
+        "Each object must have the keys `tool` and `arguments`.\n"
+        "When you are ready to answer, respond with `Final:` followed by the final answer content.\n"
+        "The content after `Final:` should contain only the final answer."
     )
+
+
+def _parse_math_whitebox_response(raw_text: str) -> _MathDecision:
+    """Parse one whitebox math assistant response into actions or a final answer."""
+    stripped = raw_text.strip()
+    if stripped.startswith("Action:"):
+        payload_text = stripped[len("Action:"):].strip()
+        try:
+            payload = json.loads(payload_text)
+        except json.JSONDecodeError as exc:
+            return _MathDecision(
+                kind="action",
+                parse_error=f"Invalid Action payload: {exc}",
+            )
+        if isinstance(payload, dict):
+            payload = [payload]
+        if not isinstance(payload, list):
+            return _MathDecision(
+                kind="action",
+                parse_error="Action payload must be a JSON object or array.",
+            )
+        tool_calls: list[ToolCall] = []
+        for entry in payload:
+            if not isinstance(entry, dict):
+                return _MathDecision(
+                    kind="action",
+                    parse_error="Each Action entry must be a JSON object.",
+                )
+            tool_name = entry.get("tool")
+            arguments = entry.get("arguments", {})
+            if not isinstance(tool_name, str) or not isinstance(arguments, dict):
+                return _MathDecision(
+                    kind="action",
+                    parse_error="Each Action entry must include string `tool` and object `arguments`.",
+                )
+            tool_calls.append(
+                ToolCall(name=tool_name, arguments=dict(arguments), tool_id=uuid4().hex)
+            )
+        return _MathDecision(kind="action", tool_calls=tool_calls)
+    if stripped.startswith("Final:"):
+        return _MathDecision(
+            kind="final",
+            final_text=stripped[len("Final:"):].strip(),
+        )
+    return _MathDecision(kind="final", final_text=raw_text)
 # Prompt contract
 def render_math_prompt(problem: str, training_mode: str = "reasoning") -> str:
     """Render one strict user prompt with no system role.
@@ -145,14 +217,42 @@ def calculator_tool(arguments: dict[str, Any], prompt: Prompt) -> str:
     return normalized
 
 
-def build_math_whitebox_rollout(
+def build_math_whitebox_agent(
     *,
     training_mode: str,
     system_prompt: str | None = None,
-) -> ReActRollout:
-    """Construct the built-in ReAct rollout used by the whitebox math example."""
+) -> Agent:
+    """Construct one explicit custom-loop whitebox rollout for the math example."""
     resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
-    return ReActRollout(
+
+    def run(agent: Agent) -> None:
+        agent.add_message("system", resolved_system_prompt)
+        while not agent.done:
+            available_tools = agent.available_tools()
+            sample = agent.generate(agent.build_prompt(tools=available_tools))
+            decision = _parse_math_whitebox_response(sample.text)
+            if decision.kind == "action":
+                if decision.parse_error:
+                    agent.record_generation(sample)
+                    agent.add_message(
+                        "tool",
+                        decision.parse_error,
+                        metadata={
+                            "tool_name": "invalid_action",
+                            "tool_id": uuid4().hex,
+                            "error": True,
+                            "status": "parse_error",
+                        },
+                    )
+                    continue
+                agent.record_generation(sample, tool_calls=decision.tool_calls)
+                agent.run_tools(decision.tool_calls, tools=available_tools)
+                continue
+            agent.record_generation(sample)
+            agent.finish(decision.final_text)
+
+    return Agent(
+        run_fn=run,
         tools=[
             Tool(
                 name="calculator",
@@ -163,7 +263,6 @@ def build_math_whitebox_rollout(
             )
         ],
         max_steps=4,
-        system_prompt=resolved_system_prompt,
         runtime=SubprocessToolRuntime(default_timeout_seconds=3.0, default_memory_limit_mb=64),
         max_parallel_calls=4,
     )
@@ -684,9 +783,9 @@ def build_math_rollout(
     training_mode: str,
     system_prompt: str | None = None,
 ):
-    """Return either the example blackbox rollout or the built-in whitebox rollout."""
+    """Return either the example blackbox rollout or the traced whitebox rollout."""
     if rollout_mode == "whitebox":
-        return build_math_whitebox_rollout(
+        return build_math_whitebox_agent(
             training_mode=training_mode,
             system_prompt=system_prompt,
         )
@@ -763,7 +862,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         choices=SUPPORTED_MATH_ROLLOUT_MODES,
         default=DEFAULT_MATH_ROLLOUT_MODE,
         help="Rollout implementation: 'blackbox' uses the example rollout hook, "
-        "'whitebox' uses FlashRL's built-in ReAct rollout.",
+        "'whitebox' uses FlashRL's traced agent building blocks.",
     )
     parser.add_argument(
         "--debug-reward",

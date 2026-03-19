@@ -1,4 +1,4 @@
-"""Minimal custom-loop demo built from explicit agent primitives."""
+"""Reusable ReAct recipe built directly from FlashRL agent primitives."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ import json
 from pathlib import Path
 import sys
 from types import SimpleNamespace
-from typing import Literal
+from typing import Literal, Sequence
 from uuid import uuid4
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
@@ -29,8 +29,17 @@ class _Decision:
     parse_error: str | None = None
 
 
+DEFAULT_REACT_CONTRACT = (
+    "You are a ReAct-style assistant.\n"
+    "When you need tools, respond with `Action:` followed by either one JSON object "
+    "or a JSON array of objects.\n"
+    "Each object must have the keys `tool` and `arguments`.\n"
+    "When you are ready to answer, respond with `Final:` followed by the final answer."
+)
+
+
 class DemoServingBackend:
-    """Scripted backend that demonstrates one parallel tool step then one final step."""
+    """Scripted backend that follows a simple ReAct pattern."""
 
     def __init__(self) -> None:
         self.generation_defaults: dict[str, object] = {}
@@ -42,9 +51,9 @@ class DemoServingBackend:
     def generate_batch(self, prompts: list[str], **kwargs):
         del kwargs
         responses_by_step = [
-            'Action: [{"tool": "add", "arguments": {"a": 20, "b": 22}}, '
-            '{"tool": "multiply", "arguments": {"a": 6, "b": 7}}]',
-            "Final: The sum is 42 and the product is 42.",
+            'Action: [{"tool": "add", "arguments": {"a": 8, "b": 13}}, '
+            '{"tool": "multiply", "arguments": {"a": 7, "b": 6}}]',
+            "Final: 8 + 13 is 21 and 7 * 6 is 42.",
         ]
         response_text = responses_by_step[min(self._call_index, len(responses_by_step) - 1)]
         self._call_index += 1
@@ -66,7 +75,8 @@ class DemoServingBackend:
         return outputs
 
 
-def _parse_response(raw_text: str) -> _Decision:
+def parse_react_response(raw_text: str) -> _Decision:
+    """Parse one ReAct-style assistant response."""
     stripped = raw_text.strip()
     if stripped.startswith("Action:"):
         payload_text = stripped[len("Action:"):].strip()
@@ -104,23 +114,22 @@ def _parse_response(raw_text: str) -> _Decision:
     return _Decision(kind="final", final_text=raw_text)
 
 
-def build_demo_agent() -> Agent:
-    """Build one explicit custom agent loop using the core Agent methods."""
-    entrypoint_module = "flashrl.framework.examples.agent_tools_helpers"
+def build_react_agent(
+    *,
+    tools: Sequence[Tool],
+    max_steps: int,
+    system_prompt: str,
+    footer: str | None = None,
+) -> Agent:
+    """Build a reusable ReAct loop from the core FlashRL agent primitives."""
 
     def run(agent: Agent) -> None:
-        agent.add_message(
-            "system",
-            "You are a tool-using assistant.\n"
-            "Use `Action:` with JSON tool calls when you need tools.\n"
-            "Use `Final:` when you are ready to answer.\n"
-            "After any tool use, finish with a concise answer after `Final:`.",
-        )
+        agent.add_message("system", system_prompt)
         while not agent.done:
             available_tools = agent.available_tools()
-            prompt = agent.build_prompt(tools=available_tools)
+            prompt = agent.build_prompt(tools=available_tools, footer=footer)
             sample = agent.generate(prompt)
-            decision = _parse_response(sample.text)
+            decision = parse_react_response(sample.text)
             if decision.kind == "action":
                 if decision.parse_error:
                     agent.record_generation(sample)
@@ -143,6 +152,15 @@ def build_demo_agent() -> Agent:
 
     return Agent(
         run_fn=run,
+        tools=list(tools),
+        max_steps=max_steps,
+    )
+
+
+def build_demo_agent() -> Agent:
+    """Build the example agent used by the offline demo."""
+    entrypoint_module = "flashrl.framework.examples.agent_tools_helpers"
+    return build_react_agent(
         tools=[
             Tool(
                 name="add",
@@ -156,16 +174,18 @@ def build_demo_agent() -> Agent:
             ),
         ],
         max_steps=3,
+        system_prompt=(
+            "Use tools before answering arithmetic questions.\n\n"
+            + DEFAULT_REACT_CONTRACT
+        ),
     )
 
 
 def main() -> int:
-    """Run one demo rollout and print the resulting transcript."""
-    prompt = Prompt(text="Compute 20 + 22 and 6 * 7.")
+    """Run the local ReAct example and print the traced rollout."""
+    prompt = Prompt(text="What are 8 + 13 and 7 * 6?")
     rollout_output = build_demo_agent()([prompt], DemoServingBackend())[0]
-    print(
-        json.dumps(rollout_output.model_dump(), ensure_ascii=True, indent=2, sort_keys=True)
-    )
+    print(json.dumps(rollout_output.model_dump(), ensure_ascii=True, indent=2, sort_keys=True))
     return 0
 
 

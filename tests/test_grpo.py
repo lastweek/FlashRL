@@ -23,7 +23,7 @@ from flashrl.framework.data_models import (
     WeightVersionInfo,
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
-from flashrl.framework.rollout.user_defined import UserDefinedRollout
+from flashrl.framework.rollout.function import FunctionRolloutGenerator
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
 from flashrl.framework.trainer.grpo.grpo_helpers import compute_advantages, prompt_batch_size
 from flashrl.framework.trainer.grpo.loss_variants import assemble_grpo_loss
@@ -77,7 +77,7 @@ def build_trainer(
         group_size=group_size,
     )
     serving_backend = serving_backend or TinyServingBackend()
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=rollout_fn or make_rollout_fn(response_suffix="grpo", repeat=2),
         serving_backend=serving_backend,
         config=SimpleNamespace(),
@@ -207,7 +207,7 @@ def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None
 
     training_backend = RecordingTrainingBackend()
     serving_backend = TinyServingBackend()
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=make_rollout_fn(response_suffix="handoff", repeat=1),
         serving_backend=serving_backend,
         config=SimpleNamespace(),
@@ -610,10 +610,10 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
     assert serving_backend._actor.debug_events[-1] == ("clear", None)
 
 
-def test_user_defined_rollout_stamps_one_weight_version_on_all_outputs() -> None:
-    """Framework rollout wrapping should stamp serving provenance centrally."""
+def test_function_rollout_generator_stamps_one_weight_version_on_all_outputs() -> None:
+    """Function rollout wrapping should stamp serving provenance centrally."""
     serving_backend = TinyServingBackend()
-    rollout = UserDefinedRollout(
+    rollout = FunctionRolloutGenerator(
         rollout_fn=make_rollout_fn(response_suffix="weights", repeat=1),
         serving_backend=serving_backend,
         config=SimpleNamespace(),

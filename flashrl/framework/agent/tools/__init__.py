@@ -1,4 +1,4 @@
-"""Compatibility shim for the relocated agent tool runtime."""
+"""User-facing tool building blocks for agent rollouts."""
 
 from flashrl.framework.agent.tools.runtime import SubprocessToolRuntime, Tool
 
