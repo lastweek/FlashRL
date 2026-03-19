@@ -24,6 +24,7 @@ from flashrl.framework.config import (
     TrainingConfig,
 )
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.training import ActorTrainingBackend
 from tests.conftest import TinyActor
@@ -64,6 +65,15 @@ class AdminServingBackend:
         self.device = self._actor.device
         self.generation_defaults: dict[str, object] = {}
         self.closed = False
+        self._active_weight_version = WeightVersionInfo(
+            version_id=0,
+            source_training_step=None,
+            source_epoch=None,
+            activated_at="2026-03-19T00:00:00Z",
+            model_source="fake/model",
+            origin="startup",
+        )
+        self._next_weight_version_id = 1
 
     def generate(self, prompts: list[str], **kwargs):
         return self._actor.generate(prompts, **kwargs)
@@ -78,8 +88,51 @@ class AdminServingBackend:
         self.generation_defaults = dict(kwargs)
         self._actor.set_generation_defaults(**kwargs)
 
-    def sync_from_training_actor(self, training_actor) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         self._actor.model.load_state_dict(training_actor.model.state_dict())
+        self._active_weight_version = WeightVersionInfo(
+            version_id=self._next_weight_version_id,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+            model_source=f"fake/model/version-{self._next_weight_version_id}",
+            origin=origin,
+        )
+        self._next_weight_version_id += 1
+        return self.current_weight_version()
+
+    def current_weight_version(self) -> WeightVersionInfo:
+        return self._active_weight_version.model_copy(deep=True)
+
+    def export_weight_version_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_version_id": self._next_weight_version_id,
+        }
+
+    def weight_sync_status(self) -> dict[str, object]:
+        active = self.current_weight_version()
+        return {
+            "activeWeightVersion": active.model_dump(),
+            "pendingWeightVersion": None,
+            "lastSuccessfulSyncAt": active.activated_at,
+            "syncHealthy": True,
+            "lastSyncError": None,
+        }
+
+    def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        next_version_id = state.get("next_version_id")
+        if isinstance(next_version_id, int):
+            self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
     def set_live_rollout_debug(self, callback, context) -> None:
         del callback, context
@@ -119,6 +172,11 @@ class AdminServingBackend:
                     "exitCode": 0 if self.closed else None,
                     "stderrTail": "",
                     "lastError": None,
+                    "activeWeightVersion": self.current_weight_version().model_dump(),
+                    "pendingWeightVersion": None,
+                    "lastSuccessfulSyncAt": self.current_weight_version().activated_at,
+                    "syncHealthy": True,
+                    "lastSyncError": None,
                 },
             )
         ]
@@ -298,7 +356,7 @@ def _patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: AdminServingBackend(config),
+        lambda config, startup_logger=None, log_dir=None: AdminServingBackend(config),
     )
 
 
@@ -330,6 +388,9 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
         runtime_object = _wait_for_json(
             f"{trainer.admin_base_url}/admin/v1/objects/FlashRLRuntime/flashrl-runtime"
         )
+        serving_object = _wait_for_json(
+            f"{trainer.admin_base_url}/admin/v1/objects/ServingBackend/serving-backend"
+        )
         vllm_list = _wait_for_json(f"{trainer.admin_base_url}/admin/v1/objects/VLLMInstance")
     finally:
         trainer.close()
@@ -341,8 +402,13 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
     assert "ServingBackend" in kinds
     assert "VLLMInstance" in kinds
     assert runtime_object["spec"]["adminBaseUrl"] == trainer.admin_base_url
+    assert serving_object["status"]["activeWeightVersion"]["version_id"] == 0
+    assert serving_object["status"]["activeWeightVersion"]["origin"] == "startup"
+    assert serving_object["status"]["pendingWeightVersion"] is None
+    assert serving_object["status"]["syncHealthy"] is True
     assert vllm_list["items"][0]["spec"]["port"] == 8100
     assert vllm_list["items"][0]["status"]["phase"] == "Ready"
+    assert vllm_list["items"][0]["status"]["activeWeightVersion"]["version_id"] == 0
 
     with pytest.raises(urllib_error.URLError):
         _get_json(f"{trainer.admin_base_url}/admin/healthz")

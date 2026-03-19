@@ -82,7 +82,6 @@ metrics:
 
 checkpointing:
   save_on_run_end: true
-  final_path: /tmp/flashrl_glm5_checkpoint.pt
 
 admin:
   admin_enabled: true

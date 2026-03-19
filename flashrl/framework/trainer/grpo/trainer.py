@@ -8,7 +8,13 @@ from typing import TYPE_CHECKING, Any, Callable
 import torch
 
 from flashrl.framework.config import GrpoConfig, TrainerConfig
-from flashrl.framework.data_models import LearnerBatch, Prompt, RewardOutput, TrainingBatch
+from flashrl.framework.data_models import (
+    LearnerBatch,
+    Prompt,
+    RewardOutput,
+    TrainingBatch,
+    WeightVersionInfo,
+)
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -240,7 +246,9 @@ class GRPOTrainer:
             prompt_count=context.prompt_count,
             prompt_indices=prompt_indices,
             candidate_indices=candidate_indices,
+            metadata=self._build_batch_metadata(rollouts),
         )
+        rollout_weight_version = dict(batch.metadata.get("weight_version", {}))
 
         advantages, advantage_seconds = timed_call(
             lambda: compute_advantages(
@@ -307,6 +315,8 @@ class GRPOTrainer:
             "candidate_count": grouped_prompts_count,
             "sample_count": grouped_prompts_count,
         }
+        if rollout_weight_version:
+            payload["rollout_weight_version"] = rollout_weight_version
 
         done_event = RuntimeEvent(kind="step_done", payload=payload)
         observe_event_pair(self.run_logger, self.metrics_sink, done_event)
@@ -394,18 +404,26 @@ class GRPOTrainer:
                 continue
             self._log_stage(context, stage)
 
-        _, sync_seconds = timed_call(
-            lambda: self.actor_backend.sync_weights_to(self.serving_backend)
+        sync_info, sync_seconds = timed_call(
+            lambda: self.actor_backend.sync_weights_to(
+                self.serving_backend,
+                source_training_step=context.step,
+                source_epoch=context.epoch,
+                origin="sync",
+            )
         )
         sync_stage = StageResult(
             name="sync",
             seconds=sync_seconds,
-            metrics={},
+            metrics={
+                "weight_version_id": sync_info.version_id,
+            },
         )
         result.stages.append(sync_stage)
         if context is not None:
             partial_step_seconds = sum(stage.seconds for stage in result.stages)
             sync_stage.metrics = {
+                "weight_version_id": sync_info.version_id,
                 "step_duration_seconds": partial_step_seconds,
                 "tokens_per_second": (
                     result.response_tokens_total / partial_step_seconds
@@ -416,6 +434,24 @@ class GRPOTrainer:
             self._log_stage(context, sync_stage)
         result.refresh_stage_views()
         return result
+
+    def _build_batch_metadata(self, rollouts: list[Any]) -> dict[str, Any]:
+        """Capture batch-wide rollout provenance and reject mixed serving versions."""
+        normalized_versions = []
+        for rollout in rollouts:
+            payload = _weight_version_payload(rollout)
+            if payload:
+                normalized_versions.append(payload)
+
+        if not normalized_versions:
+            return {}
+
+        canonical = normalized_versions[0]
+        if any(payload != canonical for payload in normalized_versions[1:]):
+            raise RuntimeError("Rollout batch mixed multiple serving weight versions.")
+        return {
+            "weight_version": canonical,
+        }
 
     def _build_epoch_summary(
         self,
@@ -526,7 +562,6 @@ class GRPOTrainer:
         controller_state, _ = self.load_checkpoint_with_metadata(path)
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
-        self.actor_backend.sync_weights_to(self.serving_backend)
 
     def load_checkpoint_with_metadata(
         self,
@@ -564,7 +599,21 @@ class GRPOTrainer:
             checkpoint_metadata = None
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
-        self.actor_backend.sync_weights_to(self.serving_backend)
+        serving_metadata = checkpoint_metadata.get("serving") if checkpoint_metadata else None
+        if isinstance(serving_metadata, dict):
+            restore_weight_version_state = getattr(
+                self.serving_backend,
+                "restore_weight_version_state",
+                None,
+            )
+            if callable(restore_weight_version_state):
+                restore_weight_version_state(serving_metadata.get("weight_version_state"))
+        self.actor_backend.sync_weights_to(
+            self.serving_backend,
+            source_training_step=self.total_steps,
+            source_epoch=self.current_epoch + 1 if self.current_epoch >= 0 else None,
+            origin="resume",
+        )
         return controller_state, checkpoint_metadata
 
     def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:
@@ -581,6 +630,18 @@ def current_time() -> float:
     import time
 
     return time.perf_counter()
+
+
+def _weight_version_payload(rollout: Any) -> dict[str, Any]:
+    metadata = getattr(rollout, "metadata", {})
+    if not isinstance(metadata, dict):
+        return {}
+    weight_version = metadata.get("weight_version")
+    if isinstance(weight_version, WeightVersionInfo):
+        return weight_version.model_dump()
+    if isinstance(weight_version, dict):
+        return dict(weight_version)
+    return {}
 
 
 def math_ceil_div(size: int, divisor: int) -> int:

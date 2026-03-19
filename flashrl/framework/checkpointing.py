@@ -13,7 +13,7 @@ from flashrl.framework.config import CheckpointingConfig
 
 
 LATEST_CHECKPOINT = "latest"
-CHECKPOINT_SCHEMA_VERSION = 3
+CHECKPOINT_SCHEMA_VERSION = 4
 LOGGER_STATE_SCHEMA_VERSION = 1
 
 

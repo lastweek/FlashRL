@@ -15,15 +15,17 @@ import socket
 import subprocess
 import sys
 import tempfile
-from threading import Lock, Thread
+from threading import Lock, RLock, Thread
 import time
 from typing import Callable, TextIO
 from typing import Any
 from urllib import error as urllib_error
 from urllib import request as urllib_request
+from uuid import uuid4
 
 from flashrl.framework.admin import build_admin_object, utc_now_iso
 from flashrl.framework.config import ServingConfig
+from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.models.actor import ActorModel, GeneratedSample
 from flashrl.framework.serving.base import ServingBackend
 
@@ -88,23 +90,30 @@ class VLLMServingBackend(ServingBackend):
         self._replicas: list[_Replica] = []
         self._admin_replicas: list[_Replica] = []
         self._log_dir = Path(log_dir) if log_dir else None
+        self._lifecycle_lock = RLock()
 
         self._validate_environment()
 
         try:
             self._replicas = self._launch_initial_replicas()
             self._admin_replicas = list(self._replicas)
+            active_model_source = (
+                self._replicas[0].model_source if self._replicas else self.config.model_name
+            )
+            self._initialize_weight_version(model_source=active_model_source, origin="startup")
             atexit.register(self.close)
         except Exception:
             self.close()
             raise
 
     def generate(self, prompts: list[str], **kwargs: Any) -> list[str]:
-        return [sample.text for sample in self.generate_batch(prompts, **kwargs)]
+        with self._lifecycle_lock:
+            return [sample.text for sample in self.generate_batch(prompts, **kwargs)]
 
     def generate_batch(self, prompts: list[str], **kwargs: Any) -> list[GeneratedSample]:
-        grouped = self.generate_grouped(prompts, group_size=1, **kwargs)
-        return [candidates[0] for candidates in grouped]
+        with self._lifecycle_lock:
+            grouped = self.generate_grouped(prompts, group_size=1, **kwargs)
+            return [candidates[0] for candidates in grouped]
 
     def generate_grouped(
         self,
@@ -112,53 +121,56 @@ class VLLMServingBackend(ServingBackend):
         group_size: int,
         **kwargs: Any,
     ) -> list[list[GeneratedSample]]:
-        if self._closed:
-            raise RuntimeError("vllm backend is closed.")
-        if group_size < 1:
-            raise ValueError(f"group_size must be >= 1, got {group_size}")
-        if not prompts:
-            return []
-        if not self._replicas:
-            raise RuntimeError("vllm replicas are not running.")
+        with self._lifecycle_lock:
+            if self._closed:
+                raise RuntimeError("vllm backend is closed.")
+            if group_size < 1:
+                raise ValueError(f"group_size must be >= 1, got {group_size}")
+            if not prompts:
+                return []
+            if not self._replicas:
+                raise RuntimeError("vllm replicas are not running.")
 
-        generation_kwargs = {
-            **self.generation_defaults,
-            **kwargs,
-        }
-        ranges = self._prompt_ranges(len(prompts), min(len(self._replicas), len(prompts)))
-        grouped_outputs: list[list[GeneratedSample] | None] = [None] * len(prompts)
+            generation_kwargs = {
+                **self.generation_defaults,
+                **kwargs,
+            }
+            ranges = self._prompt_ranges(len(prompts), min(len(self._replicas), len(prompts)))
+            grouped_outputs: list[list[GeneratedSample] | None] = [None] * len(prompts)
 
-        with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
-            futures = []
-            for replica, (start, end) in zip(self._replicas, ranges, strict=True):
-                futures.append(
-                    executor.submit(
-                        self._generate_chunk,
-                        replica,
-                        prompts[start:end],
-                        group_size,
-                        generation_kwargs,
-                        start,
+            with ThreadPoolExecutor(max_workers=len(ranges)) as executor:
+                futures = []
+                for replica, (start, end) in zip(self._replicas, ranges, strict=True):
+                    futures.append(
+                        executor.submit(
+                            self._generate_chunk,
+                            replica,
+                            prompts[start:end],
+                            group_size,
+                            generation_kwargs,
+                            start,
+                        )
                     )
-                )
 
-            for future in futures:
-                start_index, chunk_outputs = future.result()
-                for offset, prompt_outputs in enumerate(chunk_outputs):
-                    grouped_outputs[start_index + offset] = prompt_outputs
+                for future in futures:
+                    start_index, chunk_outputs = future.result()
+                    for offset, prompt_outputs in enumerate(chunk_outputs):
+                        grouped_outputs[start_index + offset] = prompt_outputs
 
-        return [
-            prompt_outputs
-            for prompt_outputs in grouped_outputs
-            if prompt_outputs is not None
-        ]
+            return [
+                prompt_outputs
+                for prompt_outputs in grouped_outputs
+                if prompt_outputs is not None
+            ]
 
     def set_generation_defaults(self, **kwargs: Any) -> None:
-        self.generation_defaults = dict(kwargs)
+        with self._lifecycle_lock:
+            self.generation_defaults = dict(kwargs)
 
     def list_admin_objects(self) -> list[dict[str, Any]]:
         """Return one admin object per managed vLLM replica."""
         items: list[dict[str, Any]] = []
+        sync_status = self.weight_sync_status()
         for replica in self._admin_replicas:
             exit_code = replica.process.poll()
             if exit_code is not None:
@@ -194,73 +206,144 @@ class VLLMServingBackend(ServingBackend):
                         "exitCode": replica.exit_code,
                         "stderrTail": replica.stderr_tail(),
                         "lastError": replica.last_error,
+                        "activeWeightVersion": sync_status.get("activeWeightVersion"),
+                        "pendingWeightVersion": sync_status.get("pendingWeightVersion"),
+                        "lastSuccessfulSyncAt": sync_status.get("lastSuccessfulSyncAt"),
+                        "syncHealthy": sync_status.get("syncHealthy"),
+                        "lastSyncError": sync_status.get("lastSyncError"),
                     },
                 )
             )
         return items
 
-    def sync_from_training_actor(self, training_actor: ActorModel) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor: ActorModel,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         """Sync weights from training actor to serving backend.
 
         Uses in-process weight loading via HTTP endpoint to avoid process restart.
         """
-        snapshot_dir = self._write_snapshot(training_actor)
+        with self._lifecycle_lock:
+            version_id = int(getattr(self, "_next_weight_version_id", 1))
+            snapshot_dir = self._write_snapshot(training_actor, version_id=version_id)
+            self._begin_pending_weight_version(
+                model_source=str(snapshot_dir),
+                source_training_step=source_training_step,
+                source_epoch=source_epoch,
+                origin=origin,
+            )
 
-        # Use load_weights_from_disk endpoint for in-process model swap
-        for replica in self._replicas:
+            previous_sources = {
+                replica.index: replica.model_source
+                for replica in self._replicas
+            }
+            advanced_replicas: list[_Replica] = []
             try:
-                self._request_json(
-                    f"{replica.base_url}/v1/load_weights_from_disk",
-                    method="POST",
-                    payload={"model_source": str(snapshot_dir)},
-                    timeout=60.0,  # Allow time for weight load
-                )
-                replica.model_source = str(snapshot_dir)
-                replica.phase = "Ready"
-                replica.last_error = None
+                for replica in self._replicas:
+                    replica.phase = "Syncing"
+                    self._request_json(
+                        f"{replica.base_url}/v1/load_weights_from_disk",
+                        method="POST",
+                        payload={"model_source": str(snapshot_dir)},
+                        timeout=60.0,
+                    )
+                    replica.model_source = str(snapshot_dir)
+                    replica.phase = "Ready"
+                    replica.last_error = None
+                    advanced_replicas.append(replica)
             except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to load weights into replica {replica.index}: {exc}"
-                ) from exc
+                rollback_error: Exception | None = None
+                for replica in advanced_replicas:
+                    previous_source = previous_sources[replica.index]
+                    try:
+                        self._request_json(
+                            f"{replica.base_url}/v1/load_weights_from_disk",
+                            method="POST",
+                            payload={"model_source": previous_source},
+                            timeout=60.0,
+                        )
+                        replica.model_source = previous_source
+                        replica.phase = "Ready"
+                        replica.last_error = None
+                    except Exception as rollback_exc:
+                        rollback_error = rollback_exc
+                        replica.phase = "Failed"
+                        replica.last_error = (
+                            f"Rollback failed after sync error: {rollback_exc}"
+                        )
+                for replica in self._replicas:
+                    if replica not in advanced_replicas and replica.phase == "Syncing":
+                        replica.phase = "Ready"
+                failure_message = f"Failed to load weights into vllm replicas: {exc}"
+                if rollback_error is None:
+                    self._clear_pending_weight_version(
+                        sync_healthy=True,
+                        last_sync_error=failure_message,
+                    )
+                    self._remove_snapshot_dir(snapshot_dir)
+                    raise RuntimeError(failure_message) from exc
+                rollback_message = (
+                    f"{failure_message}. Rollback also failed: {rollback_error}"
+                )
+                self._clear_pending_weight_version(
+                    sync_healthy=False,
+                    last_sync_error=rollback_message,
+                )
+                raise RuntimeError(rollback_message) from exc
+
+            activated = self._commit_pending_weight_version()
+            self._cleanup_inactive_snapshots(active_model_source=str(snapshot_dir))
+            return activated
 
     def pause_inference(self) -> None:
         """Pause inference for all replicas."""
-        for replica in self._replicas:
-            try:
-                self._request_json(
-                    f"{replica.base_url}/admin/pause",
-                    method="POST",
-                    timeout=30.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to pause inference for replica {replica.index}: {exc}"
-                ) from exc
+        with self._lifecycle_lock:
+            for replica in self._replicas:
+                try:
+                    self._request_json(
+                        f"{replica.base_url}/admin/pause",
+                        method="POST",
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to pause inference for replica {replica.index}: {exc}"
+                    ) from exc
 
     def resume_inference(self) -> None:
         """Resume inference for all replicas."""
-        for replica in self._replicas:
-            try:
-                self._request_json(
-                    f"{replica.base_url}/admin/resume",
-                    method="POST",
-                    timeout=30.0,
-                )
-            except Exception as exc:
-                raise RuntimeError(
-                    f"Failed to resume inference for replica {replica.index}: {exc}"
-                ) from exc
+        with self._lifecycle_lock:
+            for replica in self._replicas:
+                try:
+                    self._request_json(
+                        f"{replica.base_url}/admin/resume",
+                        method="POST",
+                        timeout=30.0,
+                    )
+                except Exception as exc:
+                    raise RuntimeError(
+                        f"Failed to resume inference for replica {replica.index}: {exc}"
+                    ) from exc
 
     def close(self) -> None:
-        if self._closed:
-            return
-        self._closed = True
-        with suppress(ValueError):
-            atexit.unregister(self.close)
-        self._stop_replicas()
-        if self._snapshot_dir is not None:
-            shutil.rmtree(self._snapshot_dir, ignore_errors=True)
-            self._snapshot_dir = None
+        with self._lifecycle_lock:
+            if self._closed:
+                return
+            self._closed = True
+            with suppress(ValueError):
+                atexit.unregister(self.close)
+            self._stop_replicas()
+            if self._snapshot_dir is not None:
+                if self._log_dir is None:
+                    shutil.rmtree(self._snapshot_dir, ignore_errors=True)
+                else:
+                    self._cleanup_stray_snapshot_temp_dirs(self._snapshot_dir)
+                self._snapshot_dir = None
 
     def _validate_environment(self) -> None:
         if self.config.debug_live_rollout:
@@ -706,6 +789,7 @@ class VLLMServingBackend(ServingBackend):
             for key, value in {
                 "finish_reason": raw_choice.get("finish_reason"),
                 "stop_reason": raw_choice.get("stop_reason"),
+                "weight_version": self.current_weight_version().model_dump(),
             }.items()
             if value is not None
         }
@@ -790,18 +874,75 @@ class VLLMServingBackend(ServingBackend):
                     continue
         raise RuntimeError(f"Unable to extract sampled token logprob for token_id={token_id}.")
 
-    def _write_snapshot(self, training_actor: ActorModel) -> Path:
-        snapshot_dir = self._ensure_snapshot_dir()
-        shutil.rmtree(snapshot_dir, ignore_errors=True)
-        snapshot_dir.mkdir(parents=True, exist_ok=True)
-        training_actor.model.save_pretrained(snapshot_dir, safe_serialization=True)
-        training_actor.tokenizer.save_pretrained(snapshot_dir)
-        return snapshot_dir
+    def _write_snapshot(self, training_actor: ActorModel, *, version_id: int) -> Path:
+        snapshot_root = self._ensure_snapshot_dir()
+        final_dir = snapshot_root / f"version-{version_id:08d}"
+        if final_dir.exists():
+            raise RuntimeError(f"Managed vllm snapshot version already exists: {final_dir}")
+
+        temp_dir = snapshot_root / f".version-{version_id:08d}.{uuid4().hex}.tmp"
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        training_actor.model.save_pretrained(temp_dir, safe_serialization=True)
+        training_actor.tokenizer.save_pretrained(temp_dir)
+        self._fsync_tree(temp_dir)
+        os.replace(temp_dir, final_dir)
+        self._fsync_dir(snapshot_root)
+        return final_dir
 
     def _ensure_snapshot_dir(self) -> Path:
         if self._snapshot_dir is None:
-            self._snapshot_dir = Path(tempfile.mkdtemp(prefix="flashrl-vllm-")).resolve()
+            if self._log_dir is not None:
+                self._snapshot_dir = (self._log_dir / "vllm" / "weights").resolve()
+                self._snapshot_dir.mkdir(parents=True, exist_ok=True)
+                self._cleanup_stray_snapshot_temp_dirs(self._snapshot_dir)
+            else:
+                self._snapshot_dir = Path(tempfile.mkdtemp(prefix="flashrl-vllm-")).resolve()
         return self._snapshot_dir
+
+    def _cleanup_inactive_snapshots(self, *, active_model_source: str) -> None:
+        snapshot_root = self._snapshot_dir
+        if snapshot_root is None:
+            return
+        self._cleanup_stray_snapshot_temp_dirs(snapshot_root)
+        active_path = Path(active_model_source).resolve()
+        for child in snapshot_root.iterdir():
+            if child.resolve() == active_path:
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+
+    def _remove_snapshot_dir(self, snapshot_dir: Path) -> None:
+        if snapshot_dir.exists():
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
+
+    def _cleanup_stray_snapshot_temp_dirs(self, snapshot_root: Path) -> None:
+        if not snapshot_root.exists():
+            return
+        for child in snapshot_root.iterdir():
+            if not child.name.startswith("."):
+                continue
+            if child.is_dir():
+                shutil.rmtree(child, ignore_errors=True)
+            else:
+                child.unlink(missing_ok=True)
+
+    def _fsync_tree(self, root: Path) -> None:
+        for child in root.rglob("*"):
+            if child.is_file():
+                with child.open("rb") as handle:
+                    os.fsync(handle.fileno())
+        directories = [path for path in root.rglob("*") if path.is_dir()]
+        for directory in sorted(directories, key=lambda item: len(item.parts), reverse=True):
+            self._fsync_dir(directory)
+        self._fsync_dir(root)
+
+    def _fsync_dir(self, path: Path) -> None:
+        with suppress(OSError):
+            dir_fd = os.open(path, os.O_RDONLY)
+            try:
+                os.fsync(dir_fd)
+            finally:
+                os.close(dir_fd)
 
     def _stop_replicas(self) -> None:
         replicas = self._replicas

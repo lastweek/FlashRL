@@ -6,7 +6,7 @@ import math
 from typing import Any, Callable
 
 
-ROLLOUT_SCHEMA_VERSION = 2
+ROLLOUT_SCHEMA_VERSION = 3
 
 PROMOTED_PROMPT_METADATA_KEYS = (
     "task_id",
@@ -276,7 +276,7 @@ def build_rollout_record(
     serialize_for_json: Callable[[Any], Any],
     truncate_text: Callable[[str], str],
 ) -> dict[str, Any]:
-    """Serialize one prompt-group rollout record in schema v2."""
+    """Serialize one prompt-group rollout record in schema v3."""
     prompt_text = str(getattr(prompt, "text", ""))
     prompt_metadata = clone_json_mapping(serialize_for_json(getattr(prompt, "metadata", {})))
 
@@ -313,6 +313,7 @@ def build_rollout_record(
 
     serialized_candidates: list[dict[str, Any]] = []
     merged_prompt_metadata = dict(prompt_metadata)
+    serving_weight_version: dict[str, Any] = {}
     for candidate, completion_messages in zip(
         candidates,
         completion_message_groups,
@@ -327,6 +328,9 @@ def build_rollout_record(
         rollout_metadata = clone_json_mapping(
             serialize_for_json(getattr(rollout, "metadata", {}))
         )
+        weight_version = clone_json_mapping(rollout_metadata.pop("weight_version", {}))
+        if weight_version and not serving_weight_version:
+            serving_weight_version = dict(weight_version)
         raw_prompt_metadata = clone_json_mapping(rollout_metadata.pop("prompt_metadata", {}))
         merged_prompt_metadata.update(
             {
@@ -375,6 +379,7 @@ def build_rollout_record(
                         "generation_seconds": generation_seconds,
                         "tokens_per_second": tokens_per_second,
                         "log_prob": float(getattr(rollout, "log_prob", 0.0)),
+                        "weight_version": weight_version,
                         **output_stats,
                     }
                 ),
@@ -424,6 +429,9 @@ def build_rollout_record(
             "prompt_char_count": len(prompt_text),
             "metadata": remaining_prompt_metadata,
             **promoted_prompt_metadata,
+        }),
+        "serving": compact_mapping({
+            "weight_version": serving_weight_version,
         }),
         "summary": compact_mapping(derive_rollout_summary(serialized_candidates)),
         "candidates": serialized_candidates,

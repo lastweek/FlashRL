@@ -379,20 +379,25 @@ Available flags:
 - `--training-mode`: choose `math` (default) or `reasoning`.
 
 Training checkpointing is configured in YAML. The shipped example configs already
-write a final checkpoint to `/tmp/flashrl_reasoning_checkpoint.pt`.
+save a final checkpoint under `run_dir/checkpoints/final.pt`.
 
 Example:
 
 ```yaml
 checkpointing:
   save_on_run_end: true
-  final_path: /tmp/flashrl_reasoning_checkpoint.pt
+  # Default final checkpoint: run_dir/checkpoints/final.pt
+  # Optional explicit override:
+  # final_path: /path/to/final.pt
   # Optional explicit resume:
-  # resume_from: /tmp/flashrl_reasoning_checkpoint.pt
+  # resume_from: /path/to/final.pt
   # Optional managed latest resume:
   # directory: logs/math-checkpoints
   # resume_from: latest
 ```
+
+When `config_vllm.yaml` is used, synced serving weights for the run are kept
+under `run_dir/vllm/weights`.
 
 ### Evaluation
 
@@ -506,8 +511,9 @@ The example does not fall back to parsing answers from free-form text.
   `debug_live_rollout`.
 - Default configs are prototype-scale and meant for local experimentation, not
   benchmark reproduction.
-- The shipped configs save a final checkpoint to
-  `/tmp/flashrl_reasoning_checkpoint.pt` via `checkpointing.final_path`.
+- Managed checkpoints default to `run_dir/checkpoints`.
+- When serving with `vllm`, synced serving weights are written under
+  `run_dir/vllm/weights`.
 - Run artifacts are written under `logs/` as `console.log`, `events.jsonl`, and
   `rollouts.jsonl`.
 - `rollouts.jsonl` keeps one row per prompt group, stores shared prompt messages

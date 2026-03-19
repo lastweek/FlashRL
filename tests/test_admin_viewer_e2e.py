@@ -64,7 +64,7 @@ def test_viewer_renders_live_runtime_and_run_history_workspaces(
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: AdminServingBackend(config),
+        lambda config, startup_logger=None, log_dir=None: AdminServingBackend(config),
     )
     trainer = FlashRL(
         actor_config=TrainingConfig(model_name="fake/model", device="cpu"),

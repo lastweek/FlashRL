@@ -70,7 +70,6 @@ metrics:
 
 checkpointing:
   save_on_run_end: true
-  final_path: /tmp/flashrl_deepseek_v32_checkpoint.pt
 
 admin:
   admin_enabled: true

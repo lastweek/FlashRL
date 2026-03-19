@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from pathlib import Path
+import threading
+import time
 
 import pytest
 import torch
@@ -102,12 +104,113 @@ def test_training_backend_checkpoint_round_trip_and_sync(
         torch.full_like(training_backend.actor.model.logit_bias, 2.0),
     )
 
-    training_backend.sync_weights_to(serving_backend)
+    startup_version = serving_backend.current_weight_version()
+    sync_info = training_backend.sync_weights_to(
+        serving_backend,
+        source_training_step=3,
+        source_epoch=2,
+        origin="sync",
+    )
 
     assert torch.allclose(
         training_backend.actor.model.logit_bias,
         serving_backend._actor.model.logit_bias,
     )
+    assert startup_version.version_id == 0
+    assert startup_version.origin == "startup"
+    assert sync_info.version_id == 1
+    assert sync_info.source_training_step == 3
+    assert sync_info.source_epoch == 2
+    assert sync_info.origin == "sync"
+    assert serving_backend.current_weight_version().version_id == 1
+    assert serving_backend.export_weight_version_state()["next_version_id"] == 2
+
+
+def test_serving_backend_restore_weight_version_state_keeps_resume_monotonic(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Restored version counters should make the next activation monotonic on resume."""
+    monkeypatch.setattr(training_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(serving_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(training_module, "ActorModel", BackendActor)
+    monkeypatch.setattr(serving_module, "ActorModel", BackendActor)
+
+    training_backend = HuggingFaceTrainingBackend(
+        TrainingConfig(model_name="fake/model", num_threads=1),
+        learning_rate=1e-3,
+    )
+    serving_backend = HuggingFaceServingBackend(
+        ServingConfig(model_name="fake/model", num_threads=1)
+    )
+
+    serving_backend.restore_weight_version_state({"schema_version": 1, "next_version_id": 7})
+    resume_info = training_backend.sync_weights_to(
+        serving_backend,
+        source_training_step=11,
+        source_epoch=4,
+        origin="resume",
+    )
+
+    assert resume_info.version_id == 7
+    assert resume_info.origin == "resume"
+    assert resume_info.source_training_step == 11
+    assert serving_backend.current_weight_version().version_id == 7
+    assert serving_backend.export_weight_version_state()["next_version_id"] == 8
+
+
+def test_huggingface_serving_backend_serializes_generate_during_sync(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The serving lifecycle lock should prevent generate from overlapping with sync."""
+    monkeypatch.setattr(training_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(serving_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(training_module, "ActorModel", BackendActor)
+    monkeypatch.setattr(serving_module, "ActorModel", BackendActor)
+
+    training_backend = HuggingFaceTrainingBackend(
+        TrainingConfig(model_name="fake/model", num_threads=1),
+        learning_rate=1e-3,
+    )
+    serving_backend = HuggingFaceServingBackend(
+        ServingConfig(model_name="fake/model", num_threads=1)
+    )
+
+    entered_sync = threading.Event()
+    release_sync = threading.Event()
+    generate_finished = threading.Event()
+    original_load_state_dict = serving_backend._actor.model.load_state_dict
+
+    def blocking_load_state_dict(state_dict, strict: bool = True):
+        entered_sync.set()
+        assert release_sync.wait(timeout=2.0)
+        return original_load_state_dict(state_dict, strict=strict)
+
+    monkeypatch.setattr(serving_backend._actor.model, "load_state_dict", blocking_load_state_dict)
+
+    sync_thread = threading.Thread(
+        target=lambda: training_backend.sync_weights_to(
+            serving_backend,
+            source_training_step=1,
+            source_epoch=1,
+            origin="sync",
+        )
+    )
+    sync_thread.start()
+    assert entered_sync.wait(timeout=2.0)
+
+    generate_thread = threading.Thread(
+        target=lambda: serving_backend.generate(["blocked"]) and generate_finished.set()
+    )
+    generate_thread.start()
+    time.sleep(0.05)
+    assert generate_finished.is_set() is False
+
+    release_sync.set()
+    sync_thread.join(timeout=2.0)
+    generate_thread.join(timeout=2.0)
+
+    assert generate_finished.is_set() is True
+    assert serving_backend.current_weight_version().version_id == 1
 
 
 def test_training_backend_factory_selects_expected_backend(

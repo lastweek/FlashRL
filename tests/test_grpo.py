@@ -13,7 +13,15 @@ import torch
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import ServingConfig, TrainerConfig, TrainingConfig
-from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import (
+    Conversation,
+    LearnerBatch,
+    Message,
+    Prompt,
+    RewardOutput,
+    RolloutOutput,
+    WeightVersionInfo,
+)
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
@@ -516,6 +524,15 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
             self._actor = DebugActor()
             self.device = self._actor.device
             self.generation_defaults: dict[str, object] = {}
+            self._active_weight_version = WeightVersionInfo(
+                version_id=0,
+                source_training_step=None,
+                source_epoch=None,
+                activated_at="2026-03-19T00:00:00Z",
+                model_source="debug-serving://startup",
+                origin="startup",
+            )
+            self._next_weight_version_id = 1
 
         def generate(self, prompts: list[str], **kwargs):
             return self._actor.generate(prompts, **kwargs)
@@ -530,8 +547,41 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
             self.generation_defaults = dict(kwargs)
             self._actor.set_generation_defaults(**kwargs)
 
-        def sync_from_training_actor(self, training_actor) -> None:
+        def sync_from_training_actor(
+            self,
+            training_actor,
+            *,
+            source_training_step: int | None = None,
+            source_epoch: int | None = None,
+            origin: str = "sync",
+        ) -> WeightVersionInfo:
             self._actor.model.load_state_dict(training_actor.model.state_dict())
+            self._active_weight_version = WeightVersionInfo(
+                version_id=self._next_weight_version_id,
+                source_training_step=source_training_step,
+                source_epoch=source_epoch,
+                activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+                model_source=f"debug-serving://version-{self._next_weight_version_id}",
+                origin=origin,
+            )
+            self._next_weight_version_id += 1
+            return self.current_weight_version()
+
+        def current_weight_version(self) -> WeightVersionInfo:
+            return self._active_weight_version.model_copy(deep=True)
+
+        def export_weight_version_state(self) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "next_version_id": self._next_weight_version_id,
+            }
+
+        def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+            if not isinstance(state, dict):
+                return
+            next_version_id = state.get("next_version_id")
+            if isinstance(next_version_id, int):
+                self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
         def set_live_rollout_debug(self, callback, context) -> None:
             self._actor.set_live_rollout_debug(callback, context)
@@ -558,6 +608,75 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
     assert ("candidate", 0) in serving_backend._actor.debug_events
     assert ("candidate", 1) in serving_backend._actor.debug_events
     assert serving_backend._actor.debug_events[-1] == ("clear", None)
+
+
+def test_user_defined_rollout_stamps_one_weight_version_on_all_outputs() -> None:
+    """Framework rollout wrapping should stamp serving provenance centrally."""
+    serving_backend = TinyServingBackend()
+    rollout = UserDefinedRollout(
+        rollout_fn=make_rollout_fn(response_suffix="weights", repeat=1),
+        serving_backend=serving_backend,
+        config=SimpleNamespace(),
+    )
+
+    _, rollouts, _, _ = rollout.generate_grouped(
+        [Prompt(text="prompt 0"), Prompt(text="prompt 1")],
+        group_size=2,
+    )
+
+    expected = serving_backend.current_weight_version().model_dump()
+    assert rollouts
+    assert all(sample.metadata["weight_version"] == expected for sample in rollouts)
+
+
+def test_grpo_rejects_mixed_rollout_weight_versions_in_one_batch() -> None:
+    """One learner batch must not mix rollout candidates from different serving versions."""
+    trainer = build_trainer(batch_size=2, group_size=2)
+    conversation = Conversation(
+        messages=[
+            Message(role="user", content="prompt"),
+            Message(role="assistant", content="response"),
+        ]
+    )
+    rollout_a = RolloutOutput(
+        text="response-a",
+        log_prob=-0.2,
+        prompt_token_ids=[1, 2],
+        response_token_ids=[3, 4],
+        response_token_logprobs=[-0.1, -0.1],
+        conversation=conversation,
+        metadata={
+            "weight_version": WeightVersionInfo(
+                version_id=3,
+                source_training_step=3,
+                source_epoch=1,
+                activated_at="2026-03-19T00:00:03Z",
+                model_source="tiny-serving://version-3",
+                origin="sync",
+            ).model_dump()
+        },
+    )
+    rollout_b = RolloutOutput(
+        text="response-b",
+        log_prob=-0.2,
+        prompt_token_ids=[1, 2],
+        response_token_ids=[5, 6],
+        response_token_logprobs=[-0.1, -0.1],
+        conversation=conversation,
+        metadata={
+            "weight_version": WeightVersionInfo(
+                version_id=4,
+                source_training_step=4,
+                source_epoch=1,
+                activated_at="2026-03-19T00:00:04Z",
+                model_source="tiny-serving://version-4",
+                origin="sync",
+            ).model_dump()
+        },
+    )
+
+    with pytest.raises(RuntimeError, match="mixed multiple serving weight versions"):
+        trainer._build_batch_metadata([rollout_a, rollout_b])
 
 
 def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> None:

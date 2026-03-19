@@ -30,7 +30,14 @@ from flashrl.framework import (
     TensorBoardMetricsConfig,
 )
 from flashrl.framework.config import AdminConfig, ServingConfig, TrainerConfig, TrainingConfig
-from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import (
+    Conversation,
+    Message,
+    Prompt,
+    RewardOutput,
+    RolloutOutput,
+    WeightVersionInfo,
+)
 from flashrl.framework.metrics import (
     CompositeMetricsSink,
     PrometheusMetricsSink,
@@ -303,6 +310,15 @@ class FakeServingBackend:
         self._actor.eval()
         self.device = self._actor.device
         self.generation_defaults: dict[str, object] = {}
+        self._active_weight_version = WeightVersionInfo(
+            version_id=0,
+            source_training_step=None,
+            source_epoch=None,
+            activated_at="2026-03-19T00:00:00Z",
+            model_source="metrics-serving://startup",
+            origin="startup",
+        )
+        self._next_weight_version_id = 1
 
     def generate(self, prompts: list[str], **kwargs):
         return self._actor.generate(prompts, **kwargs)
@@ -317,8 +333,41 @@ class FakeServingBackend:
         self.generation_defaults = dict(kwargs)
         self._actor.set_generation_defaults(**kwargs)
 
-    def sync_from_training_actor(self, training_actor) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         self._actor.model.load_state_dict(training_actor.model.state_dict())
+        self._active_weight_version = WeightVersionInfo(
+            version_id=self._next_weight_version_id,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+            model_source=f"metrics-serving://version-{self._next_weight_version_id}",
+            origin=origin,
+        )
+        self._next_weight_version_id += 1
+        return self.current_weight_version()
+
+    def current_weight_version(self) -> WeightVersionInfo:
+        return self._active_weight_version.model_copy(deep=True)
+
+    def export_weight_version_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_version_id": self._next_weight_version_id,
+        }
+
+    def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        next_version_id = state.get("next_version_id")
+        if isinstance(next_version_id, int):
+            self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
     def set_live_rollout_debug(self, callback, context) -> None:
         if not getattr(self.config, "debug_live_rollout", False):
@@ -466,7 +515,7 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: FakeServingBackend(config),
+        lambda config, startup_logger=None, log_dir=None: FakeServingBackend(config),
     )
 
 
@@ -2022,11 +2071,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("flashrl/framework/examples/math/eval.py").exists()
     assert Path("flashrl/framework/examples/math/config.yaml").exists()
     assert Path("flashrl/framework/examples/math/config_vllm.yaml").exists()
-    assert Path("flashrl/framework/examples/reasoning-code/train.py").exists()
-    assert not Path("flashrl/framework/examples/reasoning-code/workflow.py").exists()
-    assert Path("flashrl/framework/examples/reasoning-code/eval.py").exists()
-    assert Path("flashrl/framework/examples/reasoning-code/executor.py").exists()
-    assert Path("flashrl/framework/examples/reasoning-code/config.yaml").exists()
+    assert Path("flashrl/framework/examples/code-single-turn/train.py").exists()
+    assert not Path("flashrl/framework/examples/code-single-turn/workflow.py").exists()
+    assert Path("flashrl/framework/examples/code-single-turn/eval.py").exists()
+    assert Path("flashrl/framework/examples/code-single-turn/executor.py").exists()
+    assert Path("flashrl/framework/examples/code-single-turn/config.yaml").exists()
     assert Path("flashrl/framework/examples/code-single-turn/config_vllm.yaml").exists()
 
     docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
@@ -2047,9 +2096,11 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "./dev.sh metrics up" in docs
     assert "endpoint-ready before reporting success" in docs
     assert "math/README.md" in docs
-    assert "reasoning-code/README.md" in docs
+    assert "code-single-turn/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
+    assert "run_dir/checkpoints" in docs
+    assert "run_dir/vllm/weights" in docs
     assert "python3 flashrl/framework/examples/math/train.py" in reasoning_docs
     assert "python3 flashrl/framework/examples/math/eval.py" in reasoning_docs
     assert "FlashRL.from_yaml(...)" in reasoning_docs
@@ -2064,15 +2115,14 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "selected` is the number of rows actually used" in reasoning_docs
     assert "not copied into `console.log`" in reasoning_docs
     assert "math.yaml" not in reasoning_docs
-    assert "model:" not in reasoning_docs
     assert "trainer:" not in reasoning_docs
     assert "actor.model_name" in reasoning_docs
     assert "trainer.batch_size" in reasoning_docs
     assert "serving.backend" in reasoning_docs
     assert "reference" in reasoning_docs
     assert "grpo.group_size" in reasoning_docs
-    assert "python3 flashrl/framework/examples/reasoning-code/train.py" in code_basic_docs
-    assert "python3 flashrl/framework/examples/reasoning-code/eval.py" in code_basic_docs
+    assert "python3 flashrl/framework/examples/code-single-turn/train.py" in code_basic_docs
+    assert "python3 flashrl/framework/examples/code-single-turn/eval.py" in code_basic_docs
     assert "strict R1-style Codeforces prototype" in code_basic_docs
     assert "does not support direct" in code_basic_docs
     assert "official tests only in v1" in code_basic_docs
@@ -2084,6 +2134,8 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "execution_status" in code_basic_docs
     assert "code_preview" in code_basic_docs
     assert "checkpointing:" in code_basic_docs
+    assert "run_dir/checkpoints" in code_basic_docs
+    assert "run_dir/vllm/weights" in code_basic_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
@@ -2101,12 +2153,12 @@ def test_observability_stack_files_and_docs_exist() -> None:
         encoding="utf-8"
     )
     code_example_yaml = Path(
-        "flashrl/framework/examples/reasoning-code/config.yaml"
+        "flashrl/framework/examples/code-single-turn/config.yaml"
     ).read_text(
         encoding="utf-8"
     )
     code_vllm_example_yaml = Path(
-        "flashrl/framework/examples/reasoning-code/config_vllm.yaml"
+        "flashrl/framework/examples/code-single-turn/config_vllm.yaml"
     ).read_text(
         encoding="utf-8"
     )
@@ -2126,27 +2178,27 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "common:" not in example_yaml
     assert "training:" not in example_yaml
     assert "runtime:" not in example_yaml
-    assert "actor:\n  model_name: Qwen/Qwen2.5-0.5B" in example_yaml
+    assert "actor:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
     assert "num_threads: 1" in example_yaml
-    assert "serving:\n  model_name: Qwen/Qwen2.5-0.5B" in example_yaml
+    assert "serving:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
     assert "  num_threads: 1" in example_yaml
     assert "  debug_live_rollout: true" in example_yaml
     assert "save_on_run_end: true" in example_yaml
-    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in example_yaml
+    assert "final_path:" not in example_yaml
     assert "debug_live_rollout:" in docs
     assert "backend: vllm" in vllm_example_yaml
     assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
     assert "checkpointing:" in vllm_example_yaml
-    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in vllm_example_yaml
+    assert "final_path:" not in vllm_example_yaml
     assert "hooks:" not in vllm_example_yaml
     assert "hooks:" not in code_example_yaml
     assert "hooks:" not in code_vllm_example_yaml
     assert "checkpointing:" in code_example_yaml
-    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in code_example_yaml
+    assert "final_path:" not in code_example_yaml
     assert "checkpointing:" in code_vllm_example_yaml
-    assert "final_path: /tmp/flashrl_code_basic_checkpoint.pt" in code_vllm_example_yaml
+    assert "final_path:" not in code_vllm_example_yaml
     assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
-    assert "Qwen/Qwen2.5-Coder-1.5B" in code_vllm_example_yaml
+    assert "Qwen/Qwen2.5-Coder-0.5B" in code_vllm_example_yaml
     assert "~/.venv-vllm" not in vllm_example_yaml
     assert "~/.venv-vllm-metal" not in vllm_example_yaml
     assert "vllm_args:" not in vllm_example_yaml

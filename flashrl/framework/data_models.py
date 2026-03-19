@@ -1,6 +1,6 @@
 """Core data models used across all components."""
 
-from typing import Any
+from typing import Any, Literal
 from pydantic import BaseModel, Field
 
 
@@ -52,6 +52,17 @@ class Conversation(BaseModel):
             if msg.role == "user":
                 return msg
         return None
+
+
+class WeightVersionInfo(BaseModel):
+    """One activated or pending serving-weight version."""
+
+    version_id: int
+    source_training_step: int | None = None
+    source_epoch: int | None = None
+    activated_at: str | None = None
+    model_source: str
+    origin: Literal["startup", "sync", "resume"]
 
 
 class RolloutOutput(BaseModel):

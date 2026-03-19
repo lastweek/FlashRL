@@ -25,7 +25,14 @@ from flashrl.framework.config import (
     TrainerConfig,
     TrainingConfig,
 )
-from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import (
+    Conversation,
+    Message,
+    Prompt,
+    RewardOutput,
+    RolloutOutput,
+    WeightVersionInfo,
+)
 from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.serving import (
     HuggingFaceServingBackend,
@@ -158,10 +165,20 @@ class ClosableServingBackend:
     """Serving backend stub that records close calls."""
 
     def __init__(self) -> None:
+        self.config = SimpleNamespace(debug_live_rollout=False)
         self._actor = TinyActor(bias_shift=0.1)
         self.device = self._actor.device
         self.generation_defaults: dict[str, object] = {}
         self.close_calls = 0
+        self._active_weight_version = WeightVersionInfo(
+            version_id=0,
+            source_training_step=None,
+            source_epoch=None,
+            activated_at="2026-03-19T00:00:00Z",
+            model_source="test-serving://startup",
+            origin="startup",
+        )
+        self._next_weight_version_id = 1
 
     def generate(self, prompts: list[str], **kwargs):
         return self._actor.generate(prompts, **kwargs)
@@ -176,8 +193,41 @@ class ClosableServingBackend:
         self.generation_defaults = dict(kwargs)
         self._actor.set_generation_defaults(**kwargs)
 
-    def sync_from_training_actor(self, training_actor) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         del training_actor
+        self._active_weight_version = WeightVersionInfo(
+            version_id=self._next_weight_version_id,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+            model_source=f"test-serving://version-{self._next_weight_version_id}",
+            origin=origin,
+        )
+        self._next_weight_version_id += 1
+        return self.current_weight_version()
+
+    def current_weight_version(self) -> WeightVersionInfo:
+        return self._active_weight_version.model_copy(deep=True)
+
+    def export_weight_version_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_version_id": self._next_weight_version_id,
+        }
+
+    def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        next_version_id = state.get("next_version_id")
+        if isinstance(next_version_id, int):
+            self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
     def set_live_rollout_debug(self, callback, context) -> None:
         del callback, context
@@ -266,8 +316,8 @@ def patch_backends(
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: (
-            serving_backend if serving_backend is not None else FakeServingBackend(config)
+        lambda config, startup_logger=None, log_dir=None: (
+            serving_backend if serving_backend is not None else ClosableServingBackend()
         ),
     )
 
@@ -612,12 +662,13 @@ def test_vllm_backend_sync_generate_and_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The backend should route completions over HTTP, sync weights in-process, and clean up."""
+    """Run-backed vLLM sync should write into the run directory and preserve the final version."""
     python_path = _make_fake_runtime(tmp_path)
     spawned_commands: list[list[str]] = []
     processes: list[FakeProcess] = []
     requests: list[tuple[str, str, dict[str, object] | None]] = []
     ports = iter([8100, 8101])
+    run_dir = tmp_path / "logs" / "run-1"
 
     def fake_spawn(self, command):
         spawned_commands.append(command)
@@ -672,11 +723,6 @@ def test_vllm_backend_sync_generate_and_close(
     monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: next(ports))
     monkeypatch.setattr(VLLMServingBackend, "_spawn_process", fake_spawn)
     monkeypatch.setattr(VLLMServingBackend, "_request_json", fake_request)
-    monkeypatch.setattr(
-        tempfile,
-        "mkdtemp",
-        lambda prefix: str(tmp_path / "snapshot"),
-    )
 
     backend = VLLMServingBackend(
         ServingConfig(
@@ -685,13 +731,22 @@ def test_vllm_backend_sync_generate_and_close(
             runtime_python=str(python_path),
             num_replicas=2,
             vllm_args=["--max-num-seqs=32"],
-        )
+        ),
+        log_dir=run_dir,
     )
     grouped = backend.generate_grouped(["ab", "cd", "ef"], group_size=2)
     startup_admin_objects = backend.list_admin_objects()
     training_actor = SnapshotTrainingActor()
-    backend.sync_from_training_actor(training_actor)
+    sync_info = backend.sync_from_training_actor(
+        training_actor,
+        source_training_step=4,
+        source_epoch=2,
+    )
     synced_admin_objects = backend.list_admin_objects()
+    snapshot_root = backend._snapshot_dir
+    assert snapshot_root is not None
+    assert snapshot_root == (run_dir / "vllm" / "weights").resolve()
+    synced_snapshot_dir = Path(sync_info.model_source)
 
     completion_requests = [
         payload
@@ -710,9 +765,18 @@ def test_vllm_backend_sync_generate_and_close(
     assert startup_admin_objects[0]["spec"]["modelSource"] == "fake/model"
     assert startup_admin_objects[0]["spec"]["pythonExecutable"] == str(python_path)
     assert startup_admin_objects[0]["status"]["phase"] == "Ready"
-    assert backend._snapshot_dir is not None
-    assert (backend._snapshot_dir / "model.safetensors").exists()
+    assert startup_admin_objects[0]["status"]["activeWeightVersion"]["version_id"] == 0
+    assert startup_admin_objects[0]["status"]["pendingWeightVersion"] is None
+    assert sync_info.version_id == 1
+    assert sync_info.source_training_step == 4
+    assert sync_info.source_epoch == 2
+    assert sync_info.origin == "sync"
+    assert synced_snapshot_dir.parent == snapshot_root
+    assert synced_snapshot_dir.name == "version-00000001"
+    assert (synced_snapshot_dir / "model.safetensors").exists()
     assert len(training_actor.model.saved_paths) == 1
+    assert training_actor.model.saved_paths[0].parent == snapshot_root
+    assert training_actor.model.saved_paths[0].name.startswith(".version-00000001.")
     assert len(spawned_commands) == 2
     assert spawned_commands[0][:3] == [
         str(python_path),
@@ -727,20 +791,135 @@ def test_vllm_backend_sync_generate_and_close(
         if method == "POST" and "/v1/load_weights_from_disk" in url
     ]
     assert len(sync_requests) == 2
-    assert synced_admin_objects[0]["spec"]["modelSource"] == str(backend._snapshot_dir)
+    assert {payload["model_source"] for _, _, payload in sync_requests} == {str(synced_snapshot_dir)}
+    assert synced_admin_objects[0]["spec"]["modelSource"] == str(synced_snapshot_dir)
     assert synced_admin_objects[0]["status"]["phase"] == "Ready"
+    assert synced_admin_objects[0]["status"]["activeWeightVersion"]["version_id"] == 1
+    assert synced_admin_objects[0]["status"]["pendingWeightVersion"] is None
     assert processes[0].terminate_calls == 0
     assert processes[1].terminate_calls == 0
+    stray_dir = snapshot_root / ".version-00000002.stray.tmp"
+    stray_dir.mkdir(parents=True, exist_ok=True)
+    (snapshot_root / ".orphan.tmp").write_text("cleanup", encoding="utf-8")
 
-    snapshot_dir = backend._snapshot_dir
     backend.close()
     closed_admin_objects = backend.list_admin_objects()
 
-    assert snapshot_dir is not None
-    assert not snapshot_dir.exists()
+    assert snapshot_root.exists()
+    assert [child.name for child in snapshot_root.iterdir()] == ["version-00000001"]
     assert processes[0].terminate_calls == 1
     assert processes[1].terminate_calls == 1
     assert closed_admin_objects[0]["status"]["phase"] == "Closed"
+
+
+def test_vllm_backend_sync_without_log_dir_uses_temp_snapshot_root_and_deletes_it_on_close(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Backends created without a run dir should keep the temp-root fallback behavior."""
+    python_path = _make_fake_runtime(tmp_path)
+    ports = iter([8100])
+    snapshot_root = (tmp_path / "snapshot-root").resolve()
+
+    def fake_request(self, url, *, method, payload=None, timeout):
+        del timeout
+        if method == "GET":
+            return {"data": [{"id": self.config.model_name}]}
+        assert payload is not None
+        if url.endswith("/v1/load_weights_from_disk"):
+            return {"status": "success", "model_source": payload["model_source"]}
+        raise RuntimeError(f"Unexpected request to {url}")
+
+    monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: next(ports))
+    monkeypatch.setattr(VLLMServingBackend, "_spawn_process", lambda self, command: FakeProcess())
+    monkeypatch.setattr(VLLMServingBackend, "_request_json", fake_request)
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(snapshot_root))
+
+    backend = VLLMServingBackend(
+        ServingConfig(
+            model_name="fake/model",
+            backend="vllm",
+            runtime_python=str(python_path),
+        )
+    )
+
+    try:
+        sync_info = backend.sync_from_training_actor(
+            SnapshotTrainingActor(),
+            source_training_step=1,
+            source_epoch=1,
+        )
+        assert backend._snapshot_dir == snapshot_root
+        assert Path(sync_info.model_source).parent == snapshot_root
+        assert snapshot_root.exists()
+    finally:
+        backend.close()
+
+    assert not snapshot_root.exists()
+
+
+def test_vllm_backend_rolls_back_partial_replica_reload_failures(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A failed replica reload should roll earlier replicas back to the previous version."""
+    python_path = _make_fake_runtime(tmp_path)
+    ports = iter([8100, 8101])
+    reload_requests: list[tuple[str, str]] = []
+
+    def fake_request(self, url, *, method, payload=None, timeout):
+        del timeout
+        if method == "GET":
+            return {"data": [{"id": self.config.model_name}]}
+        assert payload is not None
+        if url.endswith("/v1/load_weights_from_disk"):
+            model_source = str(payload["model_source"])
+            reload_requests.append((url, model_source))
+            if url.startswith("http://127.0.0.1:8101") and model_source.endswith("version-00000001"):
+                raise RuntimeError("replica reload failed")
+            return {"status": "success", "model_source": model_source}
+        raise RuntimeError(f"Unexpected request to {url}")
+
+    monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: next(ports))
+    monkeypatch.setattr(VLLMServingBackend, "_spawn_process", lambda self, command: FakeProcess())
+    monkeypatch.setattr(VLLMServingBackend, "_request_json", fake_request)
+    monkeypatch.setattr(tempfile, "mkdtemp", lambda prefix: str(tmp_path / "snapshot-root"))
+
+    backend = VLLMServingBackend(
+        ServingConfig(
+            model_name="fake/model",
+            backend="vllm",
+            runtime_python=str(python_path),
+            num_replicas=2,
+        )
+    )
+
+    try:
+        training_actor = SnapshotTrainingActor()
+        with pytest.raises(RuntimeError, match="Failed to load weights into vllm replicas"):
+            backend.sync_from_training_actor(
+                training_actor,
+                source_training_step=1,
+                source_epoch=1,
+            )
+
+        assert [replica.model_source for replica in backend._replicas] == ["fake/model", "fake/model"]
+        sync_status = backend.weight_sync_status()
+        assert sync_status["activeWeightVersion"]["version_id"] == 0
+        assert sync_status["pendingWeightVersion"] is None
+        assert sync_status["syncHealthy"] is True
+        assert "Failed to load weights into vllm replicas" in sync_status["lastSyncError"]
+        snapshot_root = backend._snapshot_dir
+        assert snapshot_root is not None
+        assert [child.name for child in snapshot_root.iterdir() if not child.name.startswith(".")] == []
+        assert len(reload_requests) == 3
+        assert reload_requests[0][1].endswith("version-00000001")
+        assert reload_requests[1][1].endswith("version-00000001")
+        assert reload_requests[2][1] == "fake/model"
+        admin_objects = backend.list_admin_objects()
+        assert admin_objects[0]["status"]["activeWeightVersion"]["version_id"] == 0
+    finally:
+        backend.close()
 
 
 def test_vllm_backend_treats_missing_completion_logprobs_as_unavailable() -> None:
@@ -864,6 +1043,15 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
             self._actor = TinyActor(bias_shift=0.1)
             self.device = self._actor.device
             self.generation_defaults: dict[str, object] = {}
+            self._active_weight_version = WeightVersionInfo(
+                version_id=0,
+                source_training_step=None,
+                source_epoch=None,
+                activated_at="2026-03-19T00:00:00Z",
+                model_source="yaml-serving://startup",
+                origin="startup",
+            )
+            self._next_weight_version_id = 1
 
         def generate(self, prompts: list[str], **kwargs):
             return self._actor.generate(prompts, **kwargs)
@@ -878,8 +1066,41 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
             self.generation_defaults = dict(kwargs)
             self._actor.set_generation_defaults(**kwargs)
 
-        def sync_from_training_actor(self, training_actor) -> None:
+        def sync_from_training_actor(
+            self,
+            training_actor,
+            *,
+            source_training_step: int | None = None,
+            source_epoch: int | None = None,
+            origin: str = "sync",
+        ) -> WeightVersionInfo:
             del training_actor
+            self._active_weight_version = WeightVersionInfo(
+                version_id=self._next_weight_version_id,
+                source_training_step=source_training_step,
+                source_epoch=source_epoch,
+                activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+                model_source=f"yaml-serving://version-{self._next_weight_version_id}",
+                origin=origin,
+            )
+            self._next_weight_version_id += 1
+            return self.current_weight_version()
+
+        def current_weight_version(self) -> WeightVersionInfo:
+            return self._active_weight_version.model_copy(deep=True)
+
+        def export_weight_version_state(self) -> dict[str, object]:
+            return {
+                "schema_version": 1,
+                "next_version_id": self._next_weight_version_id,
+            }
+
+        def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+            if not isinstance(state, dict):
+                return
+            next_version_id = state.get("next_version_id")
+            if isinstance(next_version_id, int):
+                self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
         def set_live_rollout_debug(self, callback, context) -> None:
             del callback, context
@@ -936,7 +1157,7 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: FakeServingBackend(config),
+        lambda config, startup_logger=None, log_dir=None: FakeServingBackend(config),
     )
 
     trainer = FlashRL.from_yaml(config_path)
@@ -1061,6 +1282,7 @@ def test_vllm_backend_pause_and_resume_inference(
     )
 
     try:
+        admin_requests.clear()
         # Pause inference
         backend.pause_inference()
         assert len(admin_requests) == 1

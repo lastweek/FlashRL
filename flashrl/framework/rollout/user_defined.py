@@ -7,6 +7,7 @@ from flashrl.framework.data_models import (
     Prompt,
     RolloutOutput,
     Conversation,
+    WeightVersionInfo,
 )
 from flashrl.framework.serving import ServingBackend
 
@@ -112,10 +113,36 @@ class UserDefinedRollout:
             )
 
         validated: list[RolloutOutput] = []
+        weight_version = self._current_weight_version()
         for rollout in rollouts:
+            self._stamp_weight_version(rollout, weight_version)
             self._validate_rollout_output(rollout)
             validated.append(rollout)
         return validated
+
+    def _current_weight_version(self) -> WeightVersionInfo | None:
+        getter = getattr(self.serving_backend, "current_weight_version", None)
+        if getter is None or not callable(getter):
+            return None
+        try:
+            weight_version = getter()
+        except Exception:
+            return None
+        if isinstance(weight_version, WeightVersionInfo):
+            return weight_version
+        return None
+
+    def _stamp_weight_version(
+        self,
+        rollout: RolloutOutput,
+        weight_version: WeightVersionInfo | None,
+    ) -> None:
+        if weight_version is None:
+            return
+        rollout.metadata = {
+            **dict(rollout.metadata),
+            "weight_version": weight_version.model_dump(),
+        }
 
     def _validate_rollout_output(self, rollout: RolloutOutput) -> None:
         """Validate that rollout outputs contain the token data required by GRPO."""

@@ -32,7 +32,7 @@ from .config import (
     TrainerConfig,
     TrainingConfig,
 )
-from .data_models import Prompt, RewardOutput, RolloutOutput
+from .data_models import Prompt, RewardOutput, RolloutOutput, WeightVersionInfo
 from .metrics import MetricsSink, build_metrics_sink
 from .observability import timed_call
 from .reward.user_defined import UserDefinedReward
@@ -572,6 +572,7 @@ class FlashRL:
             return []
 
         child_objects = self._serving_child_admin_objects()
+        sync_status = self._serving_weight_sync_status()
         active_replica_count = sum(
             1
             for item in child_objects
@@ -605,6 +606,11 @@ class FlashRL:
                     "phase": backend_phase,
                     "device": str(self._serving_backend.device),
                     "activeReplicaCount": active_replica_count,
+                    "activeWeightVersion": sync_status.get("activeWeightVersion"),
+                    "pendingWeightVersion": sync_status.get("pendingWeightVersion"),
+                    "lastSuccessfulSyncAt": sync_status.get("lastSuccessfulSyncAt"),
+                    "syncHealthy": sync_status.get("syncHealthy"),
+                    "lastSyncError": sync_status.get("lastSyncError"),
                 },
             )
         ]
@@ -617,6 +623,52 @@ class FlashRL:
         if list_objects is None:
             return []
         return list_objects()
+
+    def _serving_weight_sync_status(self) -> dict[str, Any]:
+        """Return serving sync status with a compatibility fallback for custom backends."""
+        if self._serving_backend is None:
+            return {
+                "activeWeightVersion": None,
+                "pendingWeightVersion": None,
+                "lastSuccessfulSyncAt": None,
+                "syncHealthy": None,
+                "lastSyncError": None,
+            }
+
+        status_getter = getattr(self._serving_backend, "weight_sync_status", None)
+        if callable(status_getter):
+            try:
+                status = status_getter()
+            except Exception:
+                status = None
+            if isinstance(status, dict):
+                return status
+
+        active = self._serving_current_weight_version()
+        return {
+            "activeWeightVersion": active.model_dump() if isinstance(active, WeightVersionInfo) else None,
+            "pendingWeightVersion": None,
+            "lastSuccessfulSyncAt": (
+                active.activated_at if isinstance(active, WeightVersionInfo) else None
+            ),
+            "syncHealthy": isinstance(active, WeightVersionInfo),
+            "lastSyncError": None,
+        }
+
+    def _serving_current_weight_version(self) -> WeightVersionInfo | None:
+        """Return the active serving version when the backend exposes it."""
+        if self._serving_backend is None:
+            return None
+        getter = getattr(self._serving_backend, "current_weight_version", None)
+        if not callable(getter):
+            return None
+        try:
+            weight_version = getter()
+        except Exception:
+            return None
+        if isinstance(weight_version, WeightVersionInfo):
+            return weight_version
+        return None
 
     def _component_phase(self) -> str:
         """Map the runtime phase to a generic component phase."""
@@ -879,6 +931,7 @@ class FlashRL:
         """Capture the metadata needed for manual restores and managed append-resume."""
         run_metadata: dict[str, Any] = {}
         run_logger_state: dict[str, Any] = {}
+        serving_metadata: dict[str, Any] = {}
         if self._run_logger is not None:
             run_metadata = {
                 "run_id": self._run_logger.run_id,
@@ -886,6 +939,29 @@ class FlashRL:
                 "run_dir": str(self._run_logger.run_dir),
             }
             run_logger_state = self._run_logger.export_state()
+        if self._serving_backend is not None:
+            export_state = getattr(self._serving_backend, "export_weight_version_state", None)
+            if callable(export_state):
+                serving_metadata = {
+                    "weight_version_state": export_state(),
+                }
+            else:
+                active = self._serving_current_weight_version()
+                next_version_id = (
+                    active.version_id + 1 if isinstance(active, WeightVersionInfo) else 0
+                )
+                serving_metadata = {
+                    "weight_version_state": {
+                        "schema_version": 1,
+                        "next_version_id": next_version_id,
+                        "active_weight_version": (
+                            active.model_dump() if isinstance(active, WeightVersionInfo) else None
+                        ),
+                        "last_successful_sync_at": (
+                            active.activated_at if isinstance(active, WeightVersionInfo) else None
+                        ),
+                    }
+                }
         assert self._trainer is not None
         return {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
@@ -895,6 +971,7 @@ class FlashRL:
             "lifecycle_totals": dict(self._run_lifecycle_totals),
             "run": run_metadata,
             "run_logger_state": run_logger_state,
+            "serving": serving_metadata,
         }
 
     def _save_checkpoint_to_path(

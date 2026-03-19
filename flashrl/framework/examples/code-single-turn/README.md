@@ -376,20 +376,25 @@ Available flags:
 - `--log-dir`: directory to save generated code and rewards (default: `generated_code/`)
 
 Training checkpointing is configured in YAML. The shipped example configs already
-write a final checkpoint to `/tmp/flashrl_code_single_turn_checkpoint.pt`.
+save a final checkpoint under `run_dir/checkpoints/final.pt`.
 
 Example:
 
 ```yaml
 checkpointing:
   save_on_run_end: true
-  final_path: /tmp/flashrl_code_single_turn_checkpoint.pt
+  # Default final checkpoint: run_dir/checkpoints/final.pt
+  # Optional explicit override:
+  # final_path: /path/to/final.pt
   # Optional explicit resume:
-  # resume_from: /tmp/flashrl_code_single_turn_checkpoint.pt
+  # resume_from: /path/to/final.pt
   # Optional managed latest resume:
   # directory: logs/code-single-turn-checkpoints
   # resume_from: latest
 ```
+
+When `config_vllm.yaml` is used, synced serving weights for the run are kept
+under `run_dir/vllm/weights`.
 
 ## Generated Code Logging
 

@@ -71,7 +71,9 @@ serving:
 
 Notes:
 - FlashRL uses `/v1/completions` against the managed local vLLM servers
-- the backend keeps restart-based weight sync after optimizer steps
+- synced vLLM serving snapshots are written under `run_dir/vllm/weights`
+- the backend reloads weights in place after optimizer steps instead of restarting replicas
+- managed checkpoints default to `run_dir/checkpoints`; explicit `checkpointing.directory` and `checkpointing.final_path` still override
 - same-environment setup is supported with the optional `vllm` extra: `pip install -e '.[vllm]'`
 - dedicated runtimes are also supported by setting `FLASHRL_VLLM_PYTHON` and using `serving.runtime_python`
 - on macOS Apple Silicon, prepare a `vllm-metal` runtime and point `FLASHRL_VLLM_PYTHON` at it

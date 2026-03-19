@@ -22,6 +22,7 @@ from flashrl.framework.data_models import (
     Prompt,
     RewardOutput,
     RolloutOutput,
+    WeightVersionInfo,
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.user_defined import UserDefinedRollout
@@ -236,6 +237,15 @@ class FakeServingBackend:
         self._actor.eval()
         self.device = self._actor.device
         self.generation_defaults: dict[str, object] = {}
+        self._active_weight_version = WeightVersionInfo(
+            version_id=0,
+            source_training_step=None,
+            source_epoch=None,
+            activated_at="2026-03-19T00:00:00Z",
+            model_source="fake-serving://startup",
+            origin="startup",
+        )
+        self._next_weight_version_id = 1
 
     def generate(self, prompts: list[str], **kwargs):
         return self._actor.generate(prompts, **kwargs)
@@ -250,8 +260,41 @@ class FakeServingBackend:
         self.generation_defaults = dict(kwargs)
         self._actor.set_generation_defaults(**kwargs)
 
-    def sync_from_training_actor(self, training_actor) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         self._actor.model.load_state_dict(training_actor.model.state_dict())
+        self._active_weight_version = WeightVersionInfo(
+            version_id=self._next_weight_version_id,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+            model_source=f"fake-serving://version-{self._next_weight_version_id}",
+            origin=origin,
+        )
+        self._next_weight_version_id += 1
+        return self.current_weight_version()
+
+    def current_weight_version(self) -> WeightVersionInfo:
+        return self._active_weight_version.model_copy(deep=True)
+
+    def export_weight_version_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_version_id": self._next_weight_version_id,
+        }
+
+    def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        next_version_id = state.get("next_version_id")
+        if isinstance(next_version_id, int):
+            self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
     def set_live_rollout_debug(self, callback, context) -> None:
         self._actor.set_live_rollout_debug(callback, context)
@@ -360,7 +403,7 @@ def patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         flashrl_module,
         "create_serving_backend",
-        lambda config, startup_logger=None: FakeServingBackend(config),
+        lambda config, startup_logger=None, log_dir=None: FakeServingBackend(config),
     )
 
 
@@ -1675,9 +1718,19 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     )
     assert "reward_mean" in reward_event["payload"]
     assert "reward_std" in reward_event["payload"]
+    sync_event = next(
+        event
+        for event in events
+        if event["event"] == "step_stage"
+        and event["payload"]["step"] == 1
+        and event["payload"]["stage"] == "sync"
+    )
+    assert sync_event["payload"]["weight_version_id"] == 1
 
     step_done = next(event for event in events if event["event"] == "step_done")
     assert step_done["payload"]["reference_configured"] is False
+    assert step_done["payload"]["rollout_weight_version"]["version_id"] == 0
+    assert step_done["payload"]["rollout_weight_version"]["origin"] == "startup"
     assert step_done["payload"]["stage_timings"]["reference_forward"] == 0.0
     assert step_done["payload"]["stage_order"] == [
         "rollout",
@@ -1729,7 +1782,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert first_rollout["run_index"] == logger.run_index
     assert first_rollout["step"] == 1
     assert first_rollout["prompt_index"] == 0
-    assert first_rollout["schema_version"] == 2
+    assert first_rollout["schema_version"] == 3
     assert first_rollout["group_size"] == 2
     assert first_rollout["prompt_count"] == 2
     assert first_rollout["candidate_count"] == 2
@@ -1737,6 +1790,8 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert first_rollout["input"]["prompt_preview"] == "prompt 0"
     assert first_rollout["input"]["prompt_token_count"] > 0
     assert first_rollout["input"]["shared_messages"][0]["content"] == "prompt 0"
+    assert first_rollout["serving"]["weight_version"]["version_id"] == 0
+    assert first_rollout["serving"]["weight_version"]["origin"] == "startup"
     assert first_rollout["summary"]["reward_mean"] > 0.0
     assert "sample_index" not in first_rollout
     assert "sample_count" not in first_rollout
@@ -1747,6 +1802,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert first_candidate["output"]["preview"].startswith("sample detail")
     assert first_candidate["output"]["response_token_count"] > 0
     assert first_candidate["output"]["avg_log_prob_per_token"] is not None
+    assert first_candidate["output"]["weight_version"] == first_rollout["serving"]["weight_version"]
     assert first_candidate["completion_messages"][0]["role"] == "assistant"
     assert "rollout" not in first_candidate
     assert "conversation" not in first_candidate
@@ -2072,9 +2128,14 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
 
     rollouts = read_rollouts(trainer._run_logger.run_dir)
     assert len(rollouts) == len(dataset)
-    assert rollouts[0]["schema_version"] == 2
+    assert rollouts[0]["schema_version"] == 3
     assert rollouts[0]["input"]["prompt_preview"] == "prompt 0"
+    assert rollouts[0]["serving"]["weight_version"]["version_id"] == 0
     assert rollouts[0]["candidates"][0]["reward"]["value"] > 0.0
+    assert (
+        rollouts[0]["candidates"][0]["output"]["weight_version"]
+        == rollouts[0]["serving"]["weight_version"]
+    )
     assert rollouts[0]["input"]["shared_messages"][0]["content"] == "prompt 0"
     assert rollouts[0]["prompt_index"] == 0
     assert rollouts[0]["candidates"][0]["candidate_index"] == 0
@@ -2258,6 +2319,11 @@ def test_managed_checkpointing_saves_intervals_and_resumes_in_place(
 
     latest_manifest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
     assert latest_manifest["checkpoint_path"] == str(checkpoint_dir / "step-00000008.pt")
+    rollouts = read_rollouts(first_run_dir)
+    version_ids = [item["serving"]["weight_version"]["version_id"] for item in rollouts]
+    assert version_ids[:4] == [0, 1, 2, 3]
+    assert version_ids[4:] == [5, 6, 7, 8]
+    assert rollouts[4]["serving"]["weight_version"]["origin"] == "resume"
 
     trainer._run_logger.close()
     trainer_resume._run_logger.close()
@@ -2296,6 +2362,75 @@ def test_managed_checkpointing_writes_final_checkpoint_when_enabled(
         and event["payload"]["trigger"] == "final"
         for event in events
     )
+
+    trainer._run_logger.close()
+
+
+def test_managed_checkpointing_defaults_to_run_local_checkpoint_directory(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Without explicit overrides, interval and final checkpoints should stay under the run dir."""
+    patch_backends(monkeypatch)
+    log_dir = tmp_path / "logs"
+    dataset = [Prompt(text=f"prompt {index}") for index in range(2)]
+
+    trainer = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="default-dir", repeat=1),
+        reward_fn=reward_fn,
+        run_config=build_managed_run_config(
+            log_dir=log_dir,
+            save_every_steps=1,
+            save_on_run_end=True,
+        ),
+    )
+    trainer.train(dataset)
+
+    run_dir = trainer._run_logger.run_dir
+    checkpoint_dir = run_dir / "checkpoints"
+    assert (checkpoint_dir / "step-00000001.pt").exists()
+    assert (checkpoint_dir / "step-00000002.pt").exists()
+    final_checkpoint = checkpoint_dir / "final.pt"
+    assert final_checkpoint.exists()
+    latest_manifest = json.loads((checkpoint_dir / "latest.json").read_text(encoding="utf-8"))
+    assert latest_manifest["checkpoint_path"] == str(final_checkpoint)
+    assert latest_manifest["run_dir"] == str(run_dir)
+
+    trainer._run_logger.close()
+
+
+def test_managed_checkpointing_explicit_final_path_overrides_default_final_location(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """`final_path` should only move the final checkpoint, not the managed manifest root."""
+    patch_backends(monkeypatch)
+    log_dir = tmp_path / "logs"
+    explicit_final_path = tmp_path / "exports" / "final.pt"
+    dataset = [Prompt(text=f"prompt {index}") for index in range(2)]
+    run_config = build_managed_run_config(
+        log_dir=log_dir,
+        save_on_run_end=True,
+    )
+    checkpointing = dict(run_config.get("checkpointing", {}))
+    checkpointing["final_path"] = str(explicit_final_path)
+    run_config["checkpointing"] = checkpointing
+
+    trainer = FlashRL(
+        rollout_fn=make_rollout_fn(response_suffix="explicit-final", repeat=1),
+        reward_fn=reward_fn,
+        run_config=run_config,
+    )
+    trainer.train(dataset)
+
+    run_dir = trainer._run_logger.run_dir
+    assert explicit_final_path.exists()
+    assert not (run_dir / "checkpoints" / "final.pt").exists()
+    latest_manifest = json.loads(
+        (run_dir / "checkpoints" / "latest.json").read_text(encoding="utf-8")
+    )
+    assert latest_manifest["checkpoint_path"] == str(explicit_final_path)
+    assert latest_manifest["run_dir"] == str(run_dir)
 
     trainer._run_logger.close()
 

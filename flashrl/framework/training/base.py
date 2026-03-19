@@ -13,6 +13,7 @@ from flashrl.framework.config import TrainingConfig
 from flashrl.framework.data_models import LearnerBatch
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.observability import StageResult
+from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.serving.base import ServingBackend
 from flashrl.framework.training.optimization import (
     LossAssemblyResult,
@@ -210,9 +211,21 @@ class ActorTrainingBackend(TrainingBackend):
         """Advance the actor optimizer once."""
         self.optimizer.step()
 
-    def sync_weights_to(self, serving_backend: ServingBackend) -> None:
+    def sync_weights_to(
+        self,
+        serving_backend: ServingBackend,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         """Sync the backend-owned actor weights into the serving backend."""
-        serving_backend.sync_from_training_actor(self.model_copy)
+        return serving_backend.sync_from_training_actor(
+            self.model_copy,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            origin=origin,
+        )
 
     def export_state(self) -> dict[str, Any]:
         """Return the actor checkpoint payload including optimizer state."""

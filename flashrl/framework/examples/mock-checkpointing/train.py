@@ -12,7 +12,14 @@ import torch
 import torch.nn.functional as F
 
 from flashrl.framework import FlashRL, TrainingConfig
-from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
+from flashrl.framework.data_models import (
+    Conversation,
+    Message,
+    Prompt,
+    RewardOutput,
+    RolloutOutput,
+    WeightVersionInfo,
+)
 from flashrl.framework.serving.base import ServingBackend
 from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
 
@@ -165,6 +172,15 @@ class MockServingBackend(ServingBackend):
         self.generation_defaults: dict[str, object] = {}
         self._actor = MockActor(bias_shift=0.05)
         self._actor.eval()
+        self._active_weight_version = WeightVersionInfo(
+            version_id=0,
+            source_training_step=None,
+            source_epoch=None,
+            activated_at="2026-03-19T00:00:00Z",
+            model_source="mock-serving://startup",
+            origin="startup",
+        )
+        self._next_weight_version_id = 1
 
     def generate(self, prompts: list[str], **kwargs):
         return [output.text for output in self.generate_batch(prompts, **kwargs)]
@@ -189,8 +205,41 @@ class MockServingBackend(ServingBackend):
     def set_generation_defaults(self, **kwargs) -> None:
         self.generation_defaults = dict(kwargs)
 
-    def sync_from_training_actor(self, training_actor) -> None:
+    def sync_from_training_actor(
+        self,
+        training_actor,
+        *,
+        source_training_step: int | None = None,
+        source_epoch: int | None = None,
+        origin: str = "sync",
+    ) -> WeightVersionInfo:
         self._actor.model.load_state_dict(training_actor.model.state_dict())
+        self._active_weight_version = WeightVersionInfo(
+            version_id=self._next_weight_version_id,
+            source_training_step=source_training_step,
+            source_epoch=source_epoch,
+            activated_at=f"2026-03-19T00:00:{self._next_weight_version_id:02d}Z",
+            model_source=f"mock-serving://version-{self._next_weight_version_id}",
+            origin=origin,
+        )
+        self._next_weight_version_id += 1
+        return self.current_weight_version()
+
+    def current_weight_version(self) -> WeightVersionInfo:
+        return self._active_weight_version.model_copy(deep=True)
+
+    def export_weight_version_state(self) -> dict[str, object]:
+        return {
+            "schema_version": 1,
+            "next_version_id": self._next_weight_version_id,
+        }
+
+    def restore_weight_version_state(self, state: dict[str, object] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        next_version_id = state.get("next_version_id")
+        if isinstance(next_version_id, int):
+            self._next_weight_version_id = max(next_version_id, self._next_weight_version_id)
 
     def close(self) -> None:
         return None
