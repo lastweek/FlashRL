@@ -126,6 +126,7 @@ class TrainingBackend(ABC):
         return self.model_copy.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
         ).logits
 
     def export_state(self) -> dict[str, Any]:
@@ -210,6 +211,10 @@ class ActorTrainingBackend(TrainingBackend):
     def optimizer_step(self) -> None:
         """Advance the actor optimizer once."""
         self.optimizer.step()
+        try:
+            self.optimizer.zero_grad(set_to_none=True)
+        except TypeError:
+            self.optimizer.zero_grad()
 
     def sync_weights_to(
         self,
@@ -262,6 +267,7 @@ class ReferenceTrainingBackend(TrainingBackend):
             return self.model_copy.model(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
+                use_cache=False,
             ).logits
 
     def backward_step(self, loss: torch.Tensor):

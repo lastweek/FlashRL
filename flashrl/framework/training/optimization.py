@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gc
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -37,6 +38,7 @@ def reference_logits(
         return reference.model(
             input_ids=input_ids,
             attention_mask=attention_mask,
+            use_cache=False,
         ).logits
 
 
@@ -44,10 +46,23 @@ def backward_step(optimizer: torch.optim.Optimizer, loss: torch.Tensor):
     """Return the backward closure used in timing."""
 
     def run() -> None:
-        optimizer.zero_grad()
+        try:
+            optimizer.zero_grad(set_to_none=True)
+        except TypeError:
+            optimizer.zero_grad()
         loss.backward()
 
     return run
+
+
+def _release_device_cache(device: torch.device | Any) -> None:
+    """Best-effort allocator cleanup for backends with aggressive caching."""
+    device_type = getattr(device, "type", str(device))
+    if device_type != "mps":
+        return
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
 
 def prepare_learner_inputs(
@@ -186,140 +201,150 @@ def optimize_grpo_batch(
     """Run one full GRPO learner step across peer actor/reference backends."""
     from flashrl.framework.training.base import OptimizationResult
 
-    (
-        input_ids,
-        attention_mask,
-        prompt_lengths,
-        full_lengths,
-        rollout_response_log_probs,
-    ), prepare_seconds = timed_call(lambda: actor_backend.prepare_inputs(learner_batch))
-    full_tokens_total = int(sum(full_lengths))
-    response_tokens_total = int(sum(len(tokens) for tokens in learner_batch.response_token_ids))
+    input_ids: torch.Tensor | None = None
+    attention_mask: torch.Tensor | None = None
+    prompt_lengths: torch.Tensor | None = None
+    full_lengths: list[int] = []
+    rollout_response_log_probs: list[list[float]] = []
+    actor_logits: torch.Tensor | None = None
+    ref_logits: torch.Tensor | None = None
+    advantages: torch.Tensor | None = None
+    training_old_response_log_probs: list[list[float]] | None = None
 
-    actor_logits, actor_forward_seconds = timed_call(
-        lambda: actor_backend.forward_logits(input_ids, attention_mask)
-    )
+    try:
+        (
+            input_ids,
+            attention_mask,
+            prompt_lengths,
+            full_lengths,
+            rollout_response_log_probs,
+        ), prepare_seconds = timed_call(lambda: actor_backend.prepare_inputs(learner_batch))
+        full_tokens_total = int(sum(full_lengths))
+        response_tokens_total = int(sum(len(tokens) for tokens in learner_batch.response_token_ids))
 
-    # Compute π^train_old logprobs BEFORE optimizer update
-    # This is critical for GLM-5 IcePop token gate
-    # π^train_old = training backend's policy before optimizer step
-    # Only compute when IcePop token gate is enabled to avoid unnecessary overhead
-    training_old_response_log_probs = None
-    training_old_seconds = 0.0
-    if grpo_config.enable_icepop_token_gate:
-        training_old_response_log_probs, training_old_seconds = timed_call(
-            lambda: compute_rollout_log_probs_from_actor(
-                actor=actor_backend.model_copy,
+        actor_logits, actor_forward_seconds = timed_call(
+            lambda: actor_backend.forward_logits(input_ids, attention_mask)
+        )
+
+        # Compute π^train_old logprobs BEFORE optimizer update
+        # This is critical for GLM-5 IcePop token gate.
+        if grpo_config.enable_icepop_token_gate:
+            training_old_response_log_probs, _ = timed_call(
+                lambda: compute_rollout_log_probs_from_actor(
+                    actor=actor_backend.model_copy,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    prompt_lengths=prompt_lengths,
+                )
+            )
+
+        reference_active = reference_backend is not None and grpo_config.kl_coefficient > 0.0
+        if reference_active:
+            ref_logits, reference_forward_seconds = timed_call(
+                lambda: reference_logits(reference_backend, input_ids, attention_mask)
+            )
+        else:
+            reference_forward_seconds = 0.0
+
+        advantages = torch.tensor(
+            learner_batch.advantages,
+            dtype=torch.float32,
+            device=actor_backend.device,
+        )
+        loss_result, loss_seconds = timed_call(
+            lambda: assemble_grpo_loss(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 prompt_lengths=prompt_lengths,
+                actor_logits=actor_logits,
+                ref_logits=ref_logits,
+                rollout_response_log_probs=rollout_response_log_probs,  # π^infer_old
+                training_response_log_probs=training_old_response_log_probs,  # π^train_old
+                advantages=advantages,
+                config=grpo_config,  # Pass full config instead of individual parameters
             )
         )
 
-    reference_active = reference_backend is not None and grpo_config.kl_coefficient > 0.0
-    if reference_active:
-        ref_logits, reference_forward_seconds = timed_call(
-            lambda: reference_logits(reference_backend, input_ids, attention_mask)
-        )
-    else:
-        ref_logits = None
-        reference_forward_seconds = 0.0
+        _, backward_seconds = timed_call(actor_backend.backward_step(loss_result.loss))
+        _, optimizer_seconds = timed_call(actor_backend.optimizer_step)
+        learning_rate = float(actor_backend.optimizer.param_groups[0]["lr"])
 
-    advantages = torch.tensor(
-        learner_batch.advantages,
-        dtype=torch.float32,
-        device=actor_backend.device,
-    )
-    loss_result, loss_seconds = timed_call(
-        lambda: assemble_grpo_loss(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            prompt_lengths=prompt_lengths,
-            actor_logits=actor_logits,
-            ref_logits=ref_logits,
-            rollout_response_log_probs=rollout_response_log_probs,  # π^infer_old
-            training_response_log_probs=training_old_response_log_probs,  # π^train_old
-            advantages=advantages,
-            config=grpo_config,  # Pass full config instead of individual parameters
-        )
-    )
-
-    _, backward_seconds = timed_call(actor_backend.backward_step(loss_result.loss))
-    _, optimizer_seconds = timed_call(actor_backend.optimizer_step)
-    learning_rate = float(actor_backend.optimizer.param_groups[0]["lr"])
-
-    stages = [
-        StageResult(
-            name="prepare_inputs",
-            seconds=prepare_seconds,
-            metrics={
-                "full_tokens_mean": mean(full_lengths),
-                "full_tokens_max": max(full_lengths, default=0),
-                "response_tokens_total": response_tokens_total,
-            },
-        ),
-        StageResult(
-            name="actor_forward",
-            seconds=actor_forward_seconds,
-            metrics={"full_tokens_total": full_tokens_total},
-        ),
-    ]
-    if reference_active:
-        stages.append(
+        stages = [
             StageResult(
-                name="reference_forward",
-                seconds=reference_forward_seconds,
-                metrics={"full_tokens_total": full_tokens_total},
-            )
-        )
-    stages.extend(
-        [
-            StageResult(
-                name="loss_assembly",
-                seconds=loss_seconds,
+                name="prepare_inputs",
+                seconds=prepare_seconds,
                 metrics={
-                    "loss": float(loss_result.loss.item()),
-                    "policy_loss": float(loss_result.policy_loss.item()),
-                    "kl_divergence": float(loss_result.kl_divergence.item()),
-                    "response_tokens_total": loss_result.response_tokens_total,
-                    "importance_sampling_ratio_mean": loss_result.importance_sampling_ratio_mean,
-                    "importance_sampling_ratio_std": loss_result.importance_sampling_ratio_std,
-                    "importance_sampling_ratio_min": loss_result.importance_sampling_ratio_min,
-                    "importance_sampling_ratio_max": loss_result.importance_sampling_ratio_max,
-                    "clip_fraction": loss_result.clip_fraction,
+                    "full_tokens_mean": mean(full_lengths),
+                    "full_tokens_max": max(full_lengths, default=0),
+                    "response_tokens_total": response_tokens_total,
                 },
             ),
             StageResult(
-                name="backward",
-                seconds=backward_seconds,
-                metrics={"loss": float(loss_result.loss.item())},
-            ),
-            StageResult(
-                name="optimizer",
-                seconds=optimizer_seconds,
-                metrics={"learning_rate": learning_rate},
+                name="actor_forward",
+                seconds=actor_forward_seconds,
+                metrics={"full_tokens_total": full_tokens_total},
             ),
         ]
-    )
+        if reference_active:
+            stages.append(
+                StageResult(
+                    name="reference_forward",
+                    seconds=reference_forward_seconds,
+                    metrics={"full_tokens_total": full_tokens_total},
+                )
+            )
+        stages.extend(
+            [
+                StageResult(
+                    name="loss_assembly",
+                    seconds=loss_seconds,
+                    metrics={
+                        "loss": float(loss_result.loss.item()),
+                        "policy_loss": float(loss_result.policy_loss.item()),
+                        "kl_divergence": float(loss_result.kl_divergence.item()),
+                        "response_tokens_total": loss_result.response_tokens_total,
+                        "importance_sampling_ratio_mean": loss_result.importance_sampling_ratio_mean,
+                        "importance_sampling_ratio_std": loss_result.importance_sampling_ratio_std,
+                        "importance_sampling_ratio_min": loss_result.importance_sampling_ratio_min,
+                        "importance_sampling_ratio_max": loss_result.importance_sampling_ratio_max,
+                        "clip_fraction": loss_result.clip_fraction,
+                    },
+                ),
+                StageResult(
+                    name="backward",
+                    seconds=backward_seconds,
+                    metrics={"loss": float(loss_result.loss.item())},
+                ),
+                StageResult(
+                    name="optimizer",
+                    seconds=optimizer_seconds,
+                    metrics={"learning_rate": learning_rate},
+                ),
+            ]
+        )
 
-    # Explicitly delete large tensors to free MPS memory before next step
-    del input_ids
-    del attention_mask
-    del prompt_lengths
-    del actor_logits
-    if ref_logits is not None:
-        del ref_logits
-    del advantages
-    if training_old_response_log_probs is not None:
-        del training_old_response_log_probs
-
-    return OptimizationResult(
-        loss=float(loss_result.loss.item()),
-        policy_loss=float(loss_result.policy_loss.item()),
-        kl_divergence=float(loss_result.kl_divergence.item()),
-        learning_rate=learning_rate,
-        response_tokens_total=loss_result.response_tokens_total,
-        reference_active=reference_active,
-        stages=stages,
-    )
-
+        return OptimizationResult(
+            loss=float(loss_result.loss.item()),
+            policy_loss=float(loss_result.policy_loss.item()),
+            kl_divergence=float(loss_result.kl_divergence.item()),
+            learning_rate=learning_rate,
+            response_tokens_total=loss_result.response_tokens_total,
+            reference_active=reference_active,
+            stages=stages,
+        )
+    finally:
+        if input_ids is not None:
+            del input_ids
+        if attention_mask is not None:
+            del attention_mask
+        if prompt_lengths is not None:
+            del prompt_lengths
+        if actor_logits is not None:
+            del actor_logits
+        if ref_logits is not None:
+            del ref_logits
+        if advantages is not None:
+            del advantages
+        if training_old_response_log_probs is not None:
+            del training_old_response_log_probs
+        _release_device_cache(actor_backend.device)

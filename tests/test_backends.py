@@ -50,6 +50,54 @@ def test_training_backend_initializes_train_mode_optimizer_and_threads(
     assert backend.optimizer.param_groups[0]["lr"] == pytest.approx(5e-4)
 
 
+def test_training_backend_forward_disables_transformer_kv_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Learner forwards should disable autoregressive KV caching to limit memory growth."""
+    monkeypatch.setattr(training_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(training_module, "ActorModel", BackendActor)
+
+    backend = HuggingFaceTrainingBackend(
+        TrainingConfig(model_name="fake/model", num_threads=1),
+        learning_rate=1e-3,
+    )
+    reference_backend = training_module.HuggingFaceReferenceBackend(
+        TrainingConfig(model_name="fake/model", num_threads=1),
+    )
+    input_ids = torch.tensor([[1, 2, 3]], dtype=torch.long)
+    attention_mask = torch.tensor([[1, 1, 1]], dtype=torch.long)
+
+    logits = backend.forward_logits(input_ids, attention_mask)
+    reference_logits = reference_backend.forward_logits(input_ids, attention_mask)
+
+    assert logits.shape == (1, 3, 32)
+    assert reference_logits.shape == (1, 3, 32)
+    assert backend.actor.model.last_forward_kwargs == {"use_cache": False}
+    assert reference_backend.model_copy.model.last_forward_kwargs == {"use_cache": False}
+
+
+def test_training_backend_optimizer_step_clears_gradients_after_update(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Grad buffers should be released after the optimizer step to reduce idle device pressure."""
+    monkeypatch.setattr(training_module, "set_num_threads", lambda value: None)
+    monkeypatch.setattr(training_module, "ActorModel", BackendActor)
+
+    backend = HuggingFaceTrainingBackend(
+        TrainingConfig(model_name="fake/model", num_threads=1),
+        learning_rate=1e-3,
+    )
+    param = next(backend.actor.model.parameters())
+    loss = param.sum()
+
+    backend.backward_step(loss)()
+    assert param.grad is not None
+
+    backend.optimizer_step()
+
+    assert all(parameter.grad is None for parameter in backend.actor.model.parameters())
+
+
 def test_serving_backend_initializes_eval_mode_and_threads(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

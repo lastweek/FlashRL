@@ -103,6 +103,7 @@ class TinyCausalLM(torch.nn.Module):
         self.last_input_ids: torch.Tensor | None = None
         self.last_attention_mask: torch.Tensor | None = None
         self.last_labels: torch.Tensor | None = None
+        self.last_forward_kwargs: dict[str, Any] | None = None
         self.grad_enabled_during_forward: bool | None = None
 
     def forward(
@@ -110,10 +111,12 @@ class TinyCausalLM(torch.nn.Module):
         input_ids: torch.Tensor,
         attention_mask: torch.Tensor | None = None,
         labels: torch.Tensor | None = None,
+        **kwargs: Any,
     ) -> SimpleNamespace:
         self.last_input_ids = input_ids
         self.last_attention_mask = attention_mask
         self.last_labels = labels
+        self.last_forward_kwargs = dict(kwargs)
         self.grad_enabled_during_forward = torch.is_grad_enabled()
         vocab_size = self.logit_bias.shape[0]
         logits = self.logit_bias.view(1, 1, vocab_size).expand(

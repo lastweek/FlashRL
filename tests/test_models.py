@@ -222,3 +222,4 @@ def test_actor_model_compute_log_probs_returns_logits_on_target_device(
     assert tiny_model.last_input_ids.device.type == "cpu"
     assert tiny_model.last_labels is not None
     assert tiny_model.last_labels.device.type == "cpu"
+    assert tiny_model.last_forward_kwargs == {"use_cache": False}
