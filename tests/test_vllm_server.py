@@ -1,257 +1,380 @@
-"""Unit tests for vLLM custom server."""
+"""Unit tests for the FastAPI-based vLLM wrapper server."""
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock, patch
-from pathlib import Path
+from types import SimpleNamespace
 
-try:
-    from flask import Flask, jsonify
-    _FLASK_AVAILABLE = True
-except ImportError:
-    _FLASK_AVAILABLE = False
-
+from fastapi.testclient import TestClient
 import pytest
 
+pytest.importorskip("vllm")
+from vllm.logprobs import Logprob
+from vllm.outputs import CompletionOutput, RequestOutput
 
-class TestVLLMServer:
-    """Test suite for vLLM custom HTTP server."""
+from flashrl.framework.serving.vllm import server
 
-    def test_health_check(self, monkeypatch: pytest.MonkeyPatch):
-        """Health check should return healthy status."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        with patch("flashrl.framework.serving.vllm.server.engine", MagicMock()):
-            # Mock engine
-            mock_engine = MagicMock()
-            mock_engine.engine_core = MagicMock(model="test-model")
+pytestmark = pytest.mark.unit
 
-            with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                from flashrl.framework.serving.vllm.server import list_models
-                response = list_models()
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "healthy"
-        assert data["inference_paused"] == False
-        assert "model_loading" not in data  # No loading initially
+class FakeTokenizer:
+    """Tokenizer stub with deterministic ids and string conversions."""
 
-    def test_list_models(self, monkeypatch: pytest.MonkeyPatch):
-        """Models endpoint should list available models."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
+    def encode(self, prompt: str, add_special_tokens: bool = True) -> list[int]:
+        tokens = [ord(char) for char in prompt]
+        if add_special_tokens:
+            return [1, *tokens]
+        return tokens
 
-        with patch("flashrl.framework.serving.vllm.server.engine", MagicMock()):
-            # Mock engine
-            mock_engine = MagicMock()
-            mock_engine.engine_core = MagicMock(model="test-model")
+    def decode(self, token_id: int) -> str:
+        if 32 <= token_id < 127:
+            return chr(token_id)
+        return f"<{token_id}>"
 
-            with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                from flashrl.framework.serving.vllm.server import list_models
-                response = list_models()
+    def convert_ids_to_tokens(self, token_ids: list[int]) -> list[str]:
+        return [self.decode(token_id) for token_id in token_ids]
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["object"] == "list"
-        assert len(data["data"]) == 1
-        assert data["data"][0]["id"] == "test-model"
-        assert "loading_status" not in data["data"][0]  # No loading initially
 
-    def test_list_models_with_loading_status(self, monkeypatch: pytest.MonkeyPatch):
-        """Models endpoint should include loading status when loading."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
+class DummyModelConfig:
+    """Minimal model config surface consumed by the wrapper."""
 
-        with patch("flashrl.framework.serving.vllm.server.engine", MagicMock()):
-            with patch("flashrl.framework.serving.vllm.server._loading_thread", MagicMock(is_alive=lambda: True)):
-                with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: False)):
-                    with patch("flashrl.framework.serving.vllm.server._loading_success", True):
-                        with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                            from flashrl.framework.serving.vllm.server import list_models
-                            response = list_models()
+    def __init__(self, model_name: str) -> None:
+        self.model = model_name
+        self.max_model_len = 128
+        self.logits_processor_pattern = None
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["object"] == "list"
-        assert data["data"][0]["loading_status"] == "loading"
-        assert data["data"][0]["loading_error"] is None
+    def get_diff_sampling_param(self) -> dict[str, object]:
+        return {"temperature": 0.7}
 
-    def test_list_models_with_error_status(self, monkeypatch: pytest.MonkeyPatch):
-        """Models endpoint should include error status when loading fails."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        with patch("flashrl.framework.serving.vllm.server.engine", MagicMock()):
-            with patch("flashrl.framework.serving.vllm.server._loading_thread", MagicMock(is_alive=lambda: True)):
-                with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: False)):
-                    with patch("flashrl.framework.serving.vllm.server._loading_success", False):
-                        with patch("flashrl.framework.serving.vllm.server._loading_error", "Load failed"):
-                            with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                                from flashrl.framework.serving.vllm.server import list_models
-                                response = list_models()
+class FakeLLM:
+    """In-process fake that mimics the `vllm.LLM` surface used by the wrapper."""
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["object"] == "list"
-        assert data["data"][0]["loading_status"] == "error"
-        assert data["data"][0]["loading_error"] == "Load failed"
+    init_calls: list[dict[str, object]] = []
+    shutdown_calls: list[str] = []
+    generate_calls: list[dict[str, object]] = []
+    logprobs_mode = "full"
 
-    def test_load_weights_from_disk(self, monkeypatch: pytest.MonkeyPatch):
-        """Load weights endpoint should start loading model."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
+    def __init__(self, **kwargs) -> None:
+        self.kwargs = dict(kwargs)
+        FakeLLM.init_calls.append(self.kwargs)
+        self.model_config = DummyModelConfig(str(kwargs["model"]))
+        self.llm_engine = SimpleNamespace(
+            shutdown=lambda: FakeLLM.shutdown_calls.append(str(kwargs["model"]))
+        )
 
-        mock_engine = MagicMock()
-        mock_engine.engine_core = MagicMock(model="old-model")
+    def get_tokenizer(self) -> FakeTokenizer:
+        return FakeTokenizer()
 
-        with patch("flashrl.framework.serving.vllm.server.engine", mock_engine):
-            with patch("flashrl.framework.serving.vllm.server.load_model", MagicMock()):
-                with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                    from flashrl.framework.serving.vllm.server import create_server
+    def generate(self, prompts, sampling_params, *, use_tqdm: bool = True):
+        FakeLLM.generate_calls.append(
+            {
+                "prompts": prompts,
+                "sampling_params": sampling_params,
+                "use_tqdm": use_tqdm,
+            }
+        )
+        prompt_items = prompts if isinstance(prompts, list) else [prompts]
+        params = (
+            sampling_params
+            if isinstance(sampling_params, list)
+            else [sampling_params] * len(prompt_items)
+        )
+        tokenizer = self.get_tokenizer()
+        outputs: list[RequestOutput] = []
 
-                    # Start server
-                    create_server("test-model", "127.0.0.1", 8000)
+        for prompt_index, (prompt_item, params_item) in enumerate(zip(prompt_items, params, strict=True)):
+            if isinstance(prompt_item, dict):
+                prompt_token_ids = list(prompt_item["prompt_token_ids"])
+                prompt_text = "".join(
+                    chr(token_id) for token_id in prompt_token_ids if 32 <= token_id < 127
+                )
+            else:
+                prompt_text = str(prompt_item)
+                prompt_token_ids = tokenizer.encode(prompt_text, add_special_tokens=True)
 
-                    # Load weights from disk
-                    response = self.client.post("/v1/load_weights_from_disk",
-                        json={"model_source": "/path/to/weights"},
-                        headers={"Content-Type": "application/json"},
-                    )
-
-                    assert response.status_code == 200
-                    data = response.get_json()
-                    assert data["status"] == "loading_started"
-                    assert data["model_source"] == "/path/to/weights"
-
-    def test_load_weights_from_disk_while_loading(self, monkeypatch: pytest.MonkeyPatch):
-        """Load weights should reject request if already loading."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
-
-        mock_engine = MagicMock()
-
-        with patch("flashrl.framework.serving.vllm.server.engine", mock_engine):
-            with patch("flashrl.framework.serving.vllm.server.load_model", MagicMock()):
-                with patch("flashrl.framework.serving.vllm.server._loading_thread", MagicMock(is_alive=lambda: True)):
-                    with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                        from flashrl.framework.serving.vllm.server import create_server
-
-                        # Start server
-                        create_server("test-model", "127.0.0.1", 8000)
-
-                        # Try to load again (should be rejected)
-                        response = self.client.post("/v1/load_weights_from_disk",
-                            json={"model_source": "/path/to/weights2"},
-                            headers={"Content-Type": "application/json"},
+            prompt_logprobs = [None]
+            for token_id in prompt_token_ids[1:]:
+                prompt_logprobs.append(
+                    {
+                        token_id: Logprob(
+                            logprob=-0.01 * token_id,
+                            decoded_token=tokenizer.decode(token_id),
                         )
+                    }
+                )
 
-                    assert response.status_code == 202
-                    data = response.get_json()
-                    assert data["status"] == "loading_in_progress"
-                    assert "already in progress" in data["message"].lower()
+            candidate_count = getattr(params_item, "n", 1)
+            request_outputs = []
+            for candidate_index in range(candidate_count):
+                token_ids = [200 + candidate_index, 210 + candidate_index]
+                if FakeLLM.logprobs_mode == "empty":
+                    output_logprobs = []
+                elif FakeLLM.logprobs_mode == "short":
+                    output_logprobs = [
+                        {
+                            token_ids[0]: Logprob(
+                                logprob=-0.3,
+                                decoded_token=f"tok-{token_ids[0]}",
+                            )
+                        }
+                    ]
+                else:
+                    output_logprobs = [
+                        {
+                            token_ids[0]: Logprob(
+                                logprob=-0.3,
+                                decoded_token=f"tok-{token_ids[0]}",
+                            )
+                        },
+                        {
+                            token_ids[1]: Logprob(
+                                logprob=-0.4,
+                                decoded_token=f"tok-{token_ids[1]}",
+                            )
+                        },
+                    ]
+                request_outputs.append(
+                    CompletionOutput(
+                        index=candidate_index,
+                        text=f"::choice-{candidate_index}",
+                        token_ids=token_ids,
+                        cumulative_logprob=-0.7 - (candidate_index * 0.1),
+                        logprobs=output_logprobs,
+                        finish_reason="stop",
+                    )
+                )
 
-    def test_load_status_idle(self, monkeypatch: pytest.MonkeyPatch):
-        """Load status should return idle when not loading."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
+            outputs.append(
+                RequestOutput(
+                    request_id=f"req-{prompt_index}",
+                    prompt=prompt_text,
+                    prompt_token_ids=prompt_token_ids,
+                    prompt_logprobs=prompt_logprobs,
+                    outputs=request_outputs,
+                    finished=True,
+                )
+            )
 
-        with patch("flashrl.framework.serving.vllm.server._loading_thread", None):
-            with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: False)):
-                with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                    from flashrl.framework.serving.vllm.server import load_status
-                    response = load_status()
+        return outputs
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "idle"
 
-    def test_load_status_loading(self, monkeypatch: pytest.MonkeyPatch):
-        """Load status should return loading when in progress."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
+@pytest.fixture(autouse=True)
+def reset_server_state(monkeypatch: pytest.MonkeyPatch):
+    """Reset module globals and replace the live LLM with a fast fake."""
+    FakeLLM.init_calls.clear()
+    FakeLLM.shutdown_calls.clear()
+    FakeLLM.generate_calls.clear()
+    FakeLLM.logprobs_mode = "full"
+    monkeypatch.setattr(server, "LLM", FakeLLM)
+    monkeypatch.setattr(server, "app", None)
+    monkeypatch.setattr(server, "llm", None)
+    monkeypatch.setattr(server, "_engine_args", None)
+    monkeypatch.setattr(server, "_model_source", "")
+    monkeypatch.setattr(server, "_served_model_names", [])
+    monkeypatch.setattr(server, "_default_sampling_params", {})
+    monkeypatch.setattr(server, "_inference_paused", False)
 
-        mock_thread = MagicMock(is_alive=lambda: True)
-        with patch("flashrl.framework.serving.vllm.server._loading_thread", mock_thread):
-            with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: False)):
-                with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                    from flashrl.framework.serving.vllm.server import load_status
-                    response = load_status()
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "loading"
-        assert data["message"] == "Model loading in progress"
+def _build_client(*, vllm_args: list[str] | None = None) -> TestClient:
+    application = server.create_app(
+        "base/model",
+        served_model_name="served-model",
+        vllm_args=vllm_args,
+    )
+    return TestClient(application)
 
-    def test_load_status_success(self, monkeypatch: pytest.MonkeyPatch):
-        """Load status should return success after loading completes."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        mock_thread = MagicMock(is_alive=lambda: False)
-        with patch("flashrl.framework.serving.vllm.server._loading_thread", mock_thread):
-            with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: True)):
-                with patch("flashrl.framework.serving.vllm.server._loading_success", True):
-                    with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                        from flashrl.framework.serving.vllm.server import load_status
-                        response = load_status()
+def test_create_app_passes_vllm_args_into_llm() -> None:
+    """Wrapper startup should honor vLLM engine CLI arguments."""
+    with _build_client(vllm_args=["--max-num-seqs=32", "--enable-prefix-caching"]) as client:
+        response = client.get("/health")
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "success"
-        assert data["message"] == "Model loaded successfully"
+    assert response.status_code == 200
+    assert len(FakeLLM.init_calls) == 1
+    assert FakeLLM.init_calls[0]["model"] == "base/model"
+    assert FakeLLM.init_calls[0]["served_model_name"] == ["served-model"]
+    assert FakeLLM.init_calls[0]["max_num_seqs"] == 32
+    assert FakeLLM.init_calls[0]["enable_prefix_caching"] is True
 
-    def test_load_status_error(self, monkeypatch: pytest.MonkeyPatch):
-        """Load status should return error after loading fails."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        mock_thread = MagicMock(is_alive=lambda: False)
-        with patch("flashrl.framework.serving.vllm.server._loading_thread", mock_thread):
-            with patch("flashrl.framework.serving.vllm.server._loading_complete", MagicMock(is_set=lambda: True)):
-                with patch("flashrl.framework.serving.vllm.server._loading_success", False):
-                    with patch("flashrl.framework.serving.vllm.server._loading_error", "Load failed"):
-                        with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                            from flashrl.framework.serving.vllm.server import load_status
-                            response = load_status()
+def test_models_endpoint_matches_vllm_schema() -> None:
+    """`/v1/models` should return a vLLM/OpenAI-compatible model list."""
+    with _build_client() as client:
+        response = client.get("/v1/models")
 
-        assert response.status_code == 500
-        data = response.get_json()
-        assert data["status"] == "error"
-        assert "Load failed" in data["message"]
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "list"
+    assert len(data["data"]) == 1
+    assert data["data"][0]["id"] == "served-model"
+    assert data["data"][0]["object"] == "model"
+    assert data["data"][0]["owned_by"] == "vllm"
+    assert data["data"][0]["root"] == "base/model"
+    assert data["data"][0]["max_model_len"] == 128
+    assert isinstance(data["data"][0]["permission"], list)
 
-    def test_pause_inference(self, monkeypatch: pytest.MonkeyPatch):
-        """Pause inference should set paused flag."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        with patch("flashrl.framework.serving.vllm.server._inference_paused", False):
-            with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                from flashrl.framework.serving.vllm.server import pause_inference
-                response = pause_inference()
+def test_completions_endpoint_matches_vllm_response_shape() -> None:
+    """`/v1/completions` should return the same non-streaming shape as vLLM."""
+    request_payload = {
+        "model": "served-model",
+        "prompt": "ab",
+        "n": 2,
+        "max_tokens": 2,
+        "logprobs": 1,
+        "return_token_ids": True,
+    }
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "inference_paused"
+    with _build_client() as client:
+        response = client.post("/v1/completions", json=request_payload)
 
-        # Verify flag is set
-        from flashrl.framework.serving.vllm.server import _inference_paused
-        assert _inference_paused == True
+    assert response.status_code == 200
+    data = response.json()
+    assert data["object"] == "text_completion"
+    assert data["model"] == "served-model"
+    assert data["usage"] == {
+        "prompt_tokens": 3,
+        "total_tokens": 7,
+        "completion_tokens": 4,
+        "prompt_tokens_details": None,
+    }
+    assert len(data["choices"]) == 2
+    assert data["choices"][0]["index"] == 0
+    assert data["choices"][0]["text"] == "::choice-0"
+    assert data["choices"][0]["finish_reason"] == "stop"
+    assert data["choices"][0]["prompt_token_ids"] == [1, 97, 98]
+    assert data["choices"][0]["token_ids"] == [200, 210]
+    assert data["choices"][0]["logprobs"]["token_logprobs"] == [-0.3, -0.4]
+    assert data["choices"][0]["logprobs"]["tokens"] == ["tok-200", "tok-210"]
+    assert data["choices"][1]["index"] == 1
+    assert FakeLLM.generate_calls[0]["use_tqdm"] is False
 
-    def test_resume_inference(self, monkeypatch: pytest.MonkeyPatch):
-        """Resume inference should clear paused flag."""
-        if not _FLASK_AVAILABLE:
-            pytest.skip("Flask not available")
 
-        with patch("flashrl.framework.serving.vllm.server._inference_paused", True):
-            with patch("flashrl.framework.serving.vllm.server.app", MagicMock()):
-                from flashrl.framework.serving.vllm.server import resume_inference
-                response = resume_inference()
+def test_completions_endpoint_tolerates_missing_logprob_steps() -> None:
+    """Missing sampled-token logprobs should not turn completions into HTTP 500s."""
+    FakeLLM.logprobs_mode = "empty"
 
-        assert response.status_code == 200
-        data = response.get_json()
-        assert data["status"] == "inference_resumed"
+    with _build_client() as client:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "served-model",
+                "prompt": "ab",
+                "n": 1,
+                "max_tokens": 2,
+                "logprobs": 1,
+                "return_token_ids": True,
+            },
+        )
 
-        # Verify flag is cleared
-        from flashrl.framework.serving.vllm.server import _inference_paused
-        assert _inference_paused == False
+    assert response.status_code == 200
+    data = response.json()
+    assert data["choices"][0]["token_ids"] == [200, 210]
+    assert data["choices"][0]["logprobs"]["token_logprobs"] == [None, None]
+    assert data["choices"][0]["logprobs"]["top_logprobs"] == [None, None]
+    assert data["choices"][0]["logprobs"]["tokens"] == ["<200>", "<210>"]
+
+
+def test_completions_endpoint_pads_short_logprob_arrays() -> None:
+    """Short logprob arrays should be padded instead of raising indexing errors."""
+    FakeLLM.logprobs_mode = "short"
+
+    with _build_client() as client:
+        response = client.post(
+            "/v1/completions",
+            json={
+                "model": "served-model",
+                "prompt": "ab",
+                "n": 1,
+                "max_tokens": 2,
+                "logprobs": 1,
+                "return_token_ids": True,
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data["choices"][0]["logprobs"]["token_logprobs"] == [-0.3, None]
+    assert data["choices"][0]["logprobs"]["tokens"] == ["tok-200", "<210>"]
+    assert data["choices"][0]["logprobs"]["top_logprobs"] == [
+        {"tok-200": -0.3},
+        None,
+    ]
+
+
+def test_tokenize_endpoint_matches_vllm_schema() -> None:
+    """`/tokenize` should report tokens, count, and max_model_len like vLLM."""
+    with _build_client() as client:
+        response = client.post(
+            "/tokenize",
+            json={
+                "model": "served-model",
+                "prompt": "ab",
+                "return_token_strs": True,
+            },
+        )
+
+    assert response.status_code == 200
+    data = response.json()
+    assert data == {
+        "count": 3,
+        "max_model_len": 128,
+        "tokens": [1, 97, 98],
+        "token_strs": ["<1>", "a", "b"],
+    }
+
+
+def test_pause_and_resume_gate_completion_requests() -> None:
+    """Admin pause should block completions until resumed."""
+    with _build_client() as client:
+        pause_response = client.post("/admin/pause")
+        blocked_response = client.post(
+            "/v1/completions",
+            json={
+                "model": "served-model",
+                "prompt": "ab",
+                "max_tokens": 2,
+            },
+        )
+        resume_response = client.post("/admin/resume")
+        ok_response = client.post(
+            "/v1/completions",
+            json={
+                "model": "served-model",
+                "prompt": "ab",
+                "max_tokens": 2,
+            },
+        )
+
+    assert pause_response.status_code == 200
+    assert pause_response.json()["status"] == "inference_paused"
+    assert blocked_response.status_code == 503
+    assert blocked_response.json()["error"]["message"] == "Inference is paused."
+    assert resume_response.status_code == 200
+    assert resume_response.json()["status"] == "inference_resumed"
+    assert ok_response.status_code == 200
+
+
+def test_load_weights_from_disk_reloads_model_and_preserves_served_name() -> None:
+    """Reloading weights should swap the model source without changing the served model id."""
+    with _build_client() as client:
+        reload_response = client.post(
+            "/v1/load_weights_from_disk",
+            json={"model_source": "/tmp/flashrl-snapshot"},
+        )
+        models_response = client.get("/v1/models")
+
+    assert reload_response.status_code == 200
+    assert reload_response.json() == {
+        "status": "success",
+        "model_source": "/tmp/flashrl-snapshot",
+    }
+    assert [call["model"] for call in FakeLLM.init_calls] == [
+        "base/model",
+        "/tmp/flashrl-snapshot",
+    ]
+    assert "base/model" in FakeLLM.shutdown_calls
+    assert models_response.status_code == 200
+    assert models_response.json()["data"][0]["id"] == "served-model"
+    assert models_response.json()["data"][0]["root"] == "/tmp/flashrl-snapshot"

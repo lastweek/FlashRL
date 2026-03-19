@@ -215,6 +215,9 @@ class VLLMServingBackend(ServingBackend):
                     payload={"model_source": str(snapshot_dir)},
                     timeout=60.0,  # Allow time for weight load
                 )
+                replica.model_source = str(snapshot_dir)
+                replica.phase = "Ready"
+                replica.last_error = None
             except Exception as exc:
                 raise RuntimeError(
                     f"Failed to load weights into replica {replica.index}: {exc}"
@@ -394,7 +397,13 @@ class VLLMServingBackend(ServingBackend):
     def _download_model_snapshot(self, model_name: str) -> str:
         from huggingface_hub import snapshot_download
 
-        snapshot_path = snapshot_download(repo_id=model_name)
+        try:
+            snapshot_path = snapshot_download(
+                repo_id=model_name,
+                local_files_only=True,
+            )
+        except Exception:
+            snapshot_path = snapshot_download(repo_id=model_name)
         return str(Path(snapshot_path))
 
     def _restart_replicas(self, model_source: str) -> None:
@@ -407,9 +416,15 @@ class VLLMServingBackend(ServingBackend):
             str(self._python_executable),
             "-m",
             "flashrl.framework.serving.vllm.server",
-            "--model", model_source,
-            "--host", "127.0.0.1",
-            "--port", str(port),
+            "--model",
+            model_source,
+            "--served-model-name",
+            self.config.model_name,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            str(port),
+            *self.config.vllm_args,
         ]
 
     def _spawn_process(self, command: list[str]) -> subprocess.Popen[str]:
@@ -573,6 +588,7 @@ class VLLMServingBackend(ServingBackend):
             ),
             "top_p": float(generation_kwargs.get("top_p", 0.9)),
             "top_k": int(generation_kwargs.get("top_k", 0)),
+            "logprobs": 1,
             "return_token_ids": True,
             "stream": False,
         }
@@ -741,13 +757,15 @@ class VLLMServingBackend(ServingBackend):
             token_logprobs = logprobs
 
         if not isinstance(token_logprobs, list) or len(token_logprobs) != len(token_ids):
-            raise RuntimeError(
-                "vllm returned logprobs with a length that does not match token_ids."
-            )
-        return [
-            self._extract_one_logprob(entry, token_id)
-            for entry, token_id in zip(token_logprobs, token_ids, strict=True)
-        ]
+            return []
+
+        try:
+            return [
+                self._extract_one_logprob(entry, token_id)
+                for entry, token_id in zip(token_logprobs, token_ids, strict=True)
+            ]
+        except (TypeError, ValueError, RuntimeError):
+            return []
 
     def _extract_one_logprob(self, step_entry: Any, token_id: int) -> float:
         if isinstance(step_entry, (int, float)):

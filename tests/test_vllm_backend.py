@@ -6,6 +6,8 @@ from io import StringIO
 from pathlib import Path
 import os
 import signal
+import sys
+import tempfile
 import time
 from types import SimpleNamespace
 
@@ -14,9 +16,7 @@ import torch
 import yaml
 
 import flashrl.framework.flashrl as flashrl_module
-import flashrl.framework.serving as serving_module
 import flashrl.framework.serving.huggingface as huggingface_module
-import flashrl.framework.serving.vllm as vllm_module
 from flashrl.framework.config import (
     GrpoConfig,
     LoggingConfig,
@@ -439,16 +439,21 @@ def test_create_serving_backend_returns_vllm_backend(
             backend="vllm",
             runtime_python=str(python_path),
             num_replicas=2,
+            vllm_args=["--max-num-seqs=32"],
         )
     )
 
     assert isinstance(backend, VLLMServingBackend)
     assert backend._snapshot_dir is None
     assert len(spawned_commands) == 2
-    # Custom server uses Python module, not vllm serve
-    assert spawned_commands[0][:3] == [str(python_path), "-m", "flashrl.framework.serving.vllm.server"]
-    assert spawned_commands[0][4] == "fake/model"  # --model flag
-    assert spawned_commands[0][6] == "127.0.0.1"  # --host flag
+    assert spawned_commands[0][:3] == [
+        str(python_path),
+        "-m",
+        "flashrl.framework.serving.vllm.server",
+    ]
+    assert spawned_commands[0][4] == "fake/model"
+    assert "--served-model-name" in spawned_commands[0]
+    assert "--max-num-seqs=32" in spawned_commands[0]
     backend.close()
 
 
@@ -481,7 +486,7 @@ def test_vllm_backend_defaults_to_current_python_when_runtime_python_is_unset(
 
     try:
         assert backend.list_admin_objects()[0]["spec"]["pythonExecutable"] == str(python_path)
-        assert spawned_commands[0][0] == str(python_path.with_name("vllm"))
+        assert spawned_commands[0][0] == str(python_path)
     finally:
         backend.close()
 
@@ -513,7 +518,13 @@ def test_vllm_backend_retries_startup_with_local_snapshot_after_remote_failure(
                 port=8100,
                 process=process,
                 model_source=model_source,
-                command=[str(python_path.with_name("vllm")), "serve", model_source],
+                command=[
+                    str(python_path),
+                    "-m",
+                    "flashrl.framework.serving.vllm.server",
+                    "--model",
+                    model_source,
+                ],
                 phase="Ready",
                 ready_at="2026-03-13T00:00:01Z",
             )
@@ -541,6 +552,62 @@ def test_vllm_backend_retries_startup_with_local_snapshot_after_remote_failure(
         backend.close()
 
 
+def test_vllm_backend_download_model_snapshot_prefers_local_cache(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Snapshot fallback should prefer the local HF cache before touching the network."""
+    calls: list[tuple[str, bool]] = []
+    cached_path = tmp_path / "hf-cache" / "fake--model"
+
+    def fake_snapshot_download(*, repo_id: str, local_files_only: bool = False):
+        calls.append((repo_id, local_files_only))
+        assert local_files_only is True
+        return str(cached_path)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    backend = object.__new__(VLLMServingBackend)
+    snapshot = VLLMServingBackend._download_model_snapshot(backend, "fake/model")
+
+    assert snapshot == str(cached_path)
+    assert calls == [("fake/model", True)]
+
+
+def test_vllm_backend_download_model_snapshot_falls_back_to_network_when_cache_misses(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Snapshot fallback should retry without `local_files_only` when cache lookup fails."""
+    calls: list[tuple[str, bool]] = []
+    downloaded_path = tmp_path / "hf-cache" / "fake--model"
+
+    def fake_snapshot_download(*, repo_id: str, local_files_only: bool = False):
+        calls.append((repo_id, local_files_only))
+        if local_files_only:
+            raise RuntimeError("cache miss")
+        return str(downloaded_path)
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    backend = object.__new__(VLLMServingBackend)
+    snapshot = VLLMServingBackend._download_model_snapshot(backend, "fake/model")
+
+    assert snapshot == str(downloaded_path)
+    assert calls == [
+        ("fake/model", True),
+        ("fake/model", False),
+    ]
+
+
 def test_vllm_backend_sync_generate_and_close(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -550,7 +617,7 @@ def test_vllm_backend_sync_generate_and_close(
     spawned_commands: list[list[str]] = []
     processes: list[FakeProcess] = []
     requests: list[tuple[str, str, dict[str, object] | None]] = []
-    ports = iter([8100, 8101, 8200, 8201])
+    ports = iter([8100, 8101])
 
     def fake_spawn(self, command):
         spawned_commands.append(command)
@@ -564,6 +631,8 @@ def test_vllm_backend_sync_generate_and_close(
         if method == "GET":
             return {"data": [{"id": self.config.model_name}]}
         assert payload is not None
+        if url.endswith("/v1/load_weights_from_disk"):
+            return {"status": "success", "model_source": payload["model_source"]}
         prompt = payload["prompt"]
         assert isinstance(prompt, str)
         grouped_choices = []
@@ -572,13 +641,33 @@ def test_vllm_backend_sync_generate_and_close(
             grouped_choices.append(
                 {
                     "text": f"vllm::{prompt}::{candidate_index}",
+                    "index": candidate_index,
                     "prompt_token_ids": prompt_token_ids,
                     "token_ids": [10 + candidate_index, 20 + candidate_index],
-                    "logprobs": {"token_logprobs": [-0.1, -0.2]},
+                    "logprobs": {
+                        "text_offset": [0, 1],
+                        "token_logprobs": [-0.1, -0.2],
+                        "tokens": [f"tok::{candidate_index}::0", f"tok::{candidate_index}::1"],
+                        "top_logprobs": [
+                            {f"tok::{candidate_index}::0": -0.1},
+                            {f"tok::{candidate_index}::1": -0.2},
+                        ],
+                    },
                     "finish_reason": "stop",
                 }
             )
-        return {"choices": grouped_choices}
+        return {
+            "id": "cmpl-test",
+            "object": "text_completion",
+            "created": 123,
+            "model": self.config.model_name,
+            "choices": grouped_choices,
+            "usage": {
+                "prompt_tokens": len(prompt_token_ids),
+                "completion_tokens": 2 * int(payload["n"]),
+                "total_tokens": len(prompt_token_ids) + (2 * int(payload["n"])),
+            },
+        }
 
     monkeypatch.setattr(VLLMServingBackend, "_reserve_port", lambda self: next(ports))
     monkeypatch.setattr(VLLMServingBackend, "_spawn_process", fake_spawn)
@@ -607,13 +696,16 @@ def test_vllm_backend_sync_generate_and_close(
     completion_requests = [
         payload
         for method, _, payload in requests
-        if method == "POST" and payload is not None
+        if method == "POST" and payload is not None and payload.get("prompt") is not None
     ]
     assert len(grouped) == 3
     assert [sample.text for sample in grouped[0]] == ["vllm::ab::0", "vllm::ab::1"]
     assert [sample.text for sample in grouped[1]] == ["vllm::cd::0", "vllm::cd::1"]
     assert [sample.text for sample in grouped[2]] == ["vllm::ef::0", "vllm::ef::1"]
+    assert grouped[0][0].response_token_logprobs == [-0.1, -0.2]
+    assert grouped[0][0].log_prob == pytest.approx(-0.3)
     assert any(payload["return_token_ids"] is True for payload in completion_requests)
+    assert all(payload["logprobs"] == 1 for payload in completion_requests)
     assert [payload["prompt"] for payload in completion_requests] == ["ab", "cd", "ef"]
     assert startup_admin_objects[0]["spec"]["modelSource"] == "fake/model"
     assert startup_admin_objects[0]["spec"]["pythonExecutable"] == str(python_path)
@@ -621,19 +713,22 @@ def test_vllm_backend_sync_generate_and_close(
     assert backend._snapshot_dir is not None
     assert (backend._snapshot_dir / "model.safetensors").exists()
     assert len(training_actor.model.saved_paths) == 1
-    # With in-process weight loading, no process restarts occur
-    assert len(spawned_commands) == 2  # Only initial launches, no restarts
-    assert spawned_commands[0][4] == "fake/model"  # --model flag
-    # Check that sync made HTTP request to load_weights_from_disk
+    assert len(spawned_commands) == 2
+    assert spawned_commands[0][:3] == [
+        str(python_path),
+        "-m",
+        "flashrl.framework.serving.vllm.server",
+    ]
+    assert "--served-model-name" in spawned_commands[0]
+    assert "--max-num-seqs=32" in spawned_commands[0]
     sync_requests = [
         (method, url, payload)
         for method, url, payload in requests
         if method == "POST" and "/v1/load_weights_from_disk" in url
     ]
-    assert len(sync_requests) == 2  # One per replica
+    assert len(sync_requests) == 2
     assert synced_admin_objects[0]["spec"]["modelSource"] == str(backend._snapshot_dir)
     assert synced_admin_objects[0]["status"]["phase"] == "Ready"
-    # Processes should not be terminated (no restart)
     assert processes[0].terminate_calls == 0
     assert processes[1].terminate_calls == 0
 
@@ -643,9 +738,31 @@ def test_vllm_backend_sync_generate_and_close(
 
     assert snapshot_dir is not None
     assert not snapshot_dir.exists()
-    assert processes[2].terminate_calls == 1
-    assert processes[3].terminate_calls == 1
+    assert processes[0].terminate_calls == 1
+    assert processes[1].terminate_calls == 1
     assert closed_admin_objects[0]["status"]["phase"] == "Closed"
+
+
+def test_vllm_backend_treats_missing_completion_logprobs_as_unavailable() -> None:
+    """Malformed completion logprobs should fall back to learner-side recomputation."""
+    backend = object.__new__(VLLMServingBackend)
+
+    assert (
+        VLLMServingBackend._extract_output_logprobs(
+            backend,
+            {"token_logprobs": [None, None]},
+            [10, 20],
+        )
+        == []
+    )
+    assert (
+        VLLMServingBackend._extract_output_logprobs(
+            backend,
+            {"token_logprobs": [-0.1]},
+            [10, 20],
+        )
+        == []
+    )
 
 
 def test_vllm_backend_surfaces_startup_stderr_lines(
