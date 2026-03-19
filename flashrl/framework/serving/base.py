@@ -51,6 +51,11 @@ class ServingBackend(ABC):
         """Clear any serving-side live-rollout debug hooks."""
         return None
 
+    def set_log_dir(self, log_dir: str | Any | None) -> None:
+        """Update the backend-owned artifact directory when supported."""
+        del log_dir
+        return None
+
     def list_admin_objects(self) -> list[dict[str, Any]]:
         """Return backend-owned admin objects when available."""
         return []

@@ -1,5 +1,6 @@
 """Strict R1-Zero math training example with explicit dataset selection."""
 from __future__ import annotations
+import ast
 import argparse
 from decimal import Decimal, InvalidOperation
 from fractions import Fraction
@@ -15,7 +16,7 @@ for candidate in (REPO_ROOT, EXAMPLE_DIR):
     candidate_text = str(candidate)
     if candidate_text not in sys.path:
         sys.path.insert(0, candidate_text)
-from flashrl.framework import FlashRL
+from flashrl.framework import FlashRL, ReActRollout, SubprocessToolRuntime, Tool
 from flashrl.framework.data_models import (
     Conversation,
     Message,
@@ -38,6 +39,8 @@ DEFAULT_AIME25_TRAIN_SPLIT = "test"
 DEFAULT_AIME25_EVAL_SPLIT = "test"
 DEFAULT_REASONING_CHECKPOINT_PATH = "/tmp/flashrl_reasoning_checkpoint.pt"
 DEFAULT_REASONING_EVAL_BATCH_SIZE = 8
+DEFAULT_MATH_ROLLOUT_MODE = "blackbox"
+SUPPORTED_MATH_ROLLOUT_MODES = ("blackbox", "whitebox")
 FINAL_ANSWER_PATTERN = re.compile(r"####\s*(.+)$", re.MULTILINE)
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_BLOCK_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -45,8 +48,24 @@ STRICT_RESPONSE_PATTERN = re.compile(
     r"^\s*<think>(?P<think>.*?)</think>\s*<answer>(?P<answer>.*?)</answer>\s*$",
     re.IGNORECASE | re.DOTALL,
 )
+
+
+def build_math_system_prompt(training_mode: str = "math") -> str:
+    """Return the explicit system prompt used by the whitebox math rollout."""
+    if training_mode == "reasoning":
+        return (
+            "You are a careful math assistant. Use the calculator tool when arithmetic "
+            "would help. When you finish, the content after `Final:` must contain exactly "
+            "one <think>...</think> block followed immediately by one "
+            "<answer>...</answer> block."
+        )
+    return (
+        "You are a careful math assistant. Use the calculator tool when arithmetic "
+        "would help. When you finish, the content after `Final:` should contain only "
+        "the final answer."
+    )
 # Prompt contract
-def render_math_prompt(problem: str, training_mode: str = "math") -> str:
+def render_math_prompt(problem: str, training_mode: str = "reasoning") -> str:
     """Render one strict user prompt with no system role.
     Args:
         problem: The math problem statement
@@ -58,8 +77,9 @@ def render_math_prompt(problem: str, training_mode: str = "math") -> str:
         # Reasoning mode: Ask for thinking blocks AND answer
         return (
             "Solve the following math problem.\n"
-            "Show your work in a ```thinking``` block, then provide your final answer "
-            "in an <answer>...</answer> block.\n\n"
+            "Respond with exactly one <think>...</think> block followed immediately by "
+            "exactly one <answer>...</answer> block.\n"
+            "Do not output any text before <think> or after </answer>.\n\n"
             f"Problem: {problem.strip()}"
         )
     else:
@@ -68,6 +88,85 @@ def render_math_prompt(problem: str, training_mode: str = "math") -> str:
             "Solve the following math problem.\n\n"
             f"Problem: {problem.strip()}"
         )
+
+
+def _render_system_prefixed_prompt(prompt_text: str, system_prompt: str | None) -> str:
+    """Render one plain-text prompt for the blackbox path."""
+    if not system_prompt:
+        return prompt_text
+    return f"System: {system_prompt}\n\nUser: {prompt_text}"
+
+
+def _safe_decimal_expression(text: str) -> Decimal:
+    """Evaluate one arithmetic expression with a small AST allowlist."""
+    allowed_binary = {
+        ast.Add: lambda left, right: left + right,
+        ast.Sub: lambda left, right: left - right,
+        ast.Mult: lambda left, right: left * right,
+        ast.Div: lambda left, right: left / right,
+        ast.Pow: lambda left, right: left**right,
+        ast.Mod: lambda left, right: left % right,
+    }
+    allowed_unary = {
+        ast.UAdd: lambda value: value,
+        ast.USub: lambda value: -value,
+    }
+
+    def evaluate(node: ast.AST) -> Decimal:
+        if isinstance(node, ast.Expression):
+            return evaluate(node.body)
+        if isinstance(node, ast.Constant) and isinstance(node.value, (int, float)):
+            return Decimal(str(node.value))
+        if isinstance(node, ast.BinOp) and type(node.op) in allowed_binary:
+            left = evaluate(node.left)
+            right = evaluate(node.right)
+            return allowed_binary[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp) and type(node.op) in allowed_unary:
+            return allowed_unary[type(node.op)](evaluate(node.operand))
+        raise ValueError("Only arithmetic expressions are supported.")
+
+    parsed = ast.parse(text, mode="eval")
+    return evaluate(parsed)
+
+
+def calculator_tool(arguments: dict[str, Any], prompt: Prompt) -> str:
+    """Safely evaluate one arithmetic expression for the whitebox math example."""
+    del prompt
+    expression = str(arguments.get("expression", "")).strip()
+    if not expression:
+        raise ValueError("calculator_tool requires a non-empty `expression` argument.")
+    try:
+        value = _safe_decimal_expression(expression)
+    except (ValueError, SyntaxError, ArithmeticError, InvalidOperation) as exc:
+        raise ValueError(f"calculator_tool could not evaluate the expression: {exc}") from exc
+    normalized = format(value.normalize(), "f") if value == value.to_integral() else format(value.normalize(), "f")
+    if "." in normalized:
+        normalized = normalized.rstrip("0").rstrip(".") or "0"
+    return normalized
+
+
+def build_math_whitebox_rollout(
+    *,
+    training_mode: str,
+    system_prompt: str | None = None,
+) -> ReActRollout:
+    """Construct the built-in ReAct rollout used by the whitebox math example."""
+    resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
+    return ReActRollout(
+        tools=[
+            Tool(
+                name="calculator",
+                description="Evaluate one arithmetic expression and return the numeric result.",
+                entrypoint="flashrl.framework.examples.math.train:calculator_tool",
+                timeout_seconds=3.0,
+                memory_limit_mb=64,
+            )
+        ],
+        max_steps=4,
+        system_prompt=resolved_system_prompt,
+        runtime=SubprocessToolRuntime(default_timeout_seconds=3.0, default_memory_limit_mb=64),
+        max_parallel_calls=4,
+    )
 
 # Dataset loading
 def _coerce_positive_int(value: Any, *, field_name: str) -> int:
@@ -320,20 +419,21 @@ def _extract_math_target_answer(raw_answer: str) -> str:
         raise ValueError(f"GSM8K answer normalized to empty text: {raw_answer[:80]!r}")
     return normalized
 def _extract_answer_block(response_text: str) -> str | None:
-    """Extract the single parsed answer block when one exists.
-    Falls back to extracting the last number from free-form text when no tags found."""
-    # First try structured <answer> blocks (for reasoning mode compatibility)
+    """Extract the single parsed answer block when one exists."""
     matches = ANSWER_BLOCK_PATTERN.findall(response_text)
     if len(matches) == 1:
         answer_text = matches[0].strip()
         if answer_text:
             return answer_text
-    # Fallback: Extract last number from free-form text (for math mode)
-    # Handles patterns like "The answer is 42." or "Answer: 13.25"
+    return None
+
+
+def _extract_last_number(response_text: str) -> str | None:
+    """Extract the last numeric answer from free-form text."""
     number_pattern = re.compile(r'-?\d+(?:\.\d+)?|\d+/\d+')
     numbers = number_pattern.findall(response_text)
     if numbers:
-        return numbers[-1]  # Return the last number found in the text
+        return numbers[-1]
     return None
 # Reward logic
 def _prompt_metadata_from_rollout(rollout: RolloutOutput) -> dict[str, Any]:
@@ -352,7 +452,7 @@ def reasoning_reward_fn(rollout: RolloutOutput, debug_reward: bool = False) -> R
     """
     text = rollout.text
     # Extract thinking content
-    thinking_pattern = r'<thinking>(.*?)</thinking>'
+    thinking_pattern = r'<think>(.*?)</think>'
     matches = re.findall(thinking_pattern, text, re.IGNORECASE | re.DOTALL)
     if not matches:
         # No thinking tags found
@@ -427,7 +527,7 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math", deb
     # In math mode: only check answer accuracy, no format restrictions
     if training_mode == "math":
         # Parse answer from various formats, not just <answer> blocks
-        parsed_answer = _extract_answer_block(text)
+        parsed_answer = _extract_answer_block(text) or _extract_last_number(text)
         answer_parse_pass = parsed_answer is not None
         normalized_answer = _normalize_math_answer(parsed_answer or "")
         accuracy_pass = bool(answer_parse_pass and normalized_answer == expected_answer)
@@ -517,7 +617,7 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math", deb
             flush=True
         )
     return result
-def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math", debug_reward: bool = False) -> RewardOutput:
+def math_reward_fn(rollout: RolloutOutput, training_mode: str = "reasoning", debug_reward: bool = False) -> RewardOutput:
     """Compute math reward from rollout metadata.
     Args:
         rollout: Rollout output with completion and metadata
@@ -528,50 +628,39 @@ def math_reward_fn(rollout: RolloutOutput, training_mode: str = "math", debug_re
     In "math" mode: Only checks answer correctness (0-1.0 range)
     In "reasoning" mode: Combines 70% reasoning score + 30% math score
     """
-    if training_mode == "reasoning":
-        # Reasoning mode: Combine reasoning + math scores
-        reasoning_result = reasoning_reward_fn(rollout, debug_reward=debug_reward)
-        math_result = _compute_math_score(rollout, training_mode="reasoning", debug_reward=debug_reward)  # Pass mode
-        # Combine: 70% reasoning + 30% math
-        combined_score = (
-            0.7 * reasoning_result.reward +
-            0.3 * math_result.reward
-        )
-        # Merge metadata
-        metadata = {
-            **reasoning_result.metadata,
-            **math_result.metadata,
-            "training_mode": "reasoning",
-            "combined_score": combined_score
-        }
-        if debug_reward:
-            print(
-                f"reward:combined  mode=reasoning  "
-                f"reasoning_score={reasoning_result.reward:.3f} (70%)  "
-                f"math_score={math_result.reward:.1f} (30%)  "
-                f"combined_score={combined_score:.3f}",
-                flush=True
-            )
-        return RewardOutput(
-            reward=combined_score,
-            metadata=metadata
-        )
-    else:
-        # Math mode: Only check answer accuracy
-        return _compute_math_score(rollout, training_mode="math", debug_reward=debug_reward)  # Pass mode
+    return _compute_math_score(
+        rollout,
+        training_mode=training_mode,
+        debug_reward=debug_reward,
+    )
 # Future code reasoning can live below as explicit `code_*` helpers later.
 # Keep this example concrete until we have real code-task data and verifiers.
 # Rollout hook
 def reasoning_rollout_fn(
     prompts: list[Prompt],
     serving_backend,
+    *,
+    system_prompt: str | None = None,
 ) -> list[RolloutOutput]:
     """Generate one rollout per prompt with prompt metadata attached."""
-    samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
+    rendered_prompts = [
+        _render_system_prefixed_prompt(prompt.text, system_prompt)
+        for prompt in prompts
+    ]
+    samples = serving_backend.generate_batch(rendered_prompts)
     rollouts: list[RolloutOutput] = []
     for prompt, sample in zip(prompts, samples, strict=True):
         # The reward only sees RolloutOutput, so we copy the prompt metadata here
         # instead of reparsing the original prompt text later.
+        messages = []
+        if system_prompt:
+            messages.append(Message(role="system", content=system_prompt))
+        messages.extend(
+            [
+                Message(role="user", content=prompt.text),
+                Message(role="assistant", content=sample.text),
+            ]
+        )
         rollouts.append(
             RolloutOutput(
                 text=sample.text,
@@ -583,15 +672,34 @@ def reasoning_rollout_fn(
                     **dict(sample.metadata),
                     "prompt_metadata": dict(prompt.metadata),
                 },
-                conversation=Conversation(
-                    messages=[
-                        Message(role="user", content=prompt.text),
-                        Message(role="assistant", content=sample.text),
-                    ]
-                ),
+                conversation=Conversation(messages=messages),
             )
         )
     return rollouts
+
+
+def build_math_rollout(
+    *,
+    rollout_mode: str,
+    training_mode: str,
+    system_prompt: str | None = None,
+):
+    """Return either the example blackbox rollout or the built-in whitebox rollout."""
+    if rollout_mode == "whitebox":
+        return build_math_whitebox_rollout(
+            training_mode=training_mode,
+            system_prompt=system_prompt,
+        )
+    resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
+
+    def rollout_fn(prompts: list[Prompt], serving_backend):
+        return reasoning_rollout_fn(
+            prompts,
+            serving_backend,
+            system_prompt=resolved_system_prompt,
+        )
+
+    return rollout_fn
 # Runtime and CLI helpers
 def find_default_vllm_python() -> str | None:
     """Return a prepared default vLLM runtime when one is available."""
@@ -651,6 +759,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Training mode: 'math' for pure math capability, 'reasoning' for reasoning quality + math",
     )
     parser.add_argument(
+        "--rollout-mode",
+        choices=SUPPORTED_MATH_ROLLOUT_MODES,
+        default=DEFAULT_MATH_ROLLOUT_MODE,
+        help="Rollout implementation: 'blackbox' uses the example rollout hook, "
+        "'whitebox' uses FlashRL's built-in ReAct rollout.",
+    )
+    parser.add_argument(
         "--debug-reward",
         action="store_true",
         help="Enable detailed reward computation logging for debugging",
@@ -668,12 +783,18 @@ def main(argv: list[str] | None = None) -> int:
             limit=args.train_limit,
             training_mode=args.training_mode,  # NEW
         )
+        system_prompt = build_math_system_prompt(args.training_mode)
+        rollout_impl = build_math_rollout(
+            rollout_mode=args.rollout_mode,
+            training_mode=args.training_mode,
+            system_prompt=system_prompt,
+        )
         # Create reward function wrapper that captures training_mode
         def reward_fn_with_mode(rollout: RolloutOutput) -> RewardOutput:
             return math_reward_fn(rollout, training_mode=args.training_mode, debug_reward=args.debug_reward)
         flashrl = FlashRL(
             config_path=args.config,
-            rollout_fn=reasoning_rollout_fn,
+            rollout_fn=rollout_impl,
             reward_fn=reward_fn_with_mode,
         )
         flashrl.train(dataset)

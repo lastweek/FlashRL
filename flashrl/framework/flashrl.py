@@ -8,7 +8,9 @@ import math
 import os
 from pathlib import Path
 import random
+import shutil
 import sys
+import tempfile
 import time
 from typing import Any, Callable, Sequence
 from uuid import uuid4
@@ -178,6 +180,7 @@ class FlashRL:
         self._restored_run_lifecycle_totals: dict[str, float] = {}
         self._runtime_bootstrap_events: list[dict[str, Any]] = []
         self._runtime_bootstrap_totals: dict[str, float] = {}
+        self._startup_artifact_dir: Path | None = None
         self._resume_from_checkpoint = False
         self._managed_resume: RestoredCheckpoint | None = None
         self._managed_resume_load_seconds = 0.0
@@ -283,11 +286,9 @@ class FlashRL:
         startup_total_seconds = 0.0
         self._apply_random_seed()
         self._emit_bootstrap_banner()
-
-        self._run_logger = RunLogger(
-            self.logging_config,
-            model_name=self.actor_config.model_name,
-        )
+        self._startup_artifact_dir = Path(
+            tempfile.mkdtemp(prefix="flashrl-runtime-")
+        ).resolve()
 
         self._emit_bootstrap_stage(
             "startup",
@@ -372,7 +373,7 @@ class FlashRL:
                 startup_logger=(
                     self._emit_bootstrap_console if self._bootstrap_console_enabled() else None
                 ),
-                log_dir=self._run_logger.run_dir,
+                log_dir=self._startup_artifact_dir,
             )
         )
         startup_total_seconds += duration_seconds
@@ -720,6 +721,9 @@ class FlashRL:
             if self._admin_server is not None:
                 self._admin_server.close()
                 self._admin_server = None
+            if self._startup_artifact_dir is not None:
+                shutil.rmtree(self._startup_artifact_dir, ignore_errors=True)
+                self._startup_artifact_dir = None
         self._serving_backend = None
         self._actor_backend = None
         self._reference_backend = None
@@ -800,10 +804,6 @@ class FlashRL:
 
     def _open_run_logger(self, run_state: TrainRunState) -> RunLogger:
         """Open and initialize the run-scoped logger for one training invocation."""
-        if self._run_logger is not None:
-            if self._managed_resume is None:
-                return self._run_logger
-
         assert self._actor_backend is not None
         assert self._serving_backend is not None
         run_open_kwargs = {
@@ -854,6 +854,9 @@ class FlashRL:
                 self.logging_config,
                 model_name=self.actor_config.model_name,
             )
+        set_log_dir = getattr(self._serving_backend, "set_log_dir", None)
+        if callable(set_log_dir):
+            set_log_dir(run_logger.run_dir)
         run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
         if self._managed_resume is not None:
             run_logger.resume_run(

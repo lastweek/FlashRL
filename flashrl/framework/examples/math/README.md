@@ -1,9 +1,14 @@
 # FlashRL Math Example
 
 This example is a strict R1-Zero-style math prototype with explicit dataset
-selection. It trains a base Qwen model with rule-based rewards only, uses no
-system prompt, and requires exactly one `<think>...</think>` block followed by
-one `<answer>...</answer>` block.
+selection. It trains a base Qwen model with rule-based rewards only, sets the
+system prompt explicitly in user code, and now supports both:
+
+- blackbox rollouts, where the example provides its own rollout function
+- whitebox rollouts, where the example builds a built-in `ReActRollout`
+
+In reasoning mode, the final answer must contain exactly one
+`<think>...</think>` block followed by one `<answer>...</answer>` block.
 
 The example keeps one simple split of responsibility:
 
@@ -84,6 +89,17 @@ Training still runs if the optional Pushgateway stack is unavailable.
 
 ## Primary Commands
 
+### Rollout Modes
+
+The example supports two rollout implementations:
+
+- `--rollout-mode blackbox`: the historical path where `train.py` / `eval.py`
+  pass a user-defined rollout function into `FlashRL(...)`
+- `--rollout-mode whitebox`: the new path where user code builds
+  `ReActRollout(system_prompt=..., tools=...)`
+
+The choice stays explicit in the example scripts. It is not hidden in YAML.
+
 ### Canonical managed vLLM training
 
 ```bash
@@ -105,6 +121,20 @@ python3 flashrl/framework/examples/math/train.py --config flashrl/framework/exam
 Use this when you want a smaller local run and `serving.debug_live_rollout`
 support for rollout debugging.
 
+### Whitebox training
+
+```bash
+python3 flashrl/framework/examples/math/train.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode reasoning \
+  --rollout-mode whitebox \
+  --train-limit 64
+```
+
+In whitebox mode, the example constructs a built-in `ReActRollout` with an
+explicit `system_prompt` and a subprocess-backed calculator tool.
+
 ## Common Run Scripts
 
 ### Quick Debug Runs (64 Samples)
@@ -119,7 +149,7 @@ python3 flashrl/framework/examples/math/train.py \
   --train-limit 64
 ```
 
-**GSM8K, Reasoning Mode (requires `<thinking>` tags):**
+**GSM8K, Reasoning Mode (requires `<think>` tags):**
 
 ```bash
 python3 flashrl/framework/examples/math/train.py \
@@ -139,7 +169,7 @@ python3 flashrl/framework/examples/math/train.py \
   --train-limit 64
 ```
 
-**AIME25, Reasoning Mode (requires `<thinking>` tags):**
+**AIME25, Reasoning Mode (requires `<think>` tags):**
 
 ```bash
 python3 flashrl/framework/examples/math/train.py \
@@ -312,6 +342,17 @@ python3 flashrl/framework/examples/math/eval.py \
   --checkpoint /tmp/flashrl_reasoning_checkpoint.pt
 ```
 
+Whitebox evaluation uses the same explicit switch:
+
+```bash
+python3 flashrl/framework/examples/math/eval.py \
+  --config flashrl/framework/examples/math/config_vllm.yaml \
+  --dataset gsm8k \
+  --training-mode reasoning \
+  --rollout-mode whitebox \
+  --eval-limit 50
+```
+
 This example is intentionally script-run. Like `code-single-turn`, the folder is
 hyphenated, so `train.py` and `eval.py` load the YAML profiles directly and
 construct `FlashRL(...)` in code instead of using `FlashRL.from_yaml(...)`.
@@ -338,7 +379,7 @@ python3 flashrl/framework/examples/math/train.py --training-mode reasoning
 ```
 
 - Evaluates both reasoning quality and answer correctness
-- Requires `<thinking>...</thinking>` tags in responses
+- Requires `<think>...</think>` tags in responses
 - Combines: 70% reasoning score + 30% math score
 - Reasoning score evaluates:
   - Presence of thinking tags
@@ -377,6 +418,12 @@ Available flags:
 - `--dataset`: choose `gsm8k` or `aime25`.
 - `--train-limit`: cap the number of training questions from the selected dataset.
 - `--training-mode`: choose `math` (default) or `reasoning`.
+- `--rollout-mode`: choose `blackbox` (default) or `whitebox`.
+
+The script constructs the system prompt explicitly in Python code through
+`build_math_system_prompt(...)`. In whitebox mode, that prompt is passed into
+`ReActRollout(system_prompt=...)`. In blackbox mode, the same prompt is prefixed
+into the example-owned rollout prompt so both paths stay behaviorally aligned.
 
 Training checkpointing is configured in YAML. The shipped example configs already
 save a final checkpoint under `run_dir/checkpoints/final.pt`.
@@ -418,6 +465,8 @@ Available flags:
 - `--checkpoint`: load a checkpoint before evaluation.
 - `--eval-limit`: cap the number of held-out questions from the selected dataset.
 - `--batch-size`: override the default eval batch size.
+- `--training-mode`: choose `math` or `reasoning`.
+- `--rollout-mode`: choose `blackbox` or `whitebox`.
 
 ## Controlling How Many Questions Are Used
 

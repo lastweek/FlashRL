@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import inspect
 from threading import Thread
 import time
 from typing import Any
@@ -236,12 +237,23 @@ class ActorModel:
         attention_mask = attention_mask.to(self.device)
         labels = labels.to(self.device)
 
-        outputs = self.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            use_cache=False,
-        )
+        forward_kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+            "labels": labels,
+        }
+        try:
+            signature = inspect.signature(self.model.forward)
+        except (TypeError, ValueError):
+            supports_use_cache = True
+        else:
+            supports_use_cache = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD or name == "use_cache"
+                for name, parameter in signature.parameters.items()
+            )
+        if supports_use_cache:
+            forward_kwargs["use_cache"] = False
+        outputs = self.model(**forward_kwargs)
         return outputs.logits
 
     def _configure_generation_special_tokens(self) -> None:

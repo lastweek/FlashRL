@@ -340,7 +340,7 @@ def build_rollout_record(
             }
         )
 
-        promoted_output, _ = promote_metadata_fields(
+        promoted_output, remaining_output_metadata = promote_metadata_fields(
             rollout_metadata,
             PROMOTED_OUTPUT_METADATA_KEYS,
         )
@@ -380,6 +380,7 @@ def build_rollout_record(
                         "tokens_per_second": tokens_per_second,
                         "log_prob": float(getattr(rollout, "log_prob", 0.0)),
                         "weight_version": weight_version,
+                        "metadata": remaining_output_metadata,
                         **output_stats,
                     }
                 ),

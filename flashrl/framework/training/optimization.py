@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import gc
 from dataclasses import dataclass
+import inspect
 from typing import TYPE_CHECKING, Any
 
 import torch
@@ -35,11 +36,22 @@ def reference_logits(
     with torch.no_grad():
         if hasattr(reference, "forward_logits"):
             return reference.forward_logits(input_ids, attention_mask)
-        return reference.model(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            use_cache=False,
-        ).logits
+        forward_kwargs: dict[str, Any] = {
+            "input_ids": input_ids,
+            "attention_mask": attention_mask,
+        }
+        try:
+            signature = inspect.signature(reference.model.forward)
+        except (TypeError, ValueError):
+            supports_use_cache = True
+        else:
+            supports_use_cache = any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD or name == "use_cache"
+                for name, parameter in signature.parameters.items()
+            )
+        if supports_use_cache:
+            forward_kwargs["use_cache"] = False
+        return reference.model(**forward_kwargs).logits
 
 
 def backward_step(optimizer: torch.optim.Optimizer, loss: torch.Tensor):

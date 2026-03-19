@@ -19,6 +19,7 @@ from flashrl.framework.config import (
     TrainerConfig,
 )
 from flashrl.framework.data_models import (
+    AssistantTurn,
     Conversation,
     LearnerBatch,
     Message,
@@ -29,6 +30,7 @@ from flashrl.framework.data_models import (
     ToolResult,
     TrainingBatch,
 )
+from flashrl.framework.agent import ReActRollout
 from flashrl.framework.flashrl import FlashRL
 from flashrl.framework.serving import (
     HuggingFaceServingBackend,
@@ -36,6 +38,7 @@ from flashrl.framework.serving import (
     VLLMServingBackend,
     create_serving_backend,
 )
+from flashrl.framework.tools import SubprocessToolRuntime, Tool
 from flashrl.framework.training import (
     FSDP2TrainingBackend,
     HuggingFaceTrainingBackend,
@@ -66,12 +69,17 @@ __all__ = [
     "Prompt",
     "Message",
     "Conversation",
+    "AssistantTurn",
     "LearnerBatch",
     "ToolCall",
     "ToolResult",
     "RolloutOutput",
     "RewardOutput",
     "TrainingBatch",
+    # Agent and tools
+    "ReActRollout",
+    "Tool",
+    "SubprocessToolRuntime",
     # Backends
     "ServingBackend",
     "HuggingFaceServingBackend",

@@ -6,19 +6,40 @@ evaluation helpers, one or more YAML configs, and an example-specific README.
 ## Math Example
 
 The math example is a strict R1-Zero-style math prototype with explicit
-dataset selection. It trains a base Qwen model with rule-based rewards, no
-system prompt, and a strict `<think>...</think><answer>...</answer>` output
-contract.
+dataset selection. It trains a base Qwen model with rule-based rewards and now
+supports both:
+
+- blackbox rollout construction in user code
+- whitebox rollout construction through built-in `ReActRollout`
+
+The example sets its system prompt explicitly in Python code and keeps the same
+strict `<think>...</think><answer>...</answer>` reasoning contract.
 
 See [flashrl/framework/examples/math/README.md](math/README.md) for:
 
 - supported run modes
+- blackbox vs whitebox rollout selection
 - the CLI-first example workflow
 - config differences
 - evaluation commands
 - environment variables
 - expected outputs and logs
 - troubleshooting
+
+## Agent Tools Demo
+
+The `agent-tools` example is a tiny offline whitebox demo. It focuses only on
+the new agent/tool API surface:
+
+- explicit `ReActRollout(system_prompt=...)`
+- subprocess-backed tools
+- parallel tool calls in one assistant step
+
+Run it with:
+
+```bash
+python3 flashrl/framework/examples/agent-tools/run.py
+```
 
 ## Reasoning-Code Example
 

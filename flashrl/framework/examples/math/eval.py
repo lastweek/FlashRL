@@ -25,6 +25,8 @@ def evaluate_model(
     *,
     dataset: list[Prompt],
     batch_size: int,
+    rollout_fn=None,
+    training_mode: str = "reasoning",
 ) -> dict[str, float | int]:
     """Run held-out evaluation against the current serving backend."""
     if batch_size < 1:
@@ -46,12 +48,13 @@ def evaluate_model(
     format_passes = 0
     truncations = 0
     sample_count = 0
+    effective_rollout_fn = rollout_fn or reasoning_math_example.reasoning_rollout_fn
 
     for start in range(0, len(dataset), batch_size):
         prompts = dataset[start:start + batch_size]
-        rollouts = reasoning_math_example.reasoning_rollout_fn(prompts, flashrl._serving_backend)
+        rollouts = effective_rollout_fn(prompts, flashrl._serving_backend)
         rewards = [
-            reasoning_math_example.math_reward_fn(rollout, training_mode=args.training_mode)
+            reasoning_math_example.math_reward_fn(rollout, training_mode=training_mode)
             for rollout in rollouts
         ]
         for reward in rewards:
@@ -118,6 +121,13 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="math",
         help="Training mode for evaluation: 'math' for pure math, 'reasoning' for reasoning + math",
     )
+    parser.add_argument(
+        "--rollout-mode",
+        choices=reasoning_math_example.SUPPORTED_MATH_ROLLOUT_MODES,
+        default=reasoning_math_example.DEFAULT_MATH_ROLLOUT_MODE,
+        help="Rollout implementation: 'blackbox' uses the example rollout hook, "
+        "'whitebox' uses FlashRL's built-in ReAct rollout.",
+    )
     return parser
 
 
@@ -140,10 +150,16 @@ def main(argv: list[str] | None = None) -> int:
             default_checkpoint = Path(reasoning_math_example.DEFAULT_REASONING_CHECKPOINT_PATH)
             if default_checkpoint.exists():
                 checkpoint = str(default_checkpoint)
+        system_prompt = reasoning_math_example.build_math_system_prompt(args.training_mode)
+        rollout_impl = reasoning_math_example.build_math_rollout(
+            rollout_mode=args.rollout_mode,
+            training_mode=args.training_mode,
+            system_prompt=system_prompt,
+        )
 
         flashrl = FlashRL(
             config_path=args.config,
-            rollout_fn=reasoning_math_example.reasoning_rollout_fn,
+            rollout_fn=rollout_impl,
             reward_fn=reasoning_math_example.math_reward_fn,
         )
         if checkpoint:
@@ -152,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
             flashrl,
             dataset=dataset,
             batch_size=batch_size,
+            rollout_fn=rollout_impl,
+            training_mode=args.training_mode,
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:

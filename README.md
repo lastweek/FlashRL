@@ -47,13 +47,27 @@ rm -rf .cache/
 ### Run the Math Example
 
 The math example now lives in its own folder with a thin training script
-and a YAML config:
+and a YAML config. It supports both the historical blackbox rollout path and
+the new built-in whitebox `ReActRollout` path:
 
 ```bash
 python3 flashrl/framework/examples/math/train.py
 ```
 
+```bash
+python3 flashrl/framework/examples/math/train.py --rollout-mode whitebox
+```
+
 See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.
+
+### Run the Agent Tools Demo
+
+The whitebox agent/tools demo is a small offline script that shows explicit
+`system_prompt`, subprocess-backed tools, and parallel tool calls:
+
+```bash
+python3 flashrl/framework/examples/agent-tools/run.py
+```
 
 ### Run the Code Example
 
@@ -105,9 +119,10 @@ Older `.flashrl-runs/` directories remain viewable if you already have them.
 - Model wrappers (Actor, Reference, Critic)
 - GRPO trainer structure
 - Training pipeline examples
+- Whitebox ReAct rollouts with subprocess-backed tools
 
 **Next steps:**
 - Real rollout generation with models
 - Real GRPO loss computation
-- Multi-turn conversations
-- Tool execution
+- Strategy libraries on top of the whitebox agent loop
+- Additional safe runtimes beyond subprocess isolation

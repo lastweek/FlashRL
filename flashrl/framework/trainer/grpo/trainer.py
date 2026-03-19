@@ -370,20 +370,46 @@ class GRPOTrainer:
         prompt_token_ids = []
         response_token_ids = []
         response_token_logprobs = []
-        for rollout in batch.rollouts:
+        expanded_advantages: list[float] = []
+        expanded_prompt_indices: list[int] = []
+        expanded_candidate_indices: list[int] = []
+        advantage_values = advantages.cpu().numpy().tolist()
+        for rollout, advantage, prompt_index, candidate_index in zip(
+            batch.rollouts,
+            advantage_values,
+            batch.prompt_indices,
+            batch.candidate_indices,
+            strict=True,
+        ):
+            turns = getattr(rollout, "assistant_turns", [])
+            if turns:
+                for turn in turns:
+                    prompt_token_ids.append([int(token_id) for token_id in turn.prompt_token_ids])
+                    response_token_ids.append([int(token_id) for token_id in turn.response_token_ids])
+                    response_token_logprobs.append(
+                        [float(value) for value in turn.response_token_logprobs]
+                    )
+                    expanded_advantages.append(float(advantage))
+                    expanded_prompt_indices.append(int(prompt_index))
+                    expanded_candidate_indices.append(int(candidate_index))
+                continue
+
             prompt_token_ids.append([int(token_id) for token_id in rollout.prompt_token_ids])
             response_token_ids.append([int(token_id) for token_id in rollout.response_token_ids])
             response_token_logprobs.append([float(value) for value in rollout.response_token_logprobs])
+            expanded_advantages.append(float(advantage))
+            expanded_prompt_indices.append(int(prompt_index))
+            expanded_candidate_indices.append(int(candidate_index))
 
         return LearnerBatch(
             prompt_token_ids=prompt_token_ids,
             response_token_ids=response_token_ids,
             response_token_logprobs=response_token_logprobs,
-            advantages=advantages.cpu().numpy().tolist(),
+            advantages=expanded_advantages,
             group_size=batch.group_size,
             prompt_count=batch.prompt_count,
-            prompt_indices=list(batch.prompt_indices),
-            candidate_indices=list(batch.candidate_indices),
+            prompt_indices=expanded_prompt_indices,
+            candidate_indices=expanded_candidate_indices,
             metadata=dict(batch.metadata),
         )
 

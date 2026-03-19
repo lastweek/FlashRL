@@ -65,6 +65,14 @@ class WeightVersionInfo(BaseModel):
     origin: Literal["startup", "sync", "resume"]
 
 
+class AssistantTurn(BaseModel):
+    """One assistant-generation segment captured within a whitebox rollout."""
+
+    prompt_token_ids: list[int]
+    response_token_ids: list[int]
+    response_token_logprobs: list[float]
+
+
 class RolloutOutput(BaseModel):
     """Output from rollout generation."""
 
@@ -73,6 +81,7 @@ class RolloutOutput(BaseModel):
     prompt_token_ids: list[int]
     response_token_ids: list[int]
     response_token_logprobs: list[float]
+    assistant_turns: list[AssistantTurn] = Field(default_factory=list)
     conversation: Conversation
     metadata: dict[str, Any] = Field(default_factory=dict)
 

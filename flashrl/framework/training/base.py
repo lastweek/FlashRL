@@ -5,6 +5,7 @@ from __future__ import annotations
 from abc import ABC
 import copy
 from dataclasses import dataclass, field
+import inspect
 from typing import Any, Literal
 
 import torch
@@ -24,6 +25,41 @@ from flashrl.framework.training.optimization import (
 
 
 BackendRole = Literal["actor", "reference"]
+
+
+def _model_accepts_use_cache(model: Any) -> bool:
+    """Return whether the target module forward accepts a ``use_cache`` kwarg."""
+    cached = getattr(model, "_flashrl_accepts_use_cache", None)
+    if isinstance(cached, bool):
+        return cached
+
+    try:
+        signature = inspect.signature(model.forward)
+    except (TypeError, ValueError):
+        supports_use_cache = True
+    else:
+        supports_use_cache = any(
+            parameter.kind is inspect.Parameter.VAR_KEYWORD or name == "use_cache"
+            for name, parameter in signature.parameters.items()
+        )
+    setattr(model, "_flashrl_accepts_use_cache", supports_use_cache)
+    return supports_use_cache
+
+
+def _forward_model_logits(
+    model: Any,
+    *,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Forward a causal LM while disabling KV cache only when supported."""
+    forward_kwargs: dict[str, Any] = {
+        "input_ids": input_ids,
+        "attention_mask": attention_mask,
+    }
+    if _model_accepts_use_cache(model):
+        forward_kwargs["use_cache"] = False
+    return model(**forward_kwargs).logits
 
 
 @dataclass
@@ -123,11 +159,11 @@ class TrainingBackend(ABC):
         attention_mask: torch.Tensor,
     ) -> torch.Tensor:
         """Run one backend-owned forward pass and return logits."""
-        return self.model_copy.model(
+        return _forward_model_logits(
+            self.model_copy.model,
             input_ids=input_ids,
             attention_mask=attention_mask,
-            use_cache=False,
-        ).logits
+        )
 
     def export_state(self) -> dict[str, Any]:
         """Return the backend-owned checkpoint payload for this role."""
@@ -264,11 +300,11 @@ class ReferenceTrainingBackend(TrainingBackend):
     ) -> torch.Tensor:
         """Run forward pass with torch.no_grad() for efficiency."""
         with torch.no_grad():
-            return self.model_copy.model(
+            return _forward_model_logits(
+                self.model_copy.model,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
-                use_cache=False,
-            ).logits
+            )
 
     def backward_step(self, loss: torch.Tensor):
         """Reference models do not support backward passes."""

@@ -8,7 +8,12 @@ import re
 from typing import Any, Callable, Protocol
 import warnings
 
-from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+try:
+    from prometheus_client import CollectorRegistry, Gauge, push_to_gateway
+except ImportError:  # pragma: no cover - depends on optional local metrics deps
+    CollectorRegistry = None
+    Gauge = None
+    push_to_gateway = None
 
 from flashrl.framework.config import (
     MetricsConfig,
@@ -334,6 +339,10 @@ class PrometheusMetricsSink:
         push_fn: Callable[..., None] | None = None,
     ) -> None:
         """Initialize the registry and gauges for one FlashRL process."""
+        if CollectorRegistry is None or Gauge is None or push_to_gateway is None:
+            raise RuntimeError(
+                "prometheus_client is required when Pushgateway metrics are enabled."
+            )
         self.config = config
         self.registry = CollectorRegistry()
         self.push_fn = push_fn or push_to_gateway

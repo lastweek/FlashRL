@@ -167,6 +167,11 @@ class VLLMServingBackend(ServingBackend):
         with self._lifecycle_lock:
             self.generation_defaults = dict(kwargs)
 
+    def set_log_dir(self, log_dir: str | Path | None) -> None:
+        """Update the backend-owned artifact directory for future snapshots/logs."""
+        with self._lifecycle_lock:
+            self._log_dir = Path(log_dir) if log_dir else None
+
     def list_admin_objects(self) -> list[dict[str, Any]]:
         """Return one admin object per managed vLLM replica."""
         items: list[dict[str, Any]] = []

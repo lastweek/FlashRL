@@ -146,6 +146,21 @@ class UserDefinedRollout:
 
     def _validate_rollout_output(self, rollout: RolloutOutput) -> None:
         """Validate that rollout outputs contain the token data required by GRPO."""
+        if rollout.assistant_turns:
+            for turn in rollout.assistant_turns:
+                if not turn.prompt_token_ids:
+                    raise ValueError(
+                        "AssistantTurn.prompt_token_ids must be populated for GRPO training."
+                    )
+                if turn.response_token_logprobs and (
+                    len(turn.response_token_logprobs) != len(turn.response_token_ids)
+                ):
+                    raise ValueError(
+                        "AssistantTurn.response_token_logprobs must match "
+                        "AssistantTurn.response_token_ids."
+                    )
+            return
+
         if not rollout.prompt_token_ids:
             raise ValueError("RolloutOutput.prompt_token_ids must be populated for GRPO training.")
         if rollout.response_token_logprobs and (
