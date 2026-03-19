@@ -19,9 +19,8 @@ for candidate in (REPO_ROOT, EXAMPLE_DIR):
         sys.path.insert(0, candidate_text)
 
 from flashrl.framework import FlashRL
+from flashrl.framework.agent import Agent
 from flashrl.framework.data_models import (
-    Conversation,
-    Message,
     Prompt,
     RewardOutput,
     RolloutOutput,
@@ -712,36 +711,15 @@ def make_code_reward_fn(
 # Rollout hook
 
 
-def reasoning_code_rollout_fn(
-    prompts: list[Prompt],
-    serving_backend,
-) -> list[RolloutOutput]:
-    """Generate one rollout per prompt with prompt metadata attached."""
-    samples = serving_backend.generate_batch([prompt.text for prompt in prompts])
-    rollouts: list[RolloutOutput] = []
-    for prompt, sample in zip(prompts, samples, strict=True):
-        # The reward only sees RolloutOutput, so we copy the prompt metadata here
-        # instead of reparsing the original prompt text later.
-        rollouts.append(
-            RolloutOutput(
-                text=sample.text,
-                log_prob=sample.log_prob,
-                prompt_token_ids=sample.prompt_token_ids,
-                response_token_ids=sample.response_token_ids,
-                response_token_logprobs=sample.response_token_logprobs,
-                metadata={
-                    **dict(sample.metadata),
-                    "prompt_metadata": dict(prompt.metadata),
-                },
-                conversation=Conversation(
-                    messages=[
-                        Message(role="user", content=prompt.text),
-                        Message(role="assistant", content=sample.text),
-                    ]
-                ),
-            )
-        )
-    return rollouts
+def build_code_agent() -> Agent:
+    """Build the single-turn Agent used by both training and evaluation."""
+
+    def run(agent: Agent) -> None:
+        sample = agent.generate(agent.prompt.text)
+        agent.record_generation(sample)
+        agent.finish(sample.text)
+
+    return Agent(run_fn=run, max_steps=1)
 
 
 def find_default_vllm_python() -> str | None:
@@ -859,7 +837,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         flashrl = FlashRL(
             config_path=args.config,
-            rollout_fn=reasoning_code_rollout_fn,
+            rollout_fn=build_code_agent(),
             reward_fn=make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),
                 memory_limit_mb=args.memory_limit_mb,

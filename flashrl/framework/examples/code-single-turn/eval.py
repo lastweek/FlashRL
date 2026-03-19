@@ -17,11 +17,13 @@ for candidate in (REPO_ROOT, EXAMPLE_DIR):
 import train as code_example
 
 from flashrl.framework import FlashRL
+from flashrl.framework.agent import Agent
 from flashrl.framework.data_models import Prompt
 
 
 def evaluate_model(
     flashrl: FlashRL,
+    rollout_agent: Agent,
     *,
     dataset: list[Prompt],
     batch_size: int,
@@ -58,7 +60,7 @@ def evaluate_model(
 
     for start in range(0, len(dataset), batch_size):
         prompts = dataset[start:start + batch_size]
-        rollouts = code_example.reasoning_code_rollout_fn(prompts, flashrl._serving_backend)
+        rollouts = rollout_agent.run_batch(prompts, flashrl._serving_backend)
         rewards = [reward_fn(rollout) for rollout in rollouts]
         for reward in rewards:
             sample_count += 1
@@ -162,6 +164,7 @@ def main(argv: list[str] | None = None) -> int:
 
     flashrl: FlashRL | None = None
     try:
+        rollout_agent = code_example.build_code_agent()
         dataset = code_example.build_code_eval_dataset(
             limit=args.eval_limit,
             rating_min=args.rating_min,
@@ -177,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
 
         flashrl = FlashRL(
             config_path=args.config,
-            rollout_fn=code_example.reasoning_code_rollout_fn,
+            rollout_fn=rollout_agent,
             reward_fn=code_example.make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),
                 memory_limit_mb=args.memory_limit_mb,
@@ -188,6 +191,7 @@ def main(argv: list[str] | None = None) -> int:
             flashrl.load_checkpoint(checkpoint)
         metrics = evaluate_model(
             flashrl,
+            rollout_agent,
             dataset=dataset,
             batch_size=args.batch_size,
             run_timeout_seconds=float(args.run_timeout_seconds),

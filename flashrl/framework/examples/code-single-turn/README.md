@@ -2,12 +2,14 @@
 
 This example is a strict R1-style Codeforces prototype with local execution
 reward. It trains a base Qwen coder model on `open-r1/codeforces`
-`verifiable-prompts`, uses no system prompt, and requires exactly one
+`verifiable-prompts`, uses FlashRL's built-in `Agent` for a single-turn rollout,
+uses no system prompt, and requires exactly one
 `<think>...</think>` block followed by one `<answer>...</answer>` block that
 contains exactly one fenced Python code block.
 
 It is a simple, local, single-turn prototype:
 
+- built-in `Agent`, but no multi-step agent loop
 - Python only
 - official tests first
 - default `rating <= 1600`
@@ -20,8 +22,8 @@ Run the commands below from the repository root.
 
 ## Files In This Folder
 
-- `train.py`: main Codeforces training entrypoint and example logic.
-- `eval.py`: held-out evaluation entrypoint.
+- `train.py`: main Codeforces training entrypoint and the shared single-turn `Agent` builder.
+- `eval.py`: held-out evaluation entrypoint using the same `Agent`.
 - `executor.py`: local Python execution helper for official tests and checkers.
 - `config.yaml`: cheap local Hugging Face profile.
 - `config_vllm.yaml`: canonical managed local vLLM profile.

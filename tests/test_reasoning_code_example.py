@@ -9,6 +9,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flashrl.framework.agent import Agent
 from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
 
 pytestmark = pytest.mark.unit
@@ -35,24 +36,29 @@ def load_script_module(
 
 code_basic_executor = load_script_module(
     "flashrl_code_basic_executor",
-    "flashrl.framework.examples.code-single-turn/executor.py",
+    "flashrl/framework/examples/code-single-turn/executor.py",
     aliases=("executor",),
 )
 code_basic = load_script_module(
     "flashrl_code_basic_train",
-    "flashrl.framework.examples.code-single-turn/train.py",
+    "flashrl/framework/examples/code-single-turn/train.py",
     aliases=("train",),
 )
 code_basic_eval = load_script_module(
     "flashrl_code_basic_eval",
-    "flashrl.framework.examples.code-single-turn/eval.py",
+    "flashrl/framework/examples/code-single-turn/eval.py",
 )
 
 
-def make_prompt(*, task_id: str = "codeforces-train-1", rating: int = 1200) -> Prompt:
+def make_prompt(
+    *,
+    task_id: str = "codeforces-train-1",
+    rating: int = 1200,
+    training_mode: str = "code",
+) -> Prompt:
     """Build one strict code prompt with minimal metadata."""
     return Prompt(
-        text=code_basic.render_code_prompt("Write a program that prints 42."),
+        text=code_basic.render_code_prompt("Write a program that prints 42.", training_mode=training_mode),
         metadata={
             "task_id": task_id,
             "source": code_basic.DEFAULT_CODEFORCES_HF_DATASET,
@@ -93,12 +99,43 @@ def make_rollout(
 
 def test_render_code_prompt_enforces_strict_contract() -> None:
     """The code example should keep the same visible strict output contract."""
-    prompt = code_basic.render_code_prompt("Solve X.")
+    prompt = code_basic.render_code_prompt("Solve X.", training_mode="reasoning-code")
 
     assert "<think>...</think>" in prompt
     assert "<answer>...</answer>" in prompt
     assert "fenced Python code block" in prompt
     assert "Do not output any text before <think> or after </answer>." in prompt
+
+
+def test_build_code_agent_returns_single_turn_agent_with_prompt_metadata() -> None:
+    """The example should expose one built-in Agent with the original prompt contract."""
+
+    class FakeServingBackend:
+        def generate_batch(self, prompt_texts: list[str], **kwargs):
+            del kwargs
+            assert prompt_texts == [code_basic.render_code_prompt("Write a program that prints 42.")]
+            return [
+                SimpleNamespace(
+                    text="<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+                    prompt_token_ids=[1, 2, 3],
+                    response_token_ids=[4, 5, 6],
+                    response_token_logprobs=[-0.1, -0.1, -0.1],
+                    log_prob=-0.3,
+                    metadata={"finish_reason": "stop"},
+                )
+            ]
+
+    agent = code_basic.build_code_agent()
+    prompt = make_prompt()
+    rollout = agent.run_batch([prompt], FakeServingBackend())[0]
+
+    assert isinstance(agent, Agent)
+    assert rollout.text == "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>"
+    assert [message.role for message in rollout.conversation.messages] == ["user", "assistant"]
+    assert rollout.metadata["prompt_metadata"] == prompt.metadata
+    assert rollout.metadata["stop_reason"] == "final"
+    assert rollout.metadata["assistant_turn_count"] == 1
+    assert len(rollout.assistant_turns) == 1
 
 
 def test_build_code_train_dataset_filters_python_stdio_rating_and_prints_summary(
@@ -215,7 +252,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Reward cases should mirror the code example's 1.1 / 1.0 / 0.1 / 0.0 behavior."""
-    prompt = make_prompt()
+    prompt = make_prompt(training_mode="reasoning-code")
     code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
@@ -252,6 +289,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         ),
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
     trailing = code_basic.score_code_rollout(
         make_rollout(
@@ -260,6 +298,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         ),
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
     strict_wrong = code_basic.score_code_rollout(
         make_rollout(
@@ -268,6 +307,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         ),
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
     missing_fence = code_basic.score_code_rollout(
         make_rollout(
@@ -276,6 +316,7 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
         ),
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
 
     assert perfect.reward == pytest.approx(1.1)
@@ -295,15 +336,15 @@ def test_score_code_rollout_uses_execution_reward_and_strict_format(
     assert strict_wrong.metadata["code_preview"] == "print(0)"
     assert missing_fence.reward == pytest.approx(0.0)
     assert missing_fence.metadata["format_pass"] is False
-    assert missing_fence.metadata["failure_reason"] == "invalid_code_fence"
-    assert missing_fence.metadata["execution_status"] == "invalid_code_fence"
+    assert missing_fence.metadata["failure_reason"] == "missing_code"
+    assert missing_fence.metadata["execution_status"] == "missing_code"
     assert missing_fence.metadata["code_preview"] == "print(42)"
 
     output = capsys.readouterr().out
     assert "code     task=codeforces-train-1" in output
     assert "status=passed" in output
     assert "status=wrong_answer" in output
-    assert "status=invalid_code_fence" in output
+    assert "status=missing_code" in output
     assert "preview  print(42)" in output
     assert "preview  print(0)" in output
 
@@ -313,7 +354,7 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
     capsys: pytest.CaptureFixture[str],
 ) -> None:
     """Length truncation should remove the format bonus even when tests pass."""
-    prompt = make_prompt(task_id="codeforces-train-trunc")
+    prompt = make_prompt(task_id="codeforces-train-trunc", training_mode="reasoning-code")
     code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompt.metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
         "checker_code": None,
@@ -341,6 +382,7 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
         ),
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
 
     assert reward.reward == pytest.approx(1.0)
@@ -440,8 +482,8 @@ def test_prepare_code_basic_environment_sets_default_vllm_runtime(
         lambda: "/tmp/fake-vllm-python",
     )
 
-    code_basic.prepare_code_basic_environment(
-        "flashrl.framework.examples.code-single-turn/config_vllm.yaml"
+    code_basic.prepare_reasoning_code_environment(
+        "flashrl/framework/examples/code-single-turn/config_vllm.yaml"
     )
 
     assert "FLASHRL_VLLM_PYTHON" in sys.modules["os"].environ
@@ -480,23 +522,23 @@ def test_code_basic_main_uses_profile_aware_flashrl_constructor(
 
     assert exit_code == 0
     assert captured["config_path"] == "flashrl.framework.examples.code-single-turn/config.yaml"
-    assert callable(captured["rollout_fn"])
+    assert isinstance(captured["rollout_fn"], Agent)
     assert callable(captured["reward_fn"])
     assert "checkpoint_out" not in captured
 
 
 def test_code_basic_train_is_the_real_example_module() -> None:
     """train.py should hold the actual code example logic without workflow indirection."""
-    train_source = Path("flashrl.framework.examples.code-single-turn/train.py").read_text(
+    train_source = Path("flashrl/framework/examples/code-single-turn/train.py").read_text(
         encoding="utf-8"
     )
-    eval_source = Path("flashrl.framework.examples.code-single-turn/eval.py").read_text(
+    eval_source = Path("flashrl/framework/examples/code-single-turn/eval.py").read_text(
         encoding="utf-8"
     )
     assert "WORKFLOW_PATH" not in train_source
     assert "exec(compile(" not in train_source
     assert "import train as code_example" in eval_source
-    assert not Path("flashrl.framework.examples.code-single-turn/workflow.py").exists()
+    assert not Path("flashrl/framework/examples/code-single-turn/workflow.py").exists()
 
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
@@ -504,8 +546,8 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
 ) -> None:
     """Held-out evaluation should aggregate solve-rate style metrics."""
     prompts = [
-        make_prompt(task_id="codeforces-test-1", rating=900),
-        make_prompt(task_id="codeforces-test-2", rating=1000),
+        make_prompt(task_id="codeforces-test-1", rating=900, training_mode="reasoning-code"),
+        make_prompt(task_id="codeforces-test-2", rating=1000, training_mode="reasoning-code"),
     ]
     code_basic.CODEFORCES_EXECUTION_PAYLOADS[prompts[0].metadata["task_id"]] = {
         "official_tests": [{"input": "", "output": "42\n"}],
@@ -579,19 +621,22 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
                     )
             return outputs
 
-    prompts[0].text = code_basic.render_code_prompt("Write code that prints 42.")
-    prompts[1].text = code_basic.render_code_prompt("Write code that prints 0.")
+    prompts[0].text = code_basic.render_code_prompt("Write code that prints 42.", training_mode="reasoning-code")
+    prompts[1].text = code_basic.render_code_prompt("Write code that prints 0.", training_mode="reasoning-code")
     flashrl = SimpleNamespace(
         _serving_backend=FakeServingBackend(),
         rollout_config=SimpleNamespace(max_new_tokens=96),
     )
+    rollout_agent = code_basic.build_code_agent()
 
     metrics = code_basic_eval.evaluate_model(
         flashrl,
+        rollout_agent,
         dataset=prompts,
         batch_size=2,
         run_timeout_seconds=1.0,
         memory_limit_mb=256,
+        training_mode="reasoning-code",
     )
 
     assert flashrl._serving_backend.generation_defaults == {
