@@ -4,14 +4,14 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from flashrl.framework.distributed.local import LocalServingClient
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     ActivateWeightVersionResponse,
     GenerateGroupedRequest,
     GenerateGroupedResponse,
 )
-from flashrl.framework.services.common import install_common_routes
+from flashrl.framework.distributed.server_common import install_common_routes
+from flashrl.framework.distributed.serving_client import LocalServingClient
 
 
 def create_serving_app(client: LocalServingClient) -> FastAPI:
@@ -22,6 +22,7 @@ def create_serving_app(client: LocalServingClient) -> FastAPI:
         status_getter=lambda: client.status().status,
         kind="ServingService",
         name="serving",
+        drainable=True,
     )
 
     @app.post("/v1/generate-grouped")

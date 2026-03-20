@@ -4,9 +4,9 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from flashrl.framework.distributed.local import LocalRewardClient
 from flashrl.framework.distributed.models import RewardBatchRequest, RewardBatchResponse
-from flashrl.framework.services.common import install_common_routes
+from flashrl.framework.distributed.reward_client import LocalRewardClient
+from flashrl.framework.distributed.server_common import install_common_routes
 
 
 def create_reward_app(client: LocalRewardClient) -> FastAPI:
@@ -17,6 +17,7 @@ def create_reward_app(client: LocalRewardClient) -> FastAPI:
         status_getter=lambda: client.status().status,
         kind="RewardService",
         name="reward",
+        drainable=True,
     )
 
     @app.post("/v1/reward-batches")

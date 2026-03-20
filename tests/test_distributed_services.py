@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
 
 from fastapi.testclient import TestClient
 import pytest
@@ -12,27 +13,23 @@ import flashrl.framework.serving.huggingface as serving_module
 import flashrl.framework.training.huggingface as training_module
 from flashrl.framework.config import GrpoConfig, RolloutConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
-from flashrl.framework.distributed.http import HttpServingClient
-from flashrl.framework.distributed.local import (
+from flashrl.framework.distributed import (
+    ActivateWeightVersionRequest,
+    HttpServingClient,
     LocalLearnerClient,
     LocalRewardClient,
     LocalRolloutClient,
     LocalServingClient,
-)
-from flashrl.framework.distributed.models import (
-    ActivateWeightVersionRequest,
     OptimizeStepRequest,
     RewardBatchRequest,
     RolloutBatchRequest,
     StatusResponse,
-)
-from flashrl.framework.rollout.base import build_rollout_generator
-from flashrl.framework.services import (
     create_learner_app,
     create_reward_app,
     create_rollout_app,
     create_serving_app,
 )
+from flashrl.framework.rollout.base import build_rollout_generator
 from flashrl.framework.training import HuggingFaceTrainingBackend
 from flashrl.framework.serving import HuggingFaceServingBackend
 from tests.conftest import TinyActor
@@ -230,7 +227,7 @@ def test_http_serving_client_parses_status_responses(
         return _Response()
 
     monkeypatch.setattr(
-        "flashrl.framework.distributed.http.urllib_request.urlopen",
+        "flashrl.framework.distributed.client_common.urllib_request.urlopen",
         fake_urlopen,
     )
 
@@ -242,3 +239,113 @@ def test_http_serving_client_parses_status_responses(
     }
     assert response.status.name == "serving"
     assert response.status.ready_replica_count == 2
+
+
+def test_rollout_service_reports_load_and_drains_during_inflight_requests() -> None:
+    """Drain should flip readiness and expose load metadata while requests are still running."""
+    request_started = threading.Event()
+    release_request = threading.Event()
+
+    class _BlockingRolloutGenerator:
+        def __init__(self) -> None:
+            self.config = RolloutConfig(max_new_tokens=8)
+
+        def generate_grouped(self, prompts, group_size):
+            request_started.set()
+            release_request.wait(timeout=2.0)
+            rollouts = [
+                RolloutOutput(
+                    text=f"reply-{index}",
+                    log_prob=-0.1,
+                    prompt_token_ids=[1],
+                    response_token_ids=[2],
+                    response_token_logprobs=[-0.1],
+                    conversation=Conversation(
+                        messages=[
+                            Message(role="user", content=prompt.text),
+                            Message(role="assistant", content=f"reply-{index}"),
+                        ]
+                    ),
+                    metadata={"weight_version": {"version_id": 0, "origin": "startup", "model_source": "local://startup"}},
+                )
+                for index, prompt in enumerate(prompts)
+                for _ in range(group_size)
+            ]
+            prompt_indices = [index for index, _prompt in enumerate(prompts) for _ in range(group_size)]
+            candidate_indices = [candidate for _index, _prompt in enumerate(prompts) for candidate in range(group_size)]
+            return prompts, rollouts, prompt_indices, candidate_indices
+
+    app = create_rollout_app(LocalRolloutClient(_BlockingRolloutGenerator()))
+    client = TestClient(app)
+
+    response_holder: dict[str, object] = {}
+
+    def _request_rollout() -> None:
+        response_holder["response"] = client.post(
+            "/v1/rollout-batches",
+            json=RolloutBatchRequest(
+                step_id=9,
+                prompts=[Prompt(text="slow")],
+                group_size=2,
+            ).model_dump(mode="json"),
+        )
+
+    worker = threading.Thread(target=_request_rollout)
+    worker.start()
+    assert request_started.wait(timeout=1.0) is True
+
+    status_payload = client.get("/v1/status").json()["status"]
+    assert status_payload["metadata"]["inflightRequests"] == 1
+    assert status_payload["metadata"]["queueDepth"] == 0
+    assert "p95LatencySeconds" in status_payload["metadata"]
+
+    drain_response = client.post("/v1/lifecycle/drain?wait_seconds=0.1")
+    assert drain_response.status_code == 200
+    assert drain_response.json()["status"] == "draining"
+
+    ready = client.get("/readyz")
+    assert ready.status_code == 503
+
+    release_request.set()
+    worker.join(timeout=2.0)
+    response = response_holder["response"]
+    assert response.status_code == 200
+
+    drained_status = client.get("/v1/status").json()["status"]
+    assert drained_status["metadata"]["inflightRequests"] == 0
+    assert drained_status["metadata"]["draining"] is True
+
+
+def test_distributed_package_reexports_clients_and_servers() -> None:
+    """The consolidated distributed package should expose clients and app factories directly."""
+    from flashrl.framework.distributed import (
+        HttpServingClient as ImportedHttpServingClient,
+        LocalLearnerClient as ImportedLocalLearnerClient,
+        create_reward_app as imported_create_reward_app,
+    )
+
+    assert ImportedHttpServingClient is HttpServingClient
+    assert ImportedLocalLearnerClient is LocalLearnerClient
+    assert imported_create_reward_app is create_reward_app
+
+
+def test_repo_imports_use_consolidated_distributed_layout() -> None:
+    """Repo Python imports should not reference the removed service or split client modules."""
+    repo_root = Path(__file__).resolve().parents[1]
+    legacy_paths = [
+        ".".join(["flashrl", "framework", "services"]),
+        ".".join(["flashrl", "framework", "distributed", "http"]),
+        ".".join(["flashrl", "framework", "distributed", "local"]),
+    ]
+
+    offenders: list[str] = []
+    for base in (repo_root / "flashrl", repo_root / "tests"):
+        for path in base.rglob("*.py"):
+            if path == Path(__file__).resolve():
+                continue
+            content = path.read_text(encoding="utf-8")
+            for legacy_path in legacy_paths:
+                if legacy_path in content:
+                    offenders.append(f"{path.relative_to(repo_root)}:{legacy_path}")
+
+    assert offenders == []

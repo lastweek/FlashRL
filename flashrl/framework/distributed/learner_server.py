@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from fastapi import FastAPI
 
-from flashrl.framework.distributed.local import LocalLearnerClient
+from flashrl.framework.distributed.learner_client import LocalLearnerClient
 from flashrl.framework.distributed.models import (
     LoadCheckpointRequest,
     LoadCheckpointResponse,
@@ -13,7 +13,7 @@ from flashrl.framework.distributed.models import (
     SaveCheckpointRequest,
     SaveCheckpointResponse,
 )
-from flashrl.framework.services.common import install_common_routes
+from flashrl.framework.distributed.server_common import install_common_routes
 
 
 def create_learner_app(client: LocalLearnerClient) -> FastAPI:

@@ -8,7 +8,7 @@ import pytest
 
 from flashrl.platform.cli import main as platform_main
 from flashrl.platform.crd import FlashRLJob, flashrljob_crd_manifest
-from flashrl.platform.operator import render_child_resources
+from flashrl.platform.operator import render_child_resources, render_operator_resources
 
 
 pytestmark = pytest.mark.unit
@@ -66,6 +66,51 @@ def test_render_child_resources_builds_expected_workloads() -> None:
     assert kinds.count("StatefulSet") == 1
     assert kinds.count("Service") == 5
     assert kinds.count("ConfigMap") == 1
+
+
+def test_flashrl_job_defaults_platform_policy_knobs() -> None:
+    """Platform mode should fill autoscaling and failure defaults for the operator."""
+    job = FlashRLJob.model_validate(_job_payload())
+
+    assert job.spec.controller.autoscaling is not None
+    assert job.spec.controller.autoscaling.enabled is False
+    assert job.spec.learner.failurePolicy is not None
+    assert job.spec.learner.failurePolicy.mode == "restart-workload"
+    assert job.spec.servingPool.autoscaling is not None
+    assert job.spec.servingPool.autoscaling.enabled is True
+    assert job.spec.rollout.failurePolicy is not None
+    assert job.spec.rollout.failurePolicy.mode == "replace-pod"
+
+
+def test_render_child_resources_include_rbac_pdb_and_headless_learner_service() -> None:
+    """Rendered children should include the new operator-facing infrastructure resources."""
+    job = FlashRLJob.model_validate(_job_payload())
+    rendered = render_child_resources(job)
+
+    kinds = [item["kind"] for item in rendered]
+    assert kinds.count("ServiceAccount") == 1
+    assert kinds.count("Role") == 1
+    assert kinds.count("RoleBinding") == 1
+    assert kinds.count("PodDisruptionBudget") == 3
+    assert "HorizontalPodAutoscaler" not in kinds
+
+    learner_service = next(
+        item
+        for item in rendered
+        if item["kind"] == "Service" and item["metadata"]["name"] == "demo-job-learner"
+    )
+    assert learner_service["spec"]["clusterIP"] == "None"
+    assert learner_service["spec"]["publishNotReadyAddresses"] is True
+
+    serving_deployment = next(
+        item
+        for item in rendered
+        if item["kind"] == "Deployment" and item["metadata"]["name"] == "demo-job-serving"
+    )
+    container = serving_deployment["spec"]["template"]["spec"]["containers"][0]
+    assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
+    assert container["livenessProbe"]["httpGet"]["path"] == "/healthz"
+    assert "lifecycle" in container
 
 
 def test_flashrl_platform_render_only_cli_prints_rendered_resources(
@@ -128,3 +173,14 @@ def test_flashrljob_crd_manifest_exposes_expected_kind() -> None:
     manifest = flashrljob_crd_manifest()
     assert manifest["kind"] == "CustomResourceDefinition"
     assert manifest["spec"]["names"]["kind"] == "FlashRLJob"
+    schema = manifest["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
+    spec_properties = schema["properties"]["spec"]["properties"]
+    assert "autoscaling" in spec_properties["servingPool"]["properties"]
+    assert "failurePolicy" in spec_properties["rollout"]["properties"]
+
+
+def test_render_operator_resources_include_deployment_and_cluster_rbac() -> None:
+    """The platform package should ship install manifests for the operator itself."""
+    rendered = render_operator_resources(namespace="flashrl-system")
+    kinds = [item["kind"] for item in rendered]
+    assert kinds == ["ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Deployment"]

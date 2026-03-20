@@ -10,7 +10,11 @@ import sys
 import yaml
 
 from flashrl.platform.crd import FlashRLJob
-from flashrl.platform.operator import FlashRLOperator, render_child_resources
+from flashrl.platform.operator import (
+    FlashRLOperator,
+    render_child_resources,
+    render_operator_resources,
+)
 
 
 def _load_job(path: str | Path) -> FlashRLJob:
@@ -52,6 +56,17 @@ def build_argument_parser() -> argparse.ArgumentParser:
     logs.add_argument("name", help="FlashRLJob name.")
     logs.add_argument("--namespace", default="default")
 
+    operator = platform_subparsers.add_parser("operator", help="Run the FlashRL platform operator")
+    operator.add_argument("--namespace", default=None, help="Namespace to watch. Defaults to all namespaces.")
+    operator.add_argument("--resync-seconds", type=int, default=60)
+
+    render_operator = platform_subparsers.add_parser(
+        "render-operator",
+        help="Print the operator Deployment and RBAC manifests.",
+    )
+    render_operator.add_argument("--namespace", default="flashrl-system")
+    render_operator.add_argument("--image", default="ghcr.io/flashrl/operator:latest")
+
     return parser
 
 
@@ -77,6 +92,16 @@ def main(argv: list[str] | None = None) -> int:
         print(
             f"Select logs for job={args.name} in namespace={args.namespace} with label flashrl.dev/job={args.name}."
         )
+        return 0
+
+    if args.platform_command == "render-operator":
+        print(json.dumps(render_operator_resources(namespace=args.namespace, image=args.image), indent=2))
+        return 0
+
+    if args.platform_command == "operator":
+        operator = FlashRLOperator()
+        operator.ensure_crd()
+        operator.run_forever(namespace=args.namespace, resync_seconds=args.resync_seconds)
         return 0
 
     operator = FlashRLOperator()

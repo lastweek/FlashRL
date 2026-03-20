@@ -1,17 +1,25 @@
-"""Distributed controller contracts, adapters, and transport models."""
+"""Distributed transport models, clients, and servers."""
 
-from flashrl.framework.distributed.http import (
+from flashrl.framework.distributed.learner_client import (
     HttpLearnerClient,
-    HttpRewardClient,
-    HttpRolloutClient,
-    HttpServingClient,
-)
-from flashrl.framework.distributed.local import (
     LocalLearnerClient,
+)
+from flashrl.framework.distributed.learner_server import create_learner_app
+from flashrl.framework.distributed.reward_client import (
+    HttpRewardClient,
     LocalRewardClient,
+)
+from flashrl.framework.distributed.reward_server import create_reward_app
+from flashrl.framework.distributed.rollout_client import (
+    HttpRolloutClient,
     LocalRolloutClient,
+)
+from flashrl.framework.distributed.rollout_server import create_rollout_app
+from flashrl.framework.distributed.serving_client import (
+    HttpServingClient,
     LocalServingClient,
 )
+from flashrl.framework.distributed.serving_server import create_serving_app
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     ActivateWeightVersionResponse,
@@ -74,4 +82,8 @@ __all__ = [
     "HttpRewardClient",
     "HttpLearnerClient",
     "HttpServingClient",
+    "create_rollout_app",
+    "create_reward_app",
+    "create_learner_app",
+    "create_serving_app",
 ]

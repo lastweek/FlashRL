@@ -7,8 +7,13 @@ from flashrl.platform.crd import (
     FlashRLJobStatus,
     FrameworkSpec,
     flashrljob_crd_manifest,
+    flashrljob_openapi_schema,
 )
-from flashrl.platform.operator import FlashRLOperator, render_child_resources
+from flashrl.platform.operator import (
+    FlashRLOperator,
+    render_child_resources,
+    render_operator_resources,
+)
 
 __all__ = [
     "FlashRLJob",
@@ -16,7 +21,9 @@ __all__ = [
     "FlashRLJobStatus",
     "FrameworkSpec",
     "flashrljob_crd_manifest",
+    "flashrljob_openapi_schema",
     "render_child_resources",
+    "render_operator_resources",
     "FlashRLOperator",
     "build_argument_parser",
 ]

@@ -15,12 +15,10 @@ from flashrl.framework.data_models import (
     TrainingBatch,
     WeightVersionInfo,
 )
-from flashrl.framework.distributed.local import (
-    LocalLearnerClient,
-    LocalRewardClient,
-    LocalRolloutClient,
-    LocalServingClient,
-)
+from flashrl.framework.distributed.learner_client import LocalLearnerClient
+from flashrl.framework.distributed.reward_client import LocalRewardClient
+from flashrl.framework.distributed.rollout_client import LocalRolloutClient
+from flashrl.framework.distributed.serving_client import LocalServingClient
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     LoadCheckpointRequest,
