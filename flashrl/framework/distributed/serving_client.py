@@ -133,6 +133,9 @@ class LocalServingClient:
 class HttpServingClient(_HttpJsonClient):
     """HTTP serving client."""
 
+    def generate_grouped(self, request: GenerateGroupedRequest) -> GenerateGroupedResponse:
+        return self._post("/v1/generate-grouped", request, GenerateGroupedResponse)
+
     def activate_weight_version(
         self,
         request: ActivateWeightVersionRequest,

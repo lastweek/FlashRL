@@ -121,7 +121,7 @@ class SpyContextManager(BaseContextManager):
 
 
 def load_script_module(module_name: str, relative_path: str):
-    """Load one script module by path for example tests."""
+    """Load one packaged example module from a file path for tests."""
     module_path = Path(relative_path)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -623,7 +623,7 @@ def test_math_example_supports_blackbox_and_whitebox_rollout_builders() -> None:
     """The math example should expose explicit blackbox and whitebox rollout construction."""
     module = load_script_module(
         "flashrl_reasoning_math_train_whitebox",
-        "flashrl/framework/examples/math/train.py",
+        "flashrl/examples/math/train.py",
     )
 
     blackbox = module.build_math_rollout(
@@ -648,7 +648,7 @@ def test_math_whitebox_rollout_runs_end_to_end_offline() -> None:
     """The math whitebox rollout should execute one tool step then one final step."""
     module = load_script_module(
         "flashrl_reasoning_math_train_whitebox_smoke",
-        "flashrl/framework/examples/math/train.py",
+        "flashrl/examples/math/train.py",
     )
     backend = ScriptedServingBackend(
         responses_by_step=[
@@ -669,7 +669,7 @@ def test_agent_tools_example_runs_and_prints_rollout_json(capsys: pytest.Capture
     """The minimal custom-loop example should run offline and print one rollout payload."""
     module = load_script_module(
         "flashrl_agent_tools_demo",
-        "flashrl/framework/examples/agent-tools/run.py",
+        "flashrl/examples/agent_tools/run.py",
     )
 
     assert module.main() == 0
@@ -683,7 +683,7 @@ def test_agent_react_example_runs_and_prints_rollout_json(capsys: pytest.Capture
     """The explicit ReAct recipe example should run offline and print one rollout payload."""
     module = load_script_module(
         "flashrl_agent_react_demo",
-        "flashrl/framework/examples/agent-react/run.py",
+        "flashrl/examples/agent_react/run.py",
     )
 
     assert module.main() == 0
@@ -697,7 +697,7 @@ def test_agent_dynamic_tools_example_runs_and_prints_rollout_json(
     """The dynamic-tools example should run offline and print one rollout payload."""
     module = load_script_module(
         "flashrl_agent_dynamic_tools_demo",
-        "flashrl/framework/examples/agent-dynamic-tools/run.py",
+        "flashrl/examples/agent_dynamic_tools/run.py",
     )
 
     assert module.main() == 0

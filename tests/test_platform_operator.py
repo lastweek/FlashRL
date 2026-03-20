@@ -31,6 +31,7 @@ class FakeCluster:
             "ConfigMap": {},
             "Service": {},
             "ServiceAccount": {},
+            "PersistentVolumeClaim": {},
             "Deployment": {},
             "StatefulSet": {},
             "Role": {},
@@ -236,6 +237,18 @@ class FakeCoreV1Api:
     def list_namespaced_pod(self, *, namespace: str, label_selector: str) -> dict[str, object]:
         return self.cluster.list_pods(namespace, label_selector)
 
+    def read_namespaced_persistent_volume_claim(self, *, name: str, namespace: str) -> dict[str, object]:
+        return self.cluster.get_resource("PersistentVolumeClaim", namespace, name)
+
+    def create_namespaced_persistent_volume_claim(self, *, namespace: str, body: dict[str, object]) -> dict[str, object]:
+        return self.cluster.create_or_replace_resource("PersistentVolumeClaim", namespace, body, replace=False)
+
+    def replace_namespaced_persistent_volume_claim(self, *, name: str, namespace: str, body: dict[str, object]) -> dict[str, object]:
+        return self.cluster.create_or_replace_resource("PersistentVolumeClaim", namespace, body, replace=True)
+
+    def delete_namespaced_persistent_volume_claim(self, *, name: str, namespace: str) -> None:
+        self.cluster.delete_resource("PersistentVolumeClaim", namespace, name)
+
 
 class FakeAppsV1Api:
     def __init__(self, cluster: FakeCluster) -> None:
@@ -371,25 +384,36 @@ def _job_payload() -> dict[str, object]:
                 "trainer": {"batch_size": 4, "max_epochs": 1},
                 "grpo": {"group_size": 2, "kl_coefficient": 0.0},
             },
-            "dataset": {"uri": "s3://datasets/train.jsonl", "format": "jsonl"},
-            "controller": {"image": "ghcr.io/flashrl/controller:latest"},
-            "learner": {"image": "ghcr.io/flashrl/learner:latest"},
-            "servingPool": {
-                "image": "ghcr.io/flashrl/serving:latest",
+            "dataset": {"type": "hook"},
+            "images": {
+                "runtime": "ghcr.io/flashrl/flashrl-runtime:latest",
+                "serving": "ghcr.io/flashrl/flashrl-serving-vllm:latest",
+                "training": "ghcr.io/flashrl/flashrl-training-fsdp:latest",
+                "pullPolicy": "IfNotPresent",
+            },
+            "userCode": {
+                "dataset": {"import": "tests.platform_hooks:build_dataset"},
+                "rollout": {"import": "tests.platform_hooks:build_rollout"},
+                "reward": {"import": "tests.platform_hooks:build_reward"},
+            },
+            "sharedStorage": {
+                "enabled": True,
+                "mountPath": "/var/lib/flashrl/shared",
+                "claim": {"size": "2Gi"},
+            },
+            "serving": {
                 "replicas": {"min": 2, "max": 6},
                 "autoscaling": {"enabled": True, "targetInflightPerReplica": 2},
             },
             "rollout": {
-                "image": "ghcr.io/flashrl/rollout:latest",
                 "replicas": {"min": 2, "max": 4},
             },
             "reward": {
-                "image": "ghcr.io/flashrl/reward:latest",
                 "replicas": {"min": 1, "max": 2},
             },
             "storage": {
-                "checkpoints": {"uriPrefix": "s3://checkpoints/"},
-                "weights": {"uriPrefix": "s3://weights/"},
+                "checkpoints": {"uriPrefix": "checkpoints"},
+                "weights": {"uriPrefix": "weights"},
             },
         },
         "status": {
@@ -480,8 +504,13 @@ def test_operator_reconcile_scales_serving_and_preserves_controller_progress() -
 
     custom_object = cluster.get_custom_object("default", "demo-job")
     serving = cluster.get_resource("Deployment", "default", "demo-job-serving")
+    rollout = cluster.get_resource("Deployment", "default", "demo-job-rollout")
+    pvc = cluster.get_resource("PersistentVolumeClaim", "default", "demo-job-shared")
     assert FINALIZER in custom_object["metadata"]["finalizers"]
     assert serving["spec"]["replicas"] == 3
+    assert rollout["spec"]["template"]["spec"]["containers"][0]["image"] == "ghcr.io/flashrl/flashrl-runtime:latest"
+    assert rollout["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"] == "IfNotPresent"
+    assert pvc["spec"]["resources"]["requests"]["storage"] == "2Gi"
     assert custom_object["status"]["progress"]["currentStep"] == 7
     assert status["components"]["serving"]["desiredReplicas"] == 3
     assert status["components"]["serving"]["lastScaleAt"] is not None

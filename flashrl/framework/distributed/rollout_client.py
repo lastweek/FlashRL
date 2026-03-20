@@ -21,14 +21,20 @@ class LocalRolloutClient:
 
     def rollout_batch(self, request: RolloutBatchRequest) -> RolloutBatchResponse:
         original_config = self._rollout_generator.config
+        serving_backend = getattr(self._rollout_generator, "serving_backend", None)
+        required_version_setter = getattr(serving_backend, "set_required_weight_version", None)
         if request.rollout_config is not None:
             self._rollout_generator.config = request.rollout_config.model_copy(deep=True)
+        if callable(required_version_setter):
+            required_version_setter(request.required_weight_version)
         try:
             prompts, rollouts, prompt_indices, candidate_indices = (
                 self._rollout_generator.generate_grouped(request.prompts, request.group_size)
             )
         finally:
             self._rollout_generator.config = original_config
+            if callable(required_version_setter):
+                required_version_setter(None)
 
         weight_version = None
         if rollouts:

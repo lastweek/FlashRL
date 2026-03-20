@@ -84,6 +84,10 @@ class LocalLearnerClient:
             root_dir = Path(tempfile.mkdtemp(prefix="flashrl-published-weights-"))
         self._publish_dir = root_dir
 
+    def reset_state(self) -> None:
+        """Clear per-run exactly-once caches when a new local run starts."""
+        self._step_results.clear()
+
     def optimize_step(self, request: OptimizeStepRequest) -> OptimizeStepResponse:
         if request.step_id is not None and request.step_id in self._step_results:
             return self._step_results[int(request.step_id)].model_copy(deep=True)

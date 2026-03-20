@@ -55,4 +55,13 @@ pythonpath = ["."]
 markers = [
     "unit: fast offline deterministic tests",
     "integration: optional local-service or heavier smoke tests",
+    "minikube: opt-in local minikube cluster end-to-end tests",
+]
+
+[tool.hatch.build]
+include = [
+    "/README.md",
+    "/flashrl/**/*.py",
+    "/flashrl/**/*.yaml",
+    "/flashrl/**/*.md",
 ]

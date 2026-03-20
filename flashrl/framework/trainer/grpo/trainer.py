@@ -85,6 +85,7 @@ class GRPOTrainer:
         reward_client: "RewardClient | None" = None,
         learner_client: "LearnerClient | None" = None,
         serving_client: "ServingClient | None" = None,
+        reference_configured: bool | None = None,
     ) -> None:
         """Initialize GRPO trainer."""
         self.config = config
@@ -100,6 +101,11 @@ class GRPOTrainer:
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
         self.on_step_complete = on_step_complete
+        self.reference_configured = (
+            bool(reference_backend is not None)
+            if reference_configured is None
+            else bool(reference_configured)
+        )
         self.rollout_client = rollout_client or self._build_default_rollout_client(
             rollout_generator
         )
@@ -129,6 +135,15 @@ class GRPOTrainer:
         self.current_epoch = 0
         self.total_steps = 0
         self._active_step_context = None
+        for client in (
+            self.rollout_client,
+            self.reward_client,
+            self.learner_client,
+            self.serving_client,
+        ):
+            reset = getattr(client, "reset_state", None)
+            if callable(reset):
+                reset()
 
     @property
     def active_step_context(self) -> StepContext | None:
@@ -231,6 +246,7 @@ class GRPOTrainer:
                             "step": self.total_steps,
                             "batch_index": batch_index,
                             "batches_in_epoch": batches_in_epoch,
+                            "step_payload": step_payload,
                         }
                     )
 
@@ -414,7 +430,7 @@ class GRPOTrainer:
             "step_duration_seconds": step_duration_seconds,
             "stage_timings": all_stage_timings,
             "stage_order": visible_stage_order,
-            "reference_configured": self.reference_backend is not None,
+            "reference_configured": self.reference_configured,
             "reference_active": ref_active,
             "dominant_stage": dominant_stage_name(result.stages),
             "candidate_count": grouped_prompts_count,

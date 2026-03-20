@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import json
+from pathlib import PurePosixPath
 from math import ceil
 from time import sleep
 from typing import Any, Callable
@@ -41,7 +42,7 @@ _COMPONENT_LAYOUT: dict[str, dict[str, Any]] = {
         "drainable": False,
         "headless_service": True,
     },
-    "serving": {"spec_attr": "servingPool", "workload_kind": "Deployment", "drainable": True},
+    "serving": {"spec_attr": "serving", "workload_kind": "Deployment", "drainable": True},
     "rollout": {"spec_attr": "rollout", "workload_kind": "Deployment", "drainable": True},
     "reward": {"spec_attr": "reward", "workload_kind": "Deployment", "drainable": True},
 }
@@ -67,6 +68,13 @@ _RESOURCE_APIS: dict[str, tuple[str, str, str, str, str]] = {
         "create_namespaced_service_account",
         "replace_namespaced_service_account",
         "delete_namespaced_service_account",
+    ),
+    "PersistentVolumeClaim": (
+        "CoreV1Api",
+        "read_namespaced_persistent_volume_claim",
+        "create_namespaced_persistent_volume_claim",
+        "replace_namespaced_persistent_volume_claim",
+        "delete_namespaced_persistent_volume_claim",
     ),
     "Deployment": (
         "AppsV1Api",
@@ -134,6 +142,16 @@ def _component_spec(job: FlashRLJob, component: str) -> WorkloadSpec:
     return getattr(job.spec, _COMPONENT_LAYOUT[component]["spec_attr"])
 
 
+def _component_image(job: FlashRLJob, component: str) -> str:
+    if component in {"controller", "rollout", "reward"}:
+        return str(job.spec.images.runtime)
+    if component == "serving":
+        return str(job.spec.images.serving)
+    if component == "learner":
+        return str(job.spec.images.training)
+    raise KeyError(component)
+
+
 def _component_kind(component: str) -> str:
     return str(_COMPONENT_LAYOUT[component]["workload_kind"])
 
@@ -190,11 +208,12 @@ def _merge_metadata(
 
 
 def _render_config_map(job: FlashRLJob) -> dict[str, Any]:
+    runtime_job = _job_for_runtime(job)
     return {
         "apiVersion": "v1",
         "kind": "ConfigMap",
         "metadata": _merge_metadata(job, "config", name=_workload_name(job, "config")),
-        "data": {"job.json": job.model_dump_json(indent=2)},
+        "data": {"job.json": runtime_job.model_dump_json(indent=2, by_alias=True)},
     }
 
 
@@ -252,10 +271,20 @@ def _render_controller_rbac(job: FlashRLJob) -> list[dict[str, Any]]:
 
 
 def _common_env(job: FlashRLJob, component: str, workload: WorkloadSpec) -> list[dict[str, Any]]:
+    namespace = _namespace_for(job)
+    learner_host = (
+        f"{_workload_name(job, 'learner')}-0."
+        f"{_workload_name(job, 'learner')}.{namespace}.svc.cluster.local"
+    )
     env = [
         {"name": "FLASHRL_JOB_NAME", "value": job.name},
         {"name": "FLASHRL_COMPONENT", "value": component},
         {"name": "FLASHRL_JOB_CONFIG_PATH", "value": "/etc/flashrl/job/job.json"},
+        {"name": "FLASHRL_CONTROLLER_URL", "value": f"http://{_workload_name(job, 'controller')}.{namespace}.svc.cluster.local"},
+        {"name": "FLASHRL_ROLLOUT_URL", "value": f"http://{_workload_name(job, 'rollout')}.{namespace}.svc.cluster.local"},
+        {"name": "FLASHRL_REWARD_URL", "value": f"http://{_workload_name(job, 'reward')}.{namespace}.svc.cluster.local"},
+        {"name": "FLASHRL_LEARNER_URL", "value": f"http://{learner_host}"},
+        {"name": "FLASHRL_SERVING_URL", "value": f"http://{_workload_name(job, 'serving')}.{namespace}.svc.cluster.local"},
         {
             "name": "FLASHRL_NAMESPACE",
             "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
@@ -295,13 +324,49 @@ def _drain_prestop_hook(wait_seconds: int) -> dict[str, Any]:
     }
 
 
+def _shared_storage_claim_name(job: FlashRLJob) -> str:
+    claim_name = job.spec.sharedStorage.claim.claimName
+    if claim_name:
+        return str(claim_name)
+    return _workload_name(job, "shared")
+
+
+def _shared_storage_volume_name() -> str:
+    return "shared-storage"
+
+
+def _job_for_runtime(job: FlashRLJob) -> FlashRLJob:
+    if not job.spec.sharedStorage.enabled:
+        return job
+    runtime_job = job.model_copy(deep=True)
+    mount_path = PurePosixPath(runtime_job.spec.sharedStorage.mountPath)
+    runtime_job.spec.storage.checkpoints.uriPrefix = str(
+        mount_path / runtime_job.spec.sharedStorage.checkpointsSubPath
+    )
+    runtime_job.spec.storage.weights.uriPrefix = str(
+        mount_path / runtime_job.spec.sharedStorage.weightsSubPath
+    )
+    return runtime_job
+
+
+def _shared_storage_mount(job: FlashRLJob) -> dict[str, Any] | None:
+    if not job.spec.sharedStorage.enabled:
+        return None
+    return {
+        "name": _shared_storage_volume_name(),
+        "mountPath": job.spec.sharedStorage.mountPath,
+    }
+
+
 def _pod_template(job: FlashRLJob, component: str, workload: WorkloadSpec) -> dict[str, Any]:
     selector_labels = _selector_labels(job, component)
     pod_labels = {**selector_labels, **workload.labels}
     annotations = dict(workload.annotations)
     container: dict[str, Any] = {
         "name": component,
-        "image": workload.image,
+        "image": _component_image(job, component),
+        "imagePullPolicy": str(job.spec.images.pullPolicy),
+        "command": ["flashrl", "component", "run", "serving-vllm" if component == "serving" else component],
         "ports": [{"name": "http", "containerPort": HTTP_PORT}],
         "env": _common_env(job, component, workload),
         "resources": workload.resources.model_dump(mode="json"),
@@ -319,6 +384,17 @@ def _pod_template(job: FlashRLJob, component: str, workload: WorkloadSpec) -> di
         ],
         "terminationGracePeriodSeconds": 120 if component == "learner" else 45,
     }
+    shared_mount = _shared_storage_mount(job)
+    if shared_mount is not None:
+        container["volumeMounts"].append(shared_mount)
+        pod_spec["volumes"].append(
+            {
+                "name": _shared_storage_volume_name(),
+                "persistentVolumeClaim": {
+                    "claimName": _shared_storage_claim_name(job),
+                },
+            }
+        )
     if component == "controller":
         pod_spec["serviceAccountName"] = _controller_service_account_name(job)
     if _component_drainable(component):
@@ -392,6 +468,24 @@ def _pod_disruption_budget(job: FlashRLJob, component: str, *, max_unavailable: 
     }
 
 
+def _persistent_volume_claim(job: FlashRLJob) -> dict[str, Any] | None:
+    if not job.spec.sharedStorage.enabled or not job.spec.sharedStorage.claim.create:
+        return None
+    claim = job.spec.sharedStorage.claim
+    spec: dict[str, Any] = {
+        "accessModes": list(claim.accessModes),
+        "resources": {"requests": {"storage": claim.size}},
+    }
+    if claim.storageClassName is not None:
+        spec["storageClassName"] = claim.storageClassName
+    return {
+        "apiVersion": "v1",
+        "kind": "PersistentVolumeClaim",
+        "metadata": _merge_metadata(job, "storage", name=_shared_storage_claim_name(job)),
+        "spec": spec,
+    }
+
+
 def render_child_resources(job: FlashRLJob) -> list[dict[str, Any]]:
     """Render the child Kubernetes resources for one FlashRLJob."""
     resources: list[dict[str, Any]] = [
@@ -409,6 +503,9 @@ def render_child_resources(job: FlashRLJob) -> list[dict[str, Any]]:
         _service(job, "reward"),
         _pod_disruption_budget(job, "learner", max_unavailable=0),
     ]
+    pvc = _persistent_volume_claim(job)
+    if pvc is not None:
+        resources.insert(1, pvc)
     for component in ELASTIC_COMPONENTS:
         workload = _component_spec(job, component)
         if workload.replicas is not None and workload.replicas.min > 1:
@@ -419,7 +516,7 @@ def render_child_resources(job: FlashRLJob) -> list[dict[str, Any]]:
 def render_operator_resources(
     *,
     namespace: str = "flashrl-system",
-    image: str = "ghcr.io/flashrl/operator:latest",
+    image: str = "ghcr.io/flashrl/flashrl-operator:latest",
 ) -> list[dict[str, Any]]:
     """Render cluster resources for the FlashRL operator itself."""
     return [
@@ -440,7 +537,13 @@ def render_operator_resources(
                 },
                 {
                     "apiGroups": [""],
-                    "resources": ["configmaps", "services", "pods", "serviceaccounts"],
+                    "resources": [
+                        "configmaps",
+                        "services",
+                        "pods",
+                        "serviceaccounts",
+                        "persistentvolumeclaims",
+                    ],
                     "verbs": ["get", "list", "watch", "create", "update", "patch", "delete"],
                 },
                 {
@@ -497,7 +600,7 @@ def render_operator_resources(
                             {
                                 "name": "operator",
                                 "image": image,
-                                "command": ["python", "-m", "flashrl", "platform", "operator"],
+                                "command": ["flashrl", "platform", "operator"],
                             }
                         ],
                     },
@@ -678,7 +781,7 @@ class FlashRLOperator:
         """Return the rendered child resources for a validated job."""
         return render_child_resources(job)
 
-    def render_operator(self, *, namespace: str = "flashrl-system", image: str = "ghcr.io/flashrl/operator:latest") -> list[dict[str, Any]]:
+    def render_operator(self, *, namespace: str = "flashrl-system", image: str = "ghcr.io/flashrl/flashrl-operator:latest") -> list[dict[str, Any]]:
         """Return the rendered operator deployment resources."""
         return render_operator_resources(namespace=namespace, image=image)
 
@@ -686,7 +789,7 @@ class FlashRLOperator:
         """Create or replace one FlashRLJob custom resource."""
         client = self.load_client()
         api = client.CustomObjectsApi()
-        body = job.model_dump(mode="json")
+        body = job.model_dump(mode="json", by_alias=True)
         metadata = body.setdefault("metadata", {})
         metadata.setdefault("namespace", namespace)
         try:
@@ -1374,4 +1477,3 @@ class FlashRLOperator:
             return True
         message = str(exc).lower()
         return "not found" in message or "404" in message
-

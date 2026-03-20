@@ -8,8 +8,11 @@ from fastapi.testclient import TestClient
 import pytest
 
 pytest.importorskip("vllm")
-from vllm.logprobs import Logprob
-from vllm.outputs import CompletionOutput, RequestOutput
+vllm_logprobs = pytest.importorskip("vllm.logprobs")
+vllm_outputs = pytest.importorskip("vllm.outputs")
+Logprob = vllm_logprobs.Logprob
+CompletionOutput = vllm_outputs.CompletionOutput
+RequestOutput = vllm_outputs.RequestOutput
 
 from flashrl.framework.serving.vllm import server
 

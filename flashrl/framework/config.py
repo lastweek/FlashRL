@@ -1,5 +1,6 @@
 """Configuration models for FlashRL components and YAML-driven runs."""
 
+from copy import deepcopy
 import os
 from pathlib import Path
 import re
@@ -71,11 +72,9 @@ class BaseConfig(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "BaseConfig":
+    def from_yaml(cls, path: str | Path, profile: str | None = None) -> "BaseConfig":
         """Load config from YAML file."""
-        with open(path) as f:
-            data = yaml.safe_load(f)
-        data = _expand_env_vars(data)
+        data = load_yaml_mapping(path, profile=profile)
         return cls(**data)
 
     @classmethod
@@ -83,6 +82,51 @@ class BaseConfig(BaseModel):
         """Load config from dictionary."""
         data = _expand_env_vars(data)
         return cls(**data)
+
+
+def _deep_merge(base: Any, override: Any) -> Any:
+    """Merge one profile override into a base config payload."""
+    if isinstance(base, dict) and isinstance(override, dict):
+        merged = {key: deepcopy(value) for key, value in base.items()}
+        for key, value in override.items():
+            if key in merged:
+                merged[key] = _deep_merge(merged[key], value)
+            else:
+                merged[key] = deepcopy(value)
+        return merged
+    return deepcopy(override)
+
+
+def load_yaml_mapping(path: str | Path, *, profile: str | None = None) -> dict[str, Any]:
+    """Load one YAML config mapping and apply one optional top-level profile."""
+    with open(path, encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        raise ValueError(f"Expected YAML mapping at {path}, found {type(payload).__name__}.")
+    profiles = payload.pop("profiles", {}) or {}
+    if not isinstance(profiles, dict):
+        raise ValueError("Top-level `profiles` must be a mapping when present.")
+    if profile is not None:
+        if profile not in profiles:
+            available = ", ".join(sorted(profiles)) or "<none>"
+            raise ValueError(
+                f"Unknown config profile '{profile}'. Available profiles: {available}."
+            )
+        selected = profiles[profile]
+        if not isinstance(selected, dict):
+            raise ValueError(f"Profile '{profile}' must resolve to a mapping.")
+        payload = _deep_merge(payload, selected)
+    return _expand_env_vars(payload)
+
+
+def _extract_framework_mapping(data: dict[str, Any]) -> dict[str, Any]:
+    """Extract the framework subsection from one combined or plain config payload."""
+    if "framework" in data:
+        framework = data.get("framework")
+        if not isinstance(framework, dict):
+            raise ValueError("config.framework must be a mapping.")
+        return framework
+    return data
 
 
 class TrainerConfig(BaseConfig):
@@ -315,12 +359,21 @@ class AdminConfig(BaseConfig):
     admin_port: int = Field(default=0, ge=0, le=65535)
 
 
+class BuilderSpec(BaseConfig):
+    """Structured import + kwargs builder reference."""
+
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    import_path: str = Field(alias="import")
+    kwargs: dict[str, Any] = Field(default_factory=dict)
+
+
 class HookConfig(BaseConfig):
     """Python import-string hooks used by YAML-driven runs."""
 
-    rollout_fn: str
-    reward_fn: str
-    dataset_fn: str
+    rollout_fn: str | BuilderSpec
+    reward_fn: str | BuilderSpec
+    dataset_fn: str | BuilderSpec
 
 
 class RunConfig(BaseConfig):
@@ -339,6 +392,19 @@ class RunConfig(BaseConfig):
     admin: AdminConfig = Field(default_factory=AdminConfig)
     hooks: HookConfig | None = None
 
+    @classmethod
+    def from_yaml(cls, path: str | Path, profile: str | None = None) -> "RunConfig":
+        """Load a plain run config or the framework section from one combined config."""
+        return cls.model_validate(_extract_framework_mapping(load_yaml_mapping(path, profile=profile)))
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "RunConfig":
+        """Load a plain run config or the framework section from one combined config."""
+        payload = deepcopy(data)
+        if isinstance(payload, dict):
+            payload.pop("profiles", None)
+        return cls.model_validate(_extract_framework_mapping(_expand_env_vars(payload)))
+
     @model_validator(mode="after")
     def validate_reference_policy(self) -> "RunConfig":
         """Require an explicit reference backend exactly when KL is enabled."""
@@ -351,3 +417,34 @@ class RunConfig(BaseConfig):
                 "run_config.reference must be omitted when grpo.kl_coefficient <= 0."
             )
         return self
+
+
+class FlashRLConfig(BaseConfig):
+    """Combined local/platform config with profile-aware loading."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    framework: RunConfig
+    platform: dict[str, Any] | None = None
+
+    @classmethod
+    def from_yaml(cls, path: str | Path, profile: str | None = None) -> "FlashRLConfig":
+        """Load one combined config file.
+
+        Plain framework-only run configs are accepted and normalized to
+        ``{"framework": ...}`` for backward compatibility.
+        """
+        data = load_yaml_mapping(path, profile=profile)
+        if "framework" not in data:
+            data = {"framework": data}
+        return cls.model_validate(data)
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "FlashRLConfig":
+        """Load one combined config payload from a dictionary."""
+        expanded = deepcopy(data)
+        expanded.pop("profiles", None)
+        expanded = _expand_env_vars(expanded)
+        if "framework" not in expanded:
+            expanded = {"framework": expanded}
+        return cls.model_validate(expanded)

@@ -482,7 +482,8 @@ def _apply_clipping(
     ratio: torch.Tensor,
     log_ratio: torch.Tensor,
     expanded_advantages: torch.Tensor,
-    config: GrpoConfig,
+    response_mask_or_config: torch.Tensor | GrpoConfig,
+    config: GrpoConfig | None = None,
 ) -> torch.Tensor:
     """Apply clipping to importance sampling ratio based on configured mode.
 
@@ -513,12 +514,23 @@ def _apply_clipping(
         ratio: Importance sampling ratio ρ = π_θ/π_old
         log_ratio: Log ratio log(π_θ/π_old) for hard mask
         expanded_advantages: Advantage estimates A expanded to token level (for asymmetric clipping)
-        response_mask: Response token mask
+        response_mask_or_config: Backward-compatible placeholder for the
+            historical `response_mask` argument, or the active GRPO config in
+            the current 4-argument call shape.
         config: GRPO configuration with clipping parameters
 
     Returns:
         Clipped ratio (or masked ratio for hard_mask mode)
     """
+    # Backward compatibility: older tests and call sites passed
+    # `(ratio, log_ratio, expanded_advantages, response_mask, config)` even
+    # though the response mask is not used by clipping itself.
+    if config is None:
+        config = response_mask_or_config  # type: ignore[assignment]
+
+    if expanded_advantages.dim() < ratio.dim():
+        expanded_advantages = expanded_advantages.unsqueeze(-1).expand_as(ratio)
+
     if config.clipping_mode == "none":
         return ratio
 

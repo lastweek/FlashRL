@@ -8,6 +8,7 @@ from typing import Any
 
 from flashrl.framework.config import (
     AdminConfig,
+    BuilderSpec,
     GrpoConfig,
     RolloutConfig,
     RunConfig,
@@ -33,6 +34,25 @@ def resolve_import(import_string: str) -> Any:
     return resolved
 
 
+def resolve_hook_target(binding: str | BuilderSpec) -> Any:
+    """Resolve one hook binding into its imported target."""
+    if isinstance(binding, BuilderSpec):
+        return resolve_import(binding.import_path)
+    return resolve_import(str(binding))
+
+
+def instantiate_hook(binding: str | BuilderSpec) -> Any:
+    """Instantiate one hook binding for local or platform runtime use."""
+    target = resolve_hook_target(binding)
+    if isinstance(binding, BuilderSpec):
+        if not callable(target):
+            raise TypeError(
+                "Structured hook bindings must resolve to a callable builder."
+            )
+        return target(**binding.kwargs)
+    return target
+
+
 def normalize_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
     """Normalize string datasets into Prompt objects."""
     normalized: list[Prompt] = []
@@ -47,13 +67,14 @@ def normalize_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
 def load_run_config(
     *,
     config_path: str | Path | None,
+    config_profile: str | None = None,
     run_config: RunConfig | dict[str, Any] | None,
 ) -> RunConfig | None:
     """Normalize the optional profile input into one RunConfig object."""
     if config_path is not None and run_config is not None:
         raise ValueError("Pass only one of config_path or run_config when constructing FlashRL.")
     if config_path is not None:
-        return RunConfig.from_yaml(config_path)
+        return RunConfig.from_yaml(config_path, profile=config_profile)
     if run_config is None:
         return None
     if isinstance(run_config, RunConfig):

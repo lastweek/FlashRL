@@ -19,14 +19,18 @@ def create_test_data(batch_size=2, seq_len=10, vocab_size=100):
     # Create reference logits (optional)
     ref_logits = torch.randn(batch_size, seq_len, vocab_size)
 
-    # Create rollout response log probs (one list per batch)
-    # response_lengths = seq_len - prompt_lengths
-    # Need to convert tensor to list first
-    prompt_lengths_list = prompt_lengths.tolist()
-    response_lengths = [seq_len - pl for pl in prompt_lengths_list]
+    # Create rollout response log probs that are consistent with the synthetic
+    # actor logits so the initial importance ratio stays near 1.0.
+    shift_log_probs = torch.log_softmax(actor_logits[:, :-1, :], dim=-1)
+    shift_ids = input_ids[:, 1:]
+    token_log_probs = torch.gather(
+        shift_log_probs,
+        dim=-1,
+        index=shift_ids.unsqueeze(-1),
+    ).squeeze(-1)
     rollout_response_log_probs = [
-        [0.0] * response_lengths[0],
-        [0.0] * response_lengths[1],
+        token_log_probs[index, prompt_lengths[index].item() - 1 :].tolist()
+        for index in range(batch_size)
     ]
 
     # Create advantages

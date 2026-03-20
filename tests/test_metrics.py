@@ -52,7 +52,7 @@ def load_script_module(
     *,
     aliases: tuple[str, ...] = (),
 ):
-    """Load one hyphen-folder script as a normal Python module for tests."""
+    """Load one packaged example module from a file path for tests."""
     module_path = Path(relative_path)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -67,8 +67,7 @@ def load_script_module(
 
 reasoning_example = load_script_module(
     "flashrl_reasoning_math_train_for_metrics",
-    "flashrl/framework/examples/math/train.py",
-    aliases=("train",),
+    "flashrl/examples/math/train.py",
 )
 
 
@@ -1988,7 +1987,7 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
 
     dataset = reasoning_example.build_math_train_dataset()
     trainer = FlashRL(
-        config_path="flashrl/framework/examples/math/config.yaml",
+        config_path="flashrl/examples/math/config.yaml",
         rollout_fn=reasoning_example.reasoning_rollout_fn,
         reward_fn=reasoning_example.math_reward_fn,
     )
@@ -2059,149 +2058,95 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("metric/grafana/provisioning/dashboards/dashboards.yml").exists()
     assert Path("metric/grafana/dashboards/flashrl-v1.json").exists()
     assert "observability/docker-compose.yml" not in Path(
-        "flashrl/framework/examples/README.md"
+        "flashrl/examples/README.md"
     ).read_text(
         encoding="utf-8"
     )
     assert not Path("examples").exists()
-    assert Path("flashrl/framework/examples/__init__.py").exists()
-    assert not Path("flashrl/framework/examples/reasoning").exists()
-    assert Path("flashrl/framework/examples/math/train.py").exists()
-    assert not Path("flashrl/framework/examples/math/workflow.py").exists()
-    assert Path("flashrl/framework/examples/math/eval.py").exists()
-    assert Path("flashrl/framework/examples/math/config.yaml").exists()
-    assert Path("flashrl/framework/examples/math/config_vllm.yaml").exists()
-    assert Path("flashrl/framework/examples/code-single-turn/train.py").exists()
-    assert not Path("flashrl/framework/examples/code-single-turn/workflow.py").exists()
-    assert Path("flashrl/framework/examples/code-single-turn/eval.py").exists()
-    assert Path("flashrl/framework/examples/code-single-turn/executor.py").exists()
-    assert Path("flashrl/framework/examples/code-single-turn/config.yaml").exists()
-    assert Path("flashrl/framework/examples/code-single-turn/config_vllm.yaml").exists()
+    assert not Path("flashrl/example_support").exists()
+    assert not Path("configs/presets").exists()
+    assert not Path("flashrl/framework/examples").exists()
+    assert Path("flashrl/examples/math/train.py").exists()
+    assert not Path("flashrl/examples/math/workflow.py").exists()
+    assert Path("flashrl/examples/math/eval.py").exists()
+    assert Path("flashrl/examples/math/config.yaml").exists()
+    assert Path("flashrl/examples/code_single_turn/train.py").exists()
+    assert not Path("flashrl/examples/code_single_turn/workflow.py").exists()
+    assert Path("flashrl/examples/code_single_turn/eval.py").exists()
+    assert Path("flashrl/examples/code_single_turn/executor.py").exists()
+    assert Path("flashrl/examples/code_single_turn/config.yaml").exists()
+    assert Path("flashrl/examples/presets/grpo_naive.yaml").exists()
+    assert Path("flashrl/platform/README.md").exists()
+    assert Path("flashrl/platform/k8s/namespace.yaml").exists()
+    assert Path("flashrl/platform/k8s/crd.yaml").exists()
+    assert Path("flashrl/platform/k8s/operator-rbac.yaml").exists()
+    assert Path("flashrl/platform/k8s/operator.yaml").exists()
 
-    docs = Path("flashrl/framework/examples/README.md").read_text(encoding="utf-8")
-    reasoning_docs = Path("flashrl/framework/examples/math/README.md").read_text(
+    docs = Path("flashrl/examples/README.md").read_text(encoding="utf-8")
+    reasoning_docs = Path("flashrl/examples/math/README.md").read_text(
         encoding="utf-8"
     )
     code_basic_docs = Path(
-        "flashrl/framework/examples/code-single-turn/README.md"
+        "flashrl/examples/code_single_turn/README.md"
     ).read_text(
         encoding="utf-8"
     )
     root_docs = Path("README.md").read_text(encoding="utf-8")
     assert "tensorboard --logdir logs" in root_docs
-    assert "python3 flashrl/framework/examples/math/train.py" in root_docs
-    assert "python3 -m flashrl.framework.examples.reasoning.train" not in root_docs
-    assert "TensorBoard is the default local metrics path." in docs
-    assert "metrics.pushgateway.enabled: true" in docs
+    assert "python3 -m flashrl.examples.math.train" in root_docs
+    assert "kubectl apply -f flashrl/platform/k8s/namespace.yaml" in root_docs
+    assert "python3 -m flashrl platform render" in root_docs
+    assert "--profile minikube" in root_docs
+    assert "Deployment" in Path("flashrl/platform/k8s/operator.yaml").read_text(encoding="utf-8")
+    assert "TensorBoard is the default path" in docs
     assert "./dev.sh metrics up" in docs
-    assert "endpoint-ready before reporting success" in docs
     assert "math/README.md" in docs
-    assert "code-single-turn/README.md" in docs
+    assert "code_single_turn/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
-    assert "run_dir/checkpoints" in docs
-    assert "run_dir/vllm/weights" in docs
-    assert "python3 flashrl/framework/examples/math/train.py" in reasoning_docs
-    assert "python3 flashrl/framework/examples/math/eval.py" in reasoning_docs
-    assert "FlashRL.from_yaml(...)" in reasoning_docs
-    assert "python3 -m flashrl.framework.flashrl --config" not in reasoning_docs
-    assert "config_vllm.yaml" in reasoning_docs
+    assert "python3 -m flashrl.examples.math.train" in reasoning_docs
+    assert "python3 -m flashrl.examples.math.eval" in reasoning_docs
+    assert "--profile vllm" in reasoning_docs
+    assert "config.yaml" in reasoning_docs
+    assert "flashrl-job.yaml" in reasoning_docs
     assert "--dataset" in reasoning_docs
-    assert "aime25" in reasoning_docs
     assert "--train-limit" in reasoning_docs
-    assert "--eval-limit" in reasoning_docs
-    assert "checkpointing:" in reasoning_docs
-    assert "available` is the full size" in reasoning_docs
-    assert "selected` is the number of rows actually used" in reasoning_docs
-    assert "not copied into `console.log`" in reasoning_docs
-    assert "math.yaml" not in reasoning_docs
-    assert "trainer:" not in reasoning_docs
-    assert "actor.model_name" in reasoning_docs
-    assert "trainer.batch_size" in reasoning_docs
-    assert "serving.backend" in reasoning_docs
-    assert "reference" in reasoning_docs
-    assert "grpo.group_size" in reasoning_docs
-    assert "python3 flashrl/framework/examples/code-single-turn/train.py" in code_basic_docs
-    assert "python3 flashrl/framework/examples/code-single-turn/eval.py" in code_basic_docs
+    assert "--rollout-mode whitebox" in reasoning_docs
+    assert "python3 -m flashrl.examples.code_single_turn.train" in code_basic_docs
+    assert "python3 -m flashrl.examples.code_single_turn.eval" in code_basic_docs
     assert "strict R1-style Codeforces prototype" in code_basic_docs
-    assert "does not support direct" in code_basic_docs
-    assert "official tests only in v1" in code_basic_docs
-    assert "`rating <= 1600`" in code_basic_docs
+    assert "--profile vllm" in code_basic_docs
     assert "--run-timeout-seconds" in code_basic_docs
-    assert "--memory-limit-mb" in code_basic_docs
-    assert "--max-tests-per-problem" in code_basic_docs
-    assert "not copied into `console.log`" in code_basic_docs
-    assert "execution_status" in code_basic_docs
-    assert "code_preview" in code_basic_docs
-    assert "checkpointing:" in code_basic_docs
-    assert "run_dir/checkpoints" in code_basic_docs
-    assert "run_dir/vllm/weights" in code_basic_docs
+    assert "config.yaml" in code_basic_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
-    assert "serving.backend: vllm" in docs
     assert "FLASHRL_VLLM_PYTHON" in docs
-    assert "optional `vllm` extra" in docs
+    assert "python3 -m flashrl.examples.math.train --profile vllm" in root_docs
+    assert "flashrl.examples.math.train:build_math_train_dataset" in Path(
+        "flashrl/examples/math/config.yaml"
+    ).read_text(encoding="utf-8")
 
-    example_yaml = Path("flashrl/framework/examples/math/config.yaml").read_text(
-        encoding="utf-8"
-    )
-    vllm_example_yaml = Path(
-        "flashrl/framework/examples/math/config_vllm.yaml"
-    ).read_text(
+    example_yaml = Path("flashrl/examples/math/config.yaml").read_text(
         encoding="utf-8"
     )
     code_example_yaml = Path(
-        "flashrl/framework/examples/code-single-turn/config.yaml"
-    ).read_text(
-        encoding="utf-8"
-    )
-    code_vllm_example_yaml = Path(
-        "flashrl/framework/examples/code-single-turn/config_vllm.yaml"
+        "flashrl/examples/code_single_turn/config.yaml"
     ).read_text(
         encoding="utf-8"
     )
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
-    assert "model:" not in example_yaml
-    assert "actor:" in example_yaml
-    assert "trainer:" in example_yaml
-    assert "serving:" in example_yaml
-    assert "grpo:" in example_yaml
-    assert "metrics:" in example_yaml
-    assert "checkpointing:" in example_yaml
-    assert "admin:" in example_yaml
-    assert "hooks:" not in example_yaml
-    assert "tensorboard:" in example_yaml
-    assert "pushgateway:" in example_yaml
-    assert "pushgateway_url:" not in example_yaml
-    assert "common:" not in example_yaml
-    assert "training:" not in example_yaml
-    assert "runtime:" not in example_yaml
-    assert "actor:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
-    assert "num_threads: 1" in example_yaml
-    assert "serving:\n  model_name: Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
-    assert "  num_threads: 1" in example_yaml
-    assert "  debug_live_rollout: true" in example_yaml
-    assert "save_on_run_end: true" in example_yaml
-    assert "final_path:" not in example_yaml
-    assert "debug_live_rollout:" in docs
-    assert "backend: vllm" in vllm_example_yaml
-    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in vllm_example_yaml
-    assert "checkpointing:" in vllm_example_yaml
-    assert "final_path:" not in vllm_example_yaml
-    assert "hooks:" not in vllm_example_yaml
-    assert "hooks:" not in code_example_yaml
-    assert "hooks:" not in code_vllm_example_yaml
-    assert "checkpointing:" in code_example_yaml
-    assert "final_path:" not in code_example_yaml
-    assert "checkpointing:" in code_vllm_example_yaml
-    assert "final_path:" not in code_vllm_example_yaml
+    assert "framework:" in example_yaml
+    assert "platform:" in example_yaml
+    assert "profiles:" in example_yaml
+    assert "Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
+    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in example_yaml
+    assert "flashrl-runtime:minikube" in example_yaml
+    assert "framework:" in code_example_yaml
+    assert "profiles:" in code_example_yaml
     assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
-    assert "Qwen/Qwen2.5-Coder-0.5B" in code_vllm_example_yaml
-    assert "~/.venv-vllm" not in vllm_example_yaml
-    assert "~/.venv-vllm-metal" not in vllm_example_yaml
-    assert "vllm_args:" not in vllm_example_yaml
+    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in code_example_yaml
     assert 'requires-python = ">=3.10"' in pyproject
     assert '"tensorboard>=2.14.0"' in pyproject
     assert '[project.optional-dependencies]' in pyproject

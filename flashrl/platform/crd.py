@@ -3,10 +3,12 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from pathlib import PurePosixPath
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
+from flashrl.framework.config import BuilderSpec
 from flashrl.framework.config import (
     CheckpointingConfig,
     GrpoConfig,
@@ -16,7 +18,7 @@ from flashrl.framework.config import (
 )
 
 
-ELASTIC_COMPONENTS = ("servingPool", "rollout", "reward")
+ELASTIC_COMPONENTS = ("serving", "rollout", "reward")
 FIXED_COMPONENTS = ("controller", "learner")
 
 
@@ -25,9 +27,28 @@ class DatasetSpec(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    uri: str
+    type: Literal["hook", "uri"] = "hook"
+    uri: str | None = None
     format: Literal["jsonl", "json", "parquet", "huggingface"] = "jsonl"
     metadata: dict[str, Any] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def validate_dataset_source(self) -> "DatasetSpec":
+        if self.type == "uri" and not self.uri:
+            raise ValueError("dataset.uri is required when dataset.type='uri'.")
+        if self.type == "hook" and self.uri is not None:
+            raise ValueError("dataset.uri must be omitted when dataset.type='hook'.")
+        return self
+
+
+class UserCodeSpec(BaseModel):
+    """Structured builder hooks resolved inside runtime images."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    dataset: BuilderSpec | None = None
+    rollout: BuilderSpec
+    reward: BuilderSpec
 
 
 class ReplicaRange(BaseModel):
@@ -81,11 +102,10 @@ class ResourceRequirementsSpec(BaseModel):
 
 
 class WorkloadSpec(BaseModel):
-    """Per-component image and pod policy."""
+    """Per-component pod policy."""
 
     model_config = ConfigDict(extra="forbid")
 
-    image: str
     replicas: ReplicaRange | None = None
     autoscaling: AutoscalingSpec | None = None
     failurePolicy: FailurePolicySpec | None = None
@@ -95,6 +115,17 @@ class WorkloadSpec(BaseModel):
     annotations: dict[str, str] = Field(default_factory=dict)
 
 
+class ImageSpec(BaseModel):
+    """Runtime image references used across workload families."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    runtime: str
+    serving: str
+    training: str
+    pullPolicy: Literal["Always", "IfNotPresent", "Never"] = "IfNotPresent"
+
+
 class ArtifactStorageSpec(BaseModel):
     """Object storage location for checkpoints and published weights."""
 
@@ -102,6 +133,50 @@ class ArtifactStorageSpec(BaseModel):
 
     uriPrefix: str
     secretRef: str | None = None
+
+
+class PersistentVolumeClaimSpec(BaseModel):
+    """PVC policy for shared in-cluster job storage."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    create: bool = True
+    claimName: str | None = None
+    size: str = "5Gi"
+    storageClassName: str | None = None
+    accessModes: list[Literal["ReadWriteOnce", "ReadWriteMany", "ReadOnlyMany"]] = Field(
+        default_factory=lambda: ["ReadWriteOnce"]
+    )
+
+    @model_validator(mode="after")
+    def validate_claim(self) -> "PersistentVolumeClaimSpec":
+        if not self.create and not self.claimName:
+            raise ValueError("sharedStorage.claim.claimName is required when create=false.")
+        return self
+
+
+class SharedStorageSpec(BaseModel):
+    """Shared PVC-mounted storage used for weights and checkpoints."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    mountPath: str = "/var/lib/flashrl/shared"
+    checkpointsSubPath: str = "checkpoints"
+    weightsSubPath: str = "weights"
+    claim: PersistentVolumeClaimSpec = Field(default_factory=PersistentVolumeClaimSpec)
+
+    @model_validator(mode="after")
+    def validate_paths(self) -> "SharedStorageSpec":
+        if not str(self.mountPath).startswith("/"):
+            raise ValueError("sharedStorage.mountPath must be an absolute container path.")
+        for field_name in ("checkpointsSubPath", "weightsSubPath"):
+            raw_value = str(getattr(self, field_name))
+            if raw_value.startswith("/"):
+                raise ValueError(f"sharedStorage.{field_name} must be a relative path.")
+            if ".." in PurePosixPath(raw_value).parts:
+                raise ValueError(f"sharedStorage.{field_name} must not contain '..'.")
+        return self
 
 
 class StorageSpec(BaseModel):
@@ -243,11 +318,14 @@ class FlashRLJobSpec(BaseModel):
     suspend: bool = False
     framework: FrameworkSpec
     dataset: DatasetSpec
-    controller: WorkloadSpec
-    learner: WorkloadSpec
-    servingPool: WorkloadSpec
-    rollout: WorkloadSpec
-    reward: WorkloadSpec
+    images: ImageSpec
+    userCode: UserCodeSpec
+    sharedStorage: SharedStorageSpec = Field(default_factory=SharedStorageSpec)
+    controller: WorkloadSpec = Field(default_factory=WorkloadSpec)
+    learner: WorkloadSpec = Field(default_factory=WorkloadSpec)
+    serving: WorkloadSpec = Field(default_factory=WorkloadSpec)
+    rollout: WorkloadSpec = Field(default_factory=WorkloadSpec)
+    reward: WorkloadSpec = Field(default_factory=WorkloadSpec)
     storage: StorageSpec
     checkpointing: CheckpointingConfig = Field(default_factory=CheckpointingConfig)
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
@@ -270,7 +348,7 @@ class FlashRLJobSpec(BaseModel):
         component_defaults = {
             "controller": self.controller,
             "learner": self.learner,
-            "servingPool": self.servingPool,
+            "serving": self.serving,
             "rollout": self.rollout,
             "reward": self.reward,
         }
@@ -294,6 +372,15 @@ class FlashRLJobSpec(BaseModel):
         self.learner.autoscaling = AutoscalingSpec(enabled=False)
         self.controller.autoscaling = AutoscalingSpec(enabled=False)
 
+        if self.dataset.type == "hook" and self.userCode.dataset is None:
+            raise ValueError("userCode.dataset is required when dataset.type='hook'.")
+        if self.dataset.type == "uri" and self.userCode.dataset is not None:
+            raise ValueError("userCode.dataset must be omitted when dataset.type='uri'.")
+        if self.sharedStorage.enabled and self.dataset.type == "uri":
+            if self.dataset.uri is not None and str(self.dataset.uri).startswith(("s3://", "gs://", "hf://")):
+                raise ValueError(
+                    "dataset.type='uri' with sharedStorage.enabled currently requires a mounted file path, not object storage."
+                )
         if actor_world_size < 1:
             raise ValueError("framework.actor.dp_size must be >= 1.")
         return self

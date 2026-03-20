@@ -1,0 +1,193 @@
+framework:
+  actor:
+    model_name: Qwen/Qwen2.5-0.5B-Instruct
+    backend: huggingface
+    num_threads: 1
+
+  serving:
+    model_name: Qwen/Qwen2.5-0.5B-Instruct
+    backend: huggingface
+    num_threads: 1
+    debug_live_rollout: true
+
+  trainer:
+    learning_rate: 1.0e-5
+    batch_size: 2
+    max_epochs: 1
+
+  grpo:
+    group_size: 2
+    clip_ratio: 0.2
+    kl_coefficient: 0.0
+    max_new_tokens: 2038
+    temperature: 1.0
+    top_p: 0.9
+    top_k: 0
+    do_sample: true
+
+  logging:
+    console: true
+    file: true
+    console_mode: compact
+
+  metrics:
+    enabled: true
+    tensorboard:
+      enabled: true
+    pushgateway:
+      enabled: false
+      url: http://localhost:9091
+      job_name: flashrl
+
+  checkpointing:
+    save_on_run_end: true
+
+  admin:
+    admin_enabled: true
+
+  hooks:
+    dataset_fn:
+      import: flashrl.examples.math.train:build_math_train_dataset
+      kwargs:
+        dataset: gsm8k
+        limit: 8
+        training_mode: reasoning
+    rollout_fn:
+      import: flashrl.examples.math.train:build_math_rollout
+      kwargs:
+        rollout_mode: blackbox
+        training_mode: reasoning
+    reward_fn:
+      import: flashrl.examples.math.train:build_math_reward_fn
+      kwargs:
+        training_mode: reasoning
+
+platform:
+  job:
+    name: flashrl-math-demo
+    namespace: default
+  images:
+    runtime: flashrl-runtime:dev
+    serving: flashrl-serving-vllm:dev
+    training: flashrl-training-fsdp:dev
+  serving:
+    replicas:
+      min: 1
+      max: 1
+  rollout:
+    replicas:
+      min: 1
+      max: 1
+  reward:
+    replicas:
+      min: 1
+      max: 1
+  storage:
+    checkpoints:
+      uriPrefix: /shared/flashrl/checkpoints
+    weights:
+      uriPrefix: /shared/flashrl/weights
+
+profiles:
+  vllm:
+    framework:
+      actor:
+        model_name: Qwen/Qwen2.5-0.5B
+      serving:
+        model_name: Qwen/Qwen2.5-0.5B
+        backend: vllm
+        runtime_python: ${FLASHRL_VLLM_PYTHON}
+        num_replicas: 1
+        debug_live_rollout: false
+      grpo:
+        max_new_tokens: 1024
+
+  minikube:
+    framework:
+      actor:
+        model_name: sshleifer/tiny-gpt2
+        max_length: 256
+      serving:
+        model_name: sshleifer/tiny-gpt2
+        max_length: 256
+        debug_live_rollout: false
+      trainer:
+        batch_size: 2
+        max_epochs: 1
+      grpo:
+        max_new_tokens: 24
+        top_p: 0.95
+      hooks:
+        dataset_fn:
+          import: flashrl.examples.math.train:build_math_train_dataset
+          kwargs:
+            dataset: gsm8k
+            limit: 2
+            training_mode: reasoning
+        rollout_fn:
+          import: flashrl.examples.math.train:build_math_rollout
+          kwargs:
+            rollout_mode: blackbox
+            training_mode: reasoning
+        reward_fn:
+          import: flashrl.examples.math.train:build_math_reward_fn
+          kwargs:
+            training_mode: reasoning
+    platform:
+      job:
+        name: flashrl-math-minikube
+        namespace: flashrl-e2e
+      images:
+        runtime: flashrl-runtime:minikube
+        serving: flashrl-serving-vllm:minikube
+        training: flashrl-training-fsdp:minikube
+        pullPolicy: IfNotPresent
+      sharedStorage:
+        enabled: true
+        mountPath: /var/lib/flashrl/shared
+        checkpointsSubPath: checkpoints
+        weightsSubPath: weights
+        claim:
+          size: 8Gi
+      controller:
+        resources:
+          requests:
+            cpu: "500m"
+            memory: 1Gi
+      learner:
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: 2Gi
+      serving:
+        replicas:
+          min: 1
+          max: 1
+        resources:
+          requests:
+            cpu: "1000m"
+            memory: 2Gi
+      rollout:
+        replicas:
+          min: 1
+          max: 1
+        resources:
+          requests:
+            cpu: "500m"
+            memory: 1Gi
+      reward:
+        replicas:
+          min: 1
+          max: 1
+        resources:
+          requests:
+            cpu: "500m"
+            memory: 1Gi
+      storage:
+        checkpoints:
+          uriPrefix: checkpoints
+        weights:
+          uriPrefix: weights
+      checkpointing:
+        save_every_steps: 1
+        save_on_run_end: true

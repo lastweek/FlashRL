@@ -22,7 +22,7 @@ def load_script_module(module_name: str, relative_path: str):
 
 mock_checkpointing = load_script_module(
     "flashrl_mock_checkpointing_train",
-    "flashrl/framework/examples/mock-checkpointing/train.py",
+    "flashrl/examples/mock_checkpointing/train.py",
 )
 
 

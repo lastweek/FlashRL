@@ -22,7 +22,7 @@ def load_script_module(
     *,
     aliases: tuple[str, ...] = (),
 ):
-    """Load one hyphen-folder script as a normal Python module for tests."""
+    """Load one packaged example module from a file path for tests."""
     module_path = Path(relative_path)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -37,12 +37,13 @@ def load_script_module(
 
 reasoning_example = load_script_module(
     "flashrl_reasoning_math_train",
-    "flashrl/framework/examples/math/train.py",
-    aliases=("train",),
+    "flashrl/examples/math/train.py",
+    aliases=("flashrl.examples.math.train",),
 )
 reasoning_eval = load_script_module(
     "flashrl_reasoning_math_eval",
-    "flashrl/framework/examples/math/eval.py",
+    "flashrl/examples/math/eval.py",
+    aliases=("flashrl.examples.math.eval",),
 )
 evaluate_model = reasoning_eval.evaluate_model
 
@@ -560,6 +561,7 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
     """The example CLIs should expose only the intended explicit operator knobs."""
     train_help = reasoning_example.build_argument_parser().format_help()
     assert "--config" in train_help
+    assert "--profile" in train_help
     assert "--dataset" in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" not in train_help
@@ -568,6 +570,7 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
 
     eval_help = reasoning_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
+    assert "--profile" in eval_help
     assert "--dataset" in eval_help
     assert "--eval-limit" in eval_help
     assert "--checkpoint" in eval_help
@@ -589,7 +592,8 @@ def test_prepare_reasoning_environment_sets_default_vllm_runtime(
     monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/math/config_vllm.yaml"
+        "flashrl/examples/math/config.yaml",
+        "vllm",
     )
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"
@@ -604,28 +608,28 @@ def test_prepare_reasoning_environment_leaves_non_vllm_configs_alone(
     monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/framework/examples/math/config.yaml"
+        "flashrl/examples/math/config.yaml"
     )
 
     assert "FLASHRL_VLLM_PYTHON" not in os.environ
 
 
-def test_eval_module_imports_only_public_helpers_from_train() -> None:
-    """eval.py should import the local train script instead of the old package path."""
-    source = Path("flashrl/framework/examples/math/eval.py").read_text(encoding="utf-8")
-    tree = ast.parse(source)
+def test_eval_module_uses_packaged_example_imports() -> None:
+    """The eval module should resolve everything from flashrl.examples."""
+    source = Path("flashrl/examples/math/eval.py").read_text(encoding="utf-8")
+    source_tree = ast.parse(source)
     assert any(
-        isinstance(node, ast.Import) and any(alias.name == "train" for alias in node.names)
-        for node in ast.walk(tree)
+        isinstance(node, ast.ImportFrom) and node.module == "flashrl.examples.math"
+        for node in ast.walk(source_tree)
     )
-    assert "flashrl.framework.examples.reasoning" not in source
+    assert "from flashrl.examples.math import train as reasoning_math_example" in source
+    assert "flashrl.example_support" not in source
 
 
-def test_reasoning_math_train_is_the_real_example_module() -> None:
-    """train.py should hold the actual example logic without workflow indirection."""
-    train_source = Path("flashrl/framework/examples/math/train.py").read_text(
-        encoding="utf-8"
-    )
-    assert "WORKFLOW_PATH" not in train_source
-    assert "exec(compile(" not in train_source
-    assert not Path("flashrl/framework/examples/math/workflow.py").exists()
+def test_reasoning_math_module_holds_the_actual_logic() -> None:
+    """The canonical module should hold the real implementation directly."""
+    source = Path("flashrl/examples/math/train.py").read_text(encoding="utf-8")
+    assert "flashrl.examples.math.train" in source
+    assert "WORKFLOW_PATH" not in source
+    assert "exec(compile(" not in source
+    assert not Path("flashrl/examples/math/workflow.py").exists()

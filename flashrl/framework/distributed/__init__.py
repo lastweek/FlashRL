@@ -10,6 +10,7 @@ from flashrl.framework.distributed.reward_client import (
     LocalRewardClient,
 )
 from flashrl.framework.distributed.reward_server import create_reward_app
+from flashrl.framework.distributed.remote_serving_backend import HttpServingBackend
 from flashrl.framework.distributed.rollout_client import (
     HttpRolloutClient,
     LocalRolloutClient,
@@ -82,6 +83,7 @@ __all__ = [
     "HttpRewardClient",
     "HttpLearnerClient",
     "HttpServingClient",
+    "HttpServingBackend",
     "create_rollout_app",
     "create_reward_app",
     "create_learner_app",

@@ -1,0 +1,14 @@
+.git
+.github
+.pytest_cache
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.DS_Store
+logs
+dist
+build
+.venv
+.mypy_cache
+node_modules

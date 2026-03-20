@@ -78,6 +78,7 @@ class FlashRL:
         checkpointing_config: CheckpointingConfig | None = None,
         admin_config: AdminConfig | None = None,
         config_path: str | Path | None = None,
+        config_profile: str | None = None,
         run_config: RunConfig | dict[str, Any] | None = None,
         dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None,
     ) -> None:
@@ -88,6 +89,7 @@ class FlashRL:
         """
         resolved_run_config = runtime_support.load_run_config(
             config_path=config_path,
+            config_profile=config_profile,
             run_config=run_config,
         )
         if resolved_run_config is not None:
@@ -260,18 +262,18 @@ class FlashRL:
         self._emit_bootstrap_console(f"  {label:<8} {component:<17} {message}")
 
     @classmethod
-    def from_yaml(cls, path: str | Path) -> "FlashRL":
+    def from_yaml(cls, path: str | Path, *, profile: str | None = None) -> "FlashRL":
         """Construct FlashRL from a YAML run config."""
         config_path = Path(path)
-        run_config = RunConfig.from_yaml(config_path)
+        run_config = RunConfig.from_yaml(config_path, profile=profile)
         if run_config.hooks is None:
             raise ValueError(
                 "FlashRL.from_yaml(...) requires hooks.rollout_fn, hooks.reward_fn, and "
                 "hooks.dataset_fn in the YAML config."
             )
-        rollout_fn = runtime_support.resolve_import(run_config.hooks.rollout_fn)
-        reward_fn = runtime_support.resolve_import(run_config.hooks.reward_fn)
-        dataset_fn = runtime_support.resolve_import(run_config.hooks.dataset_fn)
+        rollout_fn = runtime_support.instantiate_hook(run_config.hooks.rollout_fn)
+        reward_fn = runtime_support.instantiate_hook(run_config.hooks.reward_fn)
+        dataset_fn = runtime_support.instantiate_hook(run_config.hooks.dataset_fn)
 
         return cls(
             rollout_fn=rollout_fn,
@@ -1211,6 +1213,11 @@ def build_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the FlashRL YAML config file.",
     )
+    parser.add_argument(
+        "--profile",
+        default=None,
+        help="Optional config profile override.",
+    )
     return parser
 
 
@@ -1221,7 +1228,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     flashrl: FlashRL | None = None
 
     try:
-        flashrl = FlashRL.from_yaml(args.config)
+        flashrl = FlashRL.from_yaml(args.config, profile=args.profile)
         flashrl.train()
     except Exception as exc:
         print(f"FlashRL YAML run failed: {exc}", file=sys.stderr)

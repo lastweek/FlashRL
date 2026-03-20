@@ -1,138 +1,122 @@
 # FlashRL
 
-A learning-first reinforcement learning project for LLM post-training.
+FlashRL is a learning-first RL project for LLM post-training. The repo now has
+two primary workflows:
 
-## Development
+- local runs from one example `config.yaml`
+- Kubernetes runs by rendering one `FlashRLJob` and applying it with `kubectl`
 
-### Setup
-
-```bash
-# Source the dev environment (consolidates bytecode, sets PYTHONPATH)
-source dev.sh
-
-# Run tests
-python3 -m pytest tests/ -v
-
-# Test imports
-python3 -c "from flashrl.framework import FlashRL, RunConfig"
-
-# Browser-based viewer tests (one-time)
-python3 -m playwright install chromium
-```
-
-### Project Structure
-
-```
-flashrl/
-├── framework/       # Core RL training APIs
-│   ├── agent/       # Agent building blocks: runtime, tools, and context
-│   ├── trainer/     # Training algorithms
-│   ├── rollout/     # Generation and rollout
-│   ├── reward/      # Reward computation
-│   ├── tools/       # Compatibility shim for relocated agent tools
-│   └── models/      # Model wrappers
-└── platform/        # Orchestration and scaling (coming later)
-```
-
-### Clean Bytecode
-
-All Python bytecode is consolidated to `.cache/pycache/` instead of cluttering `__pycache__/` folders everywhere.
-
-To clean all bytecode:
-```bash
-rm -rf .cache/
-```
-
-## Quick Start
-
-### Run the Math Example
-
-The math example now lives in its own folder with a thin training script
-and a YAML config. It supports both the historical blackbox rollout path and
-an explicit whitebox path built from `flashrl.framework.agent` primitives:
+## Install
 
 ```bash
-python3 flashrl/framework/examples/math/train.py
+pip install -e '.[dev,platform]'
 ```
+
+For managed local vLLM serving, also install:
 
 ```bash
-python3 flashrl/framework/examples/math/train.py --rollout-mode whitebox
+pip install -e '.[vllm]'
 ```
 
-See [flashrl/framework/examples/README.md](flashrl/framework/examples/README.md) for details.
-See [flashrl/framework/agent/README.md](flashrl/framework/agent/README.md) for the agent toolbox overview.
+## Local Examples
 
-### Run the Agent Tools Demo
-
-The whitebox agent examples are small offline scripts that show the public
-agent toolbox in increasing complexity:
+Math example:
 
 ```bash
-python3 flashrl/framework/examples/agent-tools/run.py
+python3 -m flashrl.examples.math.train
+python3 -m flashrl.examples.math.train --profile vllm
+python3 -m flashrl.examples.math.eval --profile vllm
 ```
+
+Code example:
 
 ```bash
-python3 flashrl/framework/examples/agent-react/run.py
+python3 -m flashrl.examples.code_single_turn.train
+python3 -m flashrl.examples.code_single_turn.train --profile vllm
+python3 -m flashrl.examples.code_single_turn.eval --profile vllm
 ```
+
+Example docs:
+
+- [flashrl/examples/README.md](flashrl/examples/README.md)
+- [flashrl/examples/math/README.md](flashrl/examples/math/README.md)
+- [flashrl/examples/code_single_turn/README.md](flashrl/examples/code_single_turn/README.md)
+
+## Kubernetes Workflow
+
+The platform path is raw-Kubernetes first:
+
+1. build images locally
+2. install the operator from committed YAML
+3. render one `FlashRLJob`
+4. apply it with `kubectl`
+
+Build images:
 
 ```bash
-python3 flashrl/framework/examples/agent-dynamic-tools/run.py
+docker build -f docker/operator.Dockerfile -t flashrl-operator:dev .
+docker build -f docker/runtime.Dockerfile -t flashrl-runtime:dev .
+docker build -f docker/serving-vllm.Dockerfile -t flashrl-serving-vllm:dev .
+docker build -f docker/training-fsdp.Dockerfile -t flashrl-training-fsdp:dev .
 ```
 
-### Run the Code Example
-
-The first code example is a script-based Codeforces prototype with local
-execution reward:
+Install the operator:
 
 ```bash
-python3 flashrl/framework/examples/code-single-turn/train.py
+kubectl apply -f flashrl/platform/k8s/namespace.yaml
+kubectl apply -f flashrl/platform/k8s/crd.yaml
+kubectl apply -f flashrl/platform/k8s/operator-rbac.yaml
+kubectl apply -f flashrl/platform/k8s/operator.yaml
 ```
 
-### Inspect Run Artifacts
+The committed `operator.yaml` points at `flashrl-operator:dev`, so the image
+you built in step 1 is the image Kubernetes starts for the operator pod.
 
-FlashRL writes machine-readable per-run artifacts under `logs/` by default:
-- `events.jsonl`
-- `console.log`
-- `rollouts.jsonl`
+Render one job:
 
-`rollouts.jsonl` is a grouped prompt-major artifact. It stores shared input
-messages once per prompt group, candidate completion messages separately, and
-promotes common quality/performance stats into first-class fields for easier
-inspection.
+```bash
+python3 -m flashrl platform render \
+  --config flashrl/examples/math/config.yaml \
+  --profile minikube \
+  --output flashrl-job.yaml
+```
 
-TensorBoard is also enabled by default for framework runs:
+Apply and inspect it:
+
+```bash
+kubectl apply -f flashrl-job.yaml
+kubectl get flashrljobs
+kubectl describe flashrljob flashrl-math-minikube
+kubectl logs -l flashrl.dev/job=flashrl-math-minikube
+```
+
+Operator lifecycle:
+
+- `kubectl apply -f flashrl/platform/k8s/operator.yaml` creates a Kubernetes `Deployment`
+- Kubernetes starts the operator pod from `flashrl-operator:dev`
+- the runtime images are not started until you apply a `FlashRLJob`
+
+See [flashrl/platform/README.md](flashrl/platform/README.md) for the full
+platform install and run flow.
+
+## Observability
+
+TensorBoard is the default local metrics path:
 
 ```bash
 tensorboard --logdir logs
 ```
 
-To inspect them, open the unified static viewer in Chrome or Edge:
+The optional local metrics stack is still available:
 
 ```bash
-open docs/viewer.html
+./dev.sh metrics up
+./dev.sh metrics down
+./dev.sh metrics reset
 ```
 
-Then switch between `Run History` and `Live Runtime` as needed. For run artifacts,
-click `Open run folder` and choose the `logs/` folder.
+Useful local URLs:
 
-Older `.flashrl-runs/` directories remain viewable if you already have them.
-
-## Current Status
-
-✅ **Step 1 Complete** - Core abstractions (data models, config, base classes)
-✅ **Step 2 Complete** - GRPO trainer skeleton
-✅ **Step 3 Complete** - End-to-end training examples
-
-**What works:**
-- Data models and configuration system
-- Script-run example workflows and YAML-driven framework runs
-- Model wrappers (Actor, Reference, Critic)
-- GRPO trainer structure
-- Training pipeline examples
-- Whitebox agent building blocks with explicit runtimes and subprocess-backed tools
-
-**Next steps:**
-- Real rollout generation with models
-- Real GRPO loss computation
-- Additional agent examples and higher-level patterns built on the traced runtime
-- Additional safe runtimes beyond subprocess isolation
+- Grafana: `http://localhost:3000`
+- Prometheus: `http://localhost:9090`
+- Pushgateway: `http://localhost:9091`

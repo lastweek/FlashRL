@@ -1,4 +1,4 @@
-"""Unit tests for the code-single-turn example."""
+"""Unit tests for the code_single_turn example."""
 
 from __future__ import annotations
 
@@ -21,7 +21,7 @@ def load_script_module(
     *,
     aliases: tuple[str, ...] = (),
 ):
-    """Load one hyphen-folder script as a normal Python module for tests."""
+    """Load one packaged example module from a file path for tests."""
     module_path = Path(relative_path)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -36,17 +36,18 @@ def load_script_module(
 
 code_basic_executor = load_script_module(
     "flashrl_code_basic_executor",
-    "flashrl/framework/examples/code-single-turn/executor.py",
-    aliases=("executor",),
+    "flashrl/examples/code_single_turn/executor.py",
+    aliases=("executor", "flashrl.examples.code_single_turn.executor"),
 )
 code_basic = load_script_module(
     "flashrl_code_basic_train",
-    "flashrl/framework/examples/code-single-turn/train.py",
-    aliases=("train",),
+    "flashrl/examples/code_single_turn/train.py",
+    aliases=("train", "flashrl.examples.code_single_turn.train"),
 )
 code_basic_eval = load_script_module(
     "flashrl_code_basic_eval",
-    "flashrl/framework/examples/code-single-turn/eval.py",
+    "flashrl/examples/code_single_turn/eval.py",
+    aliases=("flashrl.examples.code_single_turn.eval",),
 )
 
 
@@ -451,6 +452,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
     """The example CLIs should expose the intended explicit operator knobs."""
     train_help = code_basic.build_argument_parser().format_help()
     assert "--config" in train_help
+    assert "--profile" in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" not in train_help
     assert "--checkpoint-out" not in train_help
@@ -462,6 +464,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
 
     eval_help = code_basic_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
+    assert "--profile" in eval_help
     assert "--eval-limit" in eval_help
     assert "--batch-size" in eval_help
     assert "--rating-min" in eval_help
@@ -483,7 +486,8 @@ def test_prepare_code_basic_environment_sets_default_vllm_runtime(
     )
 
     code_basic.prepare_reasoning_code_environment(
-        "flashrl/framework/examples/code-single-turn/config_vllm.yaml"
+        "flashrl/examples/code_single_turn/config.yaml",
+        "vllm",
     )
 
     assert "FLASHRL_VLLM_PYTHON" in sys.modules["os"].environ
@@ -512,7 +516,7 @@ def test_code_basic_main_uses_profile_aware_flashrl_constructor(
     exit_code = code_basic.main(
         [
             "--config",
-            "flashrl.framework.examples.code-single-turn/config.yaml",
+            "flashrl/examples/code_single_turn/config.yaml",
             "--run-timeout-seconds",
             "2.5",
             "--memory-limit-mb",
@@ -521,24 +525,23 @@ def test_code_basic_main_uses_profile_aware_flashrl_constructor(
     )
 
     assert exit_code == 0
-    assert captured["config_path"] == "flashrl.framework.examples.code-single-turn/config.yaml"
+    assert captured["config_path"] == "flashrl/examples/code_single_turn/config.yaml"
     assert isinstance(captured["rollout_fn"], Agent)
     assert callable(captured["reward_fn"])
+    assert captured["config_profile"] is None
     assert "checkpoint_out" not in captured
 
 
-def test_code_basic_train_is_the_real_example_module() -> None:
-    """train.py should hold the actual code example logic without workflow indirection."""
-    train_source = Path("flashrl/framework/examples/code-single-turn/train.py").read_text(
-        encoding="utf-8"
-    )
-    eval_source = Path("flashrl/framework/examples/code-single-turn/eval.py").read_text(
-        encoding="utf-8"
-    )
+def test_code_basic_modules_hold_the_actual_logic() -> None:
+    """The canonical modules should hold the implementation directly."""
+    train_source = Path("flashrl/examples/code_single_turn/train.py").read_text(encoding="utf-8")
+    eval_source = Path("flashrl/examples/code_single_turn/eval.py").read_text(encoding="utf-8")
+    assert "flashrl.examples.code_single_turn" in train_source
+    assert "flashrl.examples.code_single_turn" in eval_source
     assert "WORKFLOW_PATH" not in train_source
     assert "exec(compile(" not in train_source
-    assert "import train as code_example" in eval_source
-    assert not Path("flashrl/framework/examples/code-single-turn/workflow.py").exists()
+    assert "from flashrl.examples.code_single_turn import train as code_example" in eval_source
+    assert not Path("flashrl/examples/code_single_turn/workflow.py").exists()
 
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(

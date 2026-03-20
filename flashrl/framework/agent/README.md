@@ -28,9 +28,9 @@ current visible tools, the current transcript, any optional footer, and then a
 final `Assistant:` cue so completion-style serving backends continue at the
 assistant turn.
 
-The examples under `flashrl/framework/examples/` show this progression:
+The examples under `flashrl.examples` show this progression:
 
-- `agent-tools/`: smallest custom loop
-- `agent-react/`: reusable ReAct recipe built in normal example code
-- `agent-dynamic-tools/`: dynamic tool gating plus context management
-- `math/`: training-integrated whitebox rollout
+- `flashrl.examples.agent_tools`: smallest custom loop
+- `flashrl.examples.agent_react`: reusable ReAct recipe built in normal example code
+- `flashrl.examples.agent_dynamic_tools`: dynamic tool gating plus context management
+- `flashrl.examples.math`: training-integrated whitebox rollout

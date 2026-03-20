@@ -9,6 +9,7 @@ import sys
 
 import yaml
 
+from flashrl.platform.config import PlatformConfig, build_flashrl_job, load_flashrl_config
 from flashrl.platform.crd import FlashRLJob
 from flashrl.platform.operator import (
     FlashRLOperator,
@@ -17,10 +18,24 @@ from flashrl.platform.operator import (
 )
 
 
-def _load_job(path: str | Path) -> FlashRLJob:
+def _load_job_file(path: str | Path) -> FlashRLJob:
     with open(path, encoding="utf-8") as handle:
         payload = yaml.safe_load(handle)
     return FlashRLJob.model_validate(payload)
+
+
+def _load_job_from_config(*, config: str, profile: str | None) -> FlashRLJob:
+    resolved = load_flashrl_config(config, profile=profile)
+    if resolved.platform is None:
+        raise ValueError("`flashrl platform render` requires a top-level `platform:` section.")
+    return build_flashrl_job(
+        run_config=resolved.framework,
+        platform_config=PlatformConfig.model_validate(resolved.platform),
+    )
+
+
+def _dump_yaml(payload: dict[str, object]) -> str:
+    return yaml.safe_dump(payload, sort_keys=False)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -31,9 +46,21 @@ def build_argument_parser() -> argparse.ArgumentParser:
     platform_parser = subparsers.add_parser("platform", help="Manage FlashRL platform jobs")
     platform_subparsers = platform_parser.add_subparsers(dest="platform_command", required=True)
 
+    render = platform_subparsers.add_parser("render", help="Render one FlashRLJob from one config file")
+    render.add_argument("--config", required=True, help="Path to one FlashRL config.yaml file.")
+    render.add_argument("--profile", default=None, help="Optional config profile to apply.")
+    render.add_argument("--output", default=None, help="Optional path to write rendered YAML.")
+    render.add_argument(
+        "--children",
+        action="store_true",
+        help="Render child Kubernetes resources instead of the FlashRLJob itself.",
+    )
+
     submit = platform_subparsers.add_parser("submit", help="Submit one FlashRLJob")
-    submit.add_argument("--file", required=True, help="Path to a FlashRLJob YAML file.")
-    submit.add_argument("--namespace", default="default")
+    submit.add_argument("--file", help="Path to a FlashRLJob YAML file.")
+    submit.add_argument("--config", help="Path to one FlashRL config.yaml file.")
+    submit.add_argument("--profile", default=None, help="Optional config profile to apply.")
+    submit.add_argument("--namespace", default=None)
     submit.add_argument(
         "--render-only",
         action="store_true",
@@ -65,7 +92,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Print the operator Deployment and RBAC manifests.",
     )
     render_operator.add_argument("--namespace", default="flashrl-system")
-    render_operator.add_argument("--image", default="ghcr.io/flashrl/operator:latest")
+    render_operator.add_argument("--image", default="ghcr.io/flashrl/flashrl-operator:latest")
 
     return parser
 
@@ -77,15 +104,41 @@ def main(argv: list[str] | None = None) -> int:
     if args.command != "platform":
         parser.error("unsupported command")
 
+    if args.platform_command == "render":
+        job = _load_job_from_config(
+            config=str(args.config),
+            profile=getattr(args, "profile", None),
+        )
+        if args.children:
+            payload = json.dumps(render_child_resources(job), indent=2)
+        else:
+            payload = _dump_yaml(job.model_dump(mode="json", by_alias=True))
+        if args.output:
+            Path(args.output).write_text(payload, encoding="utf-8")
+        else:
+            print(payload)
+        return 0
+
     if args.platform_command == "submit":
-        job = _load_job(args.file)
+        if getattr(args, "file", None):
+            job = _load_job_file(args.file)
+        elif getattr(args, "config", None):
+            job = _load_job_from_config(
+                config=str(args.config),
+                profile=getattr(args, "profile", None),
+            )
+        else:
+            raise ValueError("Pass either --file or --config.")
+        if args.namespace is not None:
+            job.metadata["namespace"] = args.namespace
         if args.render_only:
             print(json.dumps(render_child_resources(job), indent=2))
             return 0
         operator = FlashRLOperator()
         operator.ensure_crd()
-        operator.submit_job(job, namespace=args.namespace)
-        print(f"Submitted FlashRLJob {job.name} to namespace={args.namespace}.")
+        namespace = str(job.metadata.get("namespace") or "default")
+        operator.submit_job(job, namespace=namespace)
+        print(f"Submitted FlashRLJob {job.name} to namespace={namespace}.")
         return 0
 
     if args.platform_command == "logs":

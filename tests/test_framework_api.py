@@ -116,6 +116,14 @@ def test_framework_vllm_wrapper_import_is_spawn_safe_when_vllm_is_available(
     """Importing the wrapper before spawning should not break child imports."""
     if importlib.util.find_spec("vllm") is None:
         pytest.skip("vllm is not installed in the current test interpreter.")
+    try:
+        import flashrl.framework.serving.vllm.server  # noqa: F401
+    except (ImportError, ModuleNotFoundError) as exc:
+        error_text = str(exc)
+        error_name = getattr(exc, "name", "") or ""
+        if error_name.startswith("vllm") or "from 'vllm'" in error_text or "No module named 'vllm" in error_text:
+            pytest.skip("vllm wrapper dependencies are not importable in the current interpreter.")
+        raise
 
     result = _run_script(
         tmp_path,

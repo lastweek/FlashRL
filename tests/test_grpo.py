@@ -41,7 +41,7 @@ pytestmark = pytest.mark.unit
 
 
 def load_script_module(module_name: str, relative_path: str):
-    """Load one hyphen-folder script as a normal Python module for tests."""
+    """Load one packaged example module from a file path for tests."""
     module_path = Path(relative_path)
     spec = importlib.util.spec_from_file_location(module_name, module_path)
     assert spec is not None
@@ -54,7 +54,7 @@ def load_script_module(module_name: str, relative_path: str):
 
 reasoning_math = load_script_module(
     "flashrl_reasoning_math_train_for_grpo",
-    "flashrl/framework/examples/math/train.py",
+    "flashrl/examples/math/train.py",
 )
 math_reward_fn = reasoning_math.math_reward_fn
 render_math_prompt = reasoning_math.render_math_prompt
