@@ -35,6 +35,26 @@ from flashrl.framework.data_models import (
     ToolResult,
     TrainingBatch,
 )
+from flashrl.framework.distributed.models import (
+    ActivateWeightVersionRequest,
+    ActivateWeightVersionResponse,
+    ComponentStatus,
+    LoadCheckpointRequest,
+    LoadCheckpointResponse,
+    OptimizeStepRequest,
+    OptimizeStepResponse,
+    RewardBatchRequest,
+    RewardBatchResponse,
+    RolloutBatchRequest,
+    RolloutBatchResponse,
+    RpcError,
+    RpcMessage,
+    SaveCheckpointRequest,
+    SaveCheckpointResponse,
+    StageResultPayload,
+    StatusResponse,
+    WeightVersionRef,
+)
 
 if TYPE_CHECKING:
     from flashrl.framework.agent import (
@@ -102,6 +122,25 @@ __all__ = [
     "RolloutOutput",
     "RewardOutput",
     "TrainingBatch",
+    # Distributed transport
+    "RpcMessage",
+    "RpcError",
+    "WeightVersionRef",
+    "ComponentStatus",
+    "StageResultPayload",
+    "RolloutBatchRequest",
+    "RolloutBatchResponse",
+    "RewardBatchRequest",
+    "RewardBatchResponse",
+    "OptimizeStepRequest",
+    "OptimizeStepResponse",
+    "ActivateWeightVersionRequest",
+    "ActivateWeightVersionResponse",
+    "SaveCheckpointRequest",
+    "SaveCheckpointResponse",
+    "LoadCheckpointRequest",
+    "LoadCheckpointResponse",
+    "StatusResponse",
     # Agent and tools
     "Agent",
     "Tool",

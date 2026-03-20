@@ -9,9 +9,11 @@ from typing import Any
 
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.data_models import WeightVersionInfo
+from flashrl.framework.distributed.models import WeightVersionRef
 from flashrl.framework.models.actor import ActorModel
 from flashrl.framework.models.device import set_num_threads
 from flashrl.framework.serving.base import ServingBackend
+import torch
 
 
 class HuggingFaceServingBackend(ServingBackend):
@@ -101,6 +103,18 @@ class HuggingFaceServingBackend(ServingBackend):
                 )
                 raise
             return self._commit_pending_weight_version()
+
+    def activate_weight_version_ref(self, weight_version: WeightVersionRef) -> WeightVersionInfo:
+        with self._lifecycle_lock:
+            current = self.current_weight_version()
+            if current.version_id == weight_version.version_id:
+                return current
+            artifact_path = Path(weight_version.artifact_uri)
+            if artifact_path.is_dir():
+                artifact_path = artifact_path / "model_state.pt"
+            state_dict = torch.load(artifact_path, weights_only=False)
+            self._actor.model.load_state_dict(state_dict)
+            return self._activate_published_weight_version(weight_version)
 
     def close(self) -> None:
         with self._lifecycle_lock:

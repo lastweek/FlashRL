@@ -8,6 +8,7 @@ from typing import Any
 from flashrl.framework.admin import utc_now_iso
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.data_models import WeightVersionInfo
+from flashrl.framework.distributed.models import WeightVersionRef
 from flashrl.framework.models.actor import ActorModel
 
 
@@ -125,6 +126,15 @@ class ServingBackend(ABC):
         )
         self._next_weight_version_id = max(int(raw_next_version_id), int(minimum_next_version_id))
 
+    def activate_weight_version_ref(self, weight_version: WeightVersionRef) -> WeightVersionInfo:
+        """Activate a previously published weight artifact when supported."""
+        current = self.current_weight_version()
+        if current.version_id == weight_version.version_id:
+            return current
+        raise NotImplementedError(
+            f"{type(self).__name__} does not support activate_weight_version_ref()."
+        )
+
     def _initialize_weight_version(
         self,
         *,
@@ -168,6 +178,27 @@ class ServingBackend(ABC):
         )
         self._pending_weight_version = pending
         return pending.model_copy(deep=True)
+
+    def _activate_published_weight_version(self, weight_version: WeightVersionRef) -> WeightVersionInfo:
+        """Mark one externally published weight version as active."""
+        activated = WeightVersionInfo(
+            version_id=weight_version.version_id,
+            source_training_step=weight_version.source_training_step,
+            source_epoch=weight_version.source_epoch,
+            activated_at=utc_now_iso(),
+            model_source=str(weight_version.artifact_uri),
+            origin=weight_version.origin,
+        )
+        self._active_weight_version = activated
+        self._pending_weight_version = None
+        self._next_weight_version_id = max(
+            int(getattr(self, "_next_weight_version_id", 1)),
+            activated.version_id + 1,
+        )
+        self._last_successful_sync_at = activated.activated_at
+        self._sync_healthy = True
+        self._last_sync_error = None
+        return activated.model_copy(deep=True)
 
     def _commit_pending_weight_version(self) -> WeightVersionInfo:
         """Activate the currently pending serving version."""

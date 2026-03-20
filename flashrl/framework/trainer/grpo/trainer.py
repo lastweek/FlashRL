@@ -15,6 +15,20 @@ from flashrl.framework.data_models import (
     TrainingBatch,
     WeightVersionInfo,
 )
+from flashrl.framework.distributed.local import (
+    LocalLearnerClient,
+    LocalRewardClient,
+    LocalRolloutClient,
+    LocalServingClient,
+)
+from flashrl.framework.distributed.models import (
+    ActivateWeightVersionRequest,
+    LoadCheckpointRequest,
+    OptimizeStepRequest,
+    RewardBatchRequest,
+    RolloutBatchRequest,
+    SaveCheckpointRequest,
+)
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -29,7 +43,6 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.base import BaseRolloutGenerator
 from flashrl.framework.rollout_metrics import count_llm_call_rounds, count_tool_calls
 from flashrl.framework.training import OptimizationResult
-from flashrl.framework.training.optimization import optimize_grpo_batch
 from flashrl.framework.trainer.grpo.grpo_helpers import (
     STAGE_ORDER,
     StepContext,
@@ -43,6 +56,12 @@ from flashrl.framework.trainer.grpo.grpo_helpers import (
 from flashrl.framework.utils import mean, summary_stats, truncate_preview
 
 if TYPE_CHECKING:
+    from flashrl.framework.distributed.protocols import (
+        LearnerClient,
+        RewardClient,
+        RolloutClient,
+        ServingClient,
+    )
     from flashrl.framework.metrics import MetricsSink
     from flashrl.framework.run_logger import RunLogger
     from flashrl.framework.serving import ServingBackend
@@ -56,14 +75,18 @@ class GRPOTrainer:
         self,
         config: TrainerConfig,
         grpo_config: GrpoConfig,
-        actor_backend: "ActorTrainingBackend",
+        actor_backend: "ActorTrainingBackend | None",
         reference_backend: "ReferenceTrainingBackend | None",
-        serving_backend: "ServingBackend",
-        reward_fn: UserDefinedReward,
-        rollout_generator: BaseRolloutGenerator,
+        serving_backend: "ServingBackend | None",
+        reward_fn: UserDefinedReward | None,
+        rollout_generator: BaseRolloutGenerator | None,
         run_logger: "RunLogger | None" = None,
         metrics_sink: "MetricsSink | None" = None,
         on_step_complete: Callable[[dict[str, Any]], None] | None = None,
+        rollout_client: "RolloutClient | None" = None,
+        reward_client: "RewardClient | None" = None,
+        learner_client: "LearnerClient | None" = None,
+        serving_client: "ServingClient | None" = None,
     ) -> None:
         """Initialize GRPO trainer."""
         self.config = config
@@ -79,10 +102,24 @@ class GRPOTrainer:
         self.reward_fn = reward_fn
         self.rollout_generator = rollout_generator
         self.on_step_complete = on_step_complete
+        self.rollout_client = rollout_client or self._build_default_rollout_client(
+            rollout_generator
+        )
+        self.reward_client = reward_client or self._build_default_reward_client(reward_fn)
+        self.learner_client = learner_client or self._build_default_learner_client(
+            actor_backend=actor_backend,
+            reference_backend=reference_backend,
+            serving_backend=serving_backend,
+        )
+        self.serving_client = serving_client or self._build_default_serving_client(
+            serving_backend
+        )
 
     @property
     def training_backend(self) -> "ActorTrainingBackend":
         """Expose the actor backend under the traditional training-backend name."""
+        if self.actor_backend is None:
+            raise RuntimeError("training_backend is unavailable without a local actor backend.")
         return self.actor_backend
 
     def attach_run_logger(self, run_logger: "RunLogger | None") -> None:
@@ -99,6 +136,47 @@ class GRPOTrainer:
     def active_step_context(self) -> StepContext | None:
         """Return the currently running step context when a step is in progress."""
         return self._active_step_context
+
+    def _build_default_rollout_client(
+        self,
+        rollout_generator: BaseRolloutGenerator | None,
+    ) -> "RolloutClient":
+        if rollout_generator is None:
+            raise ValueError("rollout_generator is required when rollout_client is not provided.")
+        return LocalRolloutClient(rollout_generator)
+
+    def _build_default_reward_client(
+        self,
+        reward_fn: UserDefinedReward | None,
+    ) -> "RewardClient":
+        if reward_fn is None:
+            raise ValueError("reward_fn is required when reward_client is not provided.")
+        return LocalRewardClient(reward_fn)
+
+    def _build_default_learner_client(
+        self,
+        *,
+        actor_backend: "ActorTrainingBackend | None",
+        reference_backend: "ReferenceTrainingBackend | None",
+        serving_backend: "ServingBackend | None",
+    ) -> "LearnerClient":
+        if actor_backend is None:
+            raise ValueError("actor_backend is required when learner_client is not provided.")
+        return LocalLearnerClient(
+            actor_backend,
+            reference_backend,
+            grpo_config=self.grpo_config,
+            serving_backend=serving_backend,
+            synchronize_serving=True,
+        )
+
+    def _build_default_serving_client(
+        self,
+        serving_backend: "ServingBackend | None",
+    ) -> "ServingClient":
+        if serving_backend is None:
+            raise ValueError("serving_backend is required when serving_client is not provided.")
+        return LocalServingClient(serving_backend)
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
@@ -184,12 +262,27 @@ class GRPOTrainer:
         rollout_started_at = current_time()
         self._install_serving_debug(context)
         try:
-            grouped_prompts, rollouts, prompt_indices, candidate_indices = (
-                self.rollout_generator.generate_grouped(prompts, context.group_size)
+            rollout_response = self.rollout_client.rollout_batch(
+                RolloutBatchRequest(
+                    step_id=context.step,
+                    prompts=prompts,
+                    group_size=context.group_size,
+                )
             )
         finally:
             self._clear_serving_debug()
         rollout_seconds = elapsed_seconds(rollout_started_at)
+        rollouts = list(rollout_response.rollouts)
+        prompt_indices = list(rollout_response.prompt_indices)
+        candidate_indices = list(rollout_response.candidate_indices)
+        if not prompt_indices and rollouts:
+            prompt_indices = [index // context.group_size for index in range(len(rollouts))]
+        if not candidate_indices and rollouts:
+            candidate_indices = [index % context.group_size for index in range(len(rollouts))]
+        grouped_prompts = [
+            prompts[prompt_index]
+            for prompt_index in prompt_indices
+        ] if prompt_indices else []
         grouped_prompts_count = len(grouped_prompts)
         prompt_lengths = []
         response_lengths = []
@@ -280,7 +373,11 @@ class GRPOTrainer:
         learner_batch = self._build_learner_batch(batch, advantages)
         # Explicitly delete the advantages tensor to free memory early
         del advantages
-        result = self._optimize_batch(learner_batch, context)
+        result = self._optimize_batch(
+            learner_batch,
+            context,
+            rollout_weight_version=rollout_response.weight_version,
+        )
         all_stage_timings = {
             "rollout": rollout_seconds,
             "reward": reward_seconds,
@@ -352,7 +449,12 @@ class GRPOTrainer:
         """Compute rewards and attach prompt/response context on failure."""
         started_at = current_time()
         try:
-            rewards = [self.reward_fn.compute(rollout) for rollout in rollouts]
+            rewards = self.reward_client.reward_batch(
+                RewardBatchRequest(
+                    step_id=context.step,
+                    rollouts=list(rollouts),
+                )
+            ).rewards
         except Exception as exc:
             if self.run_logger is not None:
                 self.run_logger.log_exception(
@@ -427,39 +529,68 @@ class GRPOTrainer:
         self,
         learner_batch: LearnerBatch,
         context: StepContext | None,
+        *,
+        rollout_weight_version: WeightVersionInfo | None,
     ) -> OptimizationResult:
         """Delegate learner-side tensor work to the training backend."""
-        result = optimize_grpo_batch(
-            actor_backend=self.actor_backend,
-            reference_backend=self.reference_backend,
-            grpo_config=self.grpo_config,
-            learner_batch=learner_batch,
+        optimize_response = self.learner_client.optimize_step(
+            OptimizeStepRequest(
+                step_id=(context.step if context is not None else None),
+                epoch=(context.epoch if context is not None else 0),
+                learner_batch=learner_batch,
+                rollout_weight_version=rollout_weight_version,
+            )
+        )
+        result = OptimizationResult(
+            loss=optimize_response.loss,
+            policy_loss=optimize_response.policy_loss,
+            kl_divergence=optimize_response.kl_divergence,
+            learning_rate=optimize_response.learning_rate,
+            response_tokens_total=optimize_response.response_tokens_total,
+            reference_active=optimize_response.reference_active,
+            stages=[
+                StageResult(
+                    name=stage.name,
+                    seconds=float(stage.seconds),
+                    metrics=dict(stage.metrics),
+                )
+                for stage in optimize_response.stages
+            ],
         )
         for stage in result.stages:
             if stage.name == "reference_forward" and not result.reference_active:
                 continue
             self._log_stage(context, stage)
 
-        sync_info, sync_seconds = timed_call(
-            lambda: self.actor_backend.sync_weights_to(
-                self.serving_backend,
-                source_training_step=context.step,
-                source_epoch=context.epoch,
-                origin="sync",
+        activation_response, sync_seconds = timed_call(
+            lambda: self.serving_client.activate_weight_version(
+                ActivateWeightVersionRequest(
+                    step_id=(context.step if context is not None else None),
+                    weight_version=optimize_response.weight_version,
+                )
             )
         )
+        active_weight_version = activation_response.active_weight_version
         sync_stage = StageResult(
             name="sync",
             seconds=sync_seconds,
             metrics={
-                "weight_version_id": sync_info.version_id,
+                "weight_version_id": (
+                    active_weight_version.version_id
+                    if active_weight_version is not None
+                    else optimize_response.weight_version.version_id
+                ),
             },
         )
         result.stages.append(sync_stage)
         if context is not None:
             partial_step_seconds = sum(stage.seconds for stage in result.stages)
             sync_stage.metrics = {
-                "weight_version_id": sync_info.version_id,
+                "weight_version_id": (
+                    active_weight_version.version_id
+                    if active_weight_version is not None
+                    else optimize_response.weight_version.version_id
+                ),
                 "step_duration_seconds": partial_step_seconds,
                 "tokens_per_second": (
                     result.response_tokens_total / partial_step_seconds
@@ -549,6 +680,8 @@ class GRPOTrainer:
 
     def _install_serving_debug(self, context: StepContext) -> None:
         """Install serving live-rollout debug hooks for the current step when enabled."""
+        if self.serving_backend is None:
+            return
         config = getattr(self.serving_backend, "config", None)
         if not getattr(config, "debug_live_rollout", False):
             return
@@ -561,6 +694,8 @@ class GRPOTrainer:
 
     def _clear_serving_debug(self) -> None:
         """Clear serving live-rollout debug hooks after the rollout stage completes."""
+        if self.serving_backend is None:
+            return
         if hasattr(self.serving_backend, "clear_live_rollout_debug"):
             self.serving_backend.clear_live_rollout_debug()
 
@@ -578,20 +713,16 @@ class GRPOTrainer:
         checkpoint_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save model checkpoint."""
-        payload = {
-            "controller_state": {
-                "epoch": self.current_epoch,
-                "total_steps": self.total_steps,
-            },
-            "backend_states": {
-                "actor": self.actor_backend.export_state(),
-                "reference": (
-                    self.reference_backend.export_state() if self.reference_backend is not None else None
-                ),
-            },
-            "checkpoint_metadata": dict(checkpoint_metadata or {}),
-        }
-        torch.save(payload, path)
+        self.learner_client.save_checkpoint(
+            SaveCheckpointRequest(
+                path=path,
+                controller_state={
+                    "epoch": self.current_epoch,
+                    "total_steps": self.total_steps,
+                },
+                checkpoint_metadata=dict(checkpoint_metadata or {}),
+            )
+        )
 
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
@@ -604,52 +735,11 @@ class GRPOTrainer:
         path: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Load checkpoint state and expose any attached checkpoint metadata."""
-        checkpoint = torch.load(path, weights_only=False)
-        backend_states = checkpoint.get("backend_states")
-        if not isinstance(backend_states, dict):
-            raise ValueError(
-                "Checkpoint is incompatible with the role-based runtime. Recreate it with the current FlashRL version."
-            )
-
-        actor_state = backend_states.get("actor")
-        if not isinstance(actor_state, dict):
-            raise ValueError("Checkpoint is missing backend_states.actor.")
-        self.actor_backend.load_state(actor_state)
-
-        reference_state = backend_states.get("reference")
-        if self.reference_backend is None:
-            if reference_state is not None:
-                raise ValueError(
-                    "Checkpoint contains reference backend state, but this trainer was created without a reference backend."
-                )
-        else:
-            if not isinstance(reference_state, dict):
-                raise ValueError(
-                    "Checkpoint is missing backend_states.reference for a trainer with a reference backend."
-                )
-            self.reference_backend.load_state(reference_state)
-
-        controller_state = dict(checkpoint.get("controller_state", {}))
-        checkpoint_metadata = checkpoint.get("checkpoint_metadata")
-        if not isinstance(checkpoint_metadata, dict):
-            checkpoint_metadata = None
+        response = self.learner_client.load_checkpoint(LoadCheckpointRequest(path=path))
+        controller_state = dict(response.controller_state)
+        checkpoint_metadata = response.checkpoint_metadata
         self.current_epoch = int(controller_state.get("epoch", 0))
         self.total_steps = int(controller_state.get("total_steps", 0))
-        serving_metadata = checkpoint_metadata.get("serving") if checkpoint_metadata else None
-        if isinstance(serving_metadata, dict):
-            restore_weight_version_state = getattr(
-                self.serving_backend,
-                "restore_weight_version_state",
-                None,
-            )
-            if callable(restore_weight_version_state):
-                restore_weight_version_state(serving_metadata.get("weight_version_state"))
-        self.actor_backend.sync_weights_to(
-            self.serving_backend,
-            source_training_step=self.total_steps,
-            source_epoch=self.current_epoch + 1 if self.current_epoch >= 0 else None,
-            origin="resume",
-        )
         return controller_state, checkpoint_metadata
 
     def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:

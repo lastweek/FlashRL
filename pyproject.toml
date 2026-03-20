@@ -22,9 +22,15 @@ dependencies = [
     "uvicorn>=0.30.0",
 ]
 
+[project.scripts]
+flashrl = "flashrl.__main__:main"
+
 [project.optional-dependencies]
 vllm = [
     "vllm>=0.16.0",
+]
+platform = [
+    "kubernetes>=32.0.0",
 ]
 dev = [
     "httpx>=0.28.0",

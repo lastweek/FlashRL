@@ -26,6 +26,7 @@ from uuid import uuid4
 from flashrl.framework.admin import build_admin_object, utc_now_iso
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.data_models import WeightVersionInfo
+from flashrl.framework.distributed.models import WeightVersionRef
 from flashrl.framework.models.actor import ActorModel, GeneratedSample
 from flashrl.framework.serving.base import ServingBackend
 
@@ -391,6 +392,45 @@ class VLLMServingBackend(ServingBackend):
                     raise RuntimeError(
                         f"Failed to resume inference for replica {replica.index}: {exc}"
                     ) from exc
+
+    def activate_weight_version_ref(self, weight_version: WeightVersionRef) -> WeightVersionInfo:
+        with self._lifecycle_lock:
+            current = self.current_weight_version()
+            if current.version_id == weight_version.version_id:
+                return current
+            model_source = str(weight_version.artifact_uri)
+            advanced_replicas: list[_Replica] = []
+            previous_sources = {replica.index: replica.model_source for replica in self._replicas}
+            try:
+                for replica in self._replicas:
+                    replica.phase = "Syncing"
+                    self._request_json(
+                        f"{replica.base_url}/v1/load_weights_from_disk",
+                        method="POST",
+                        payload={"model_source": model_source},
+                        timeout=60.0,
+                    )
+                    replica.model_source = model_source
+                    replica.phase = "Ready"
+                    replica.last_error = None
+                    advanced_replicas.append(replica)
+            except Exception as exc:
+                for replica in advanced_replicas:
+                    previous_source = previous_sources[replica.index]
+                    try:
+                        self._request_json(
+                            f"{replica.base_url}/v1/load_weights_from_disk",
+                            method="POST",
+                            payload={"model_source": previous_source},
+                            timeout=60.0,
+                        )
+                        replica.model_source = previous_source
+                        replica.phase = "Ready"
+                    except Exception as rollback_exc:
+                        replica.phase = "Failed"
+                        replica.last_error = f"Rollback failed after activation error: {rollback_exc}"
+                raise RuntimeError(f"Failed to activate weight version {weight_version.version_id}: {exc}") from exc
+            return self._activate_published_weight_version(weight_version)
 
     def close(self) -> None:
         with self._lifecycle_lock:
