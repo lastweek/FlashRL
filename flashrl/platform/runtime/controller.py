@@ -19,9 +19,8 @@ from flashrl.framework.distributed import (
     HttpServingClient,
 )
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
-from flashrl.platform.crd import FlashRLJob
-from flashrl.platform.operator import GROUP, PLURAL, VERSION
-from flashrl.platform.runtime import _service_url, _shared_path, load_dataset, load_job_config
+from flashrl.platform.k8s.job import FlashRLJob, GROUP, PLURAL, VERSION
+from flashrl.platform.runtime.common import load_dataset, load_job_config, service_url, shared_path
 
 
 class ControllerStatusWriter:
@@ -170,10 +169,10 @@ def run_controller(job_path: str | Path | None = None) -> None:
             if metadata_key in live_job.metadata:
                 job.metadata[metadata_key] = live_job.metadata[metadata_key]
 
-    rollout_client = HttpRolloutClient(_service_url("rollout"))
-    reward_client = HttpRewardClient(_service_url("reward"))
-    learner_client = HttpLearnerClient(_service_url("learner"))
-    serving_client = HttpServingClient(_service_url("serving"))
+    rollout_client = HttpRolloutClient(service_url("rollout"))
+    reward_client = HttpRewardClient(service_url("reward"))
+    learner_client = HttpLearnerClient(service_url("learner"))
+    serving_client = HttpServingClient(service_url("serving"))
 
     trainer = GRPOTrainer(
         config=job.spec.framework.trainer,
@@ -250,7 +249,7 @@ def _resume_target(job: FlashRLJob) -> str | None:
 def _checkpoint_path(job: FlashRLJob, *, step: int, final: bool) -> Path:
     if final and job.spec.checkpointing.final_path is not None:
         return Path(job.spec.checkpointing.final_path)
-    base_dir = _shared_path(job.spec.storage.checkpoints.uriPrefix, purpose="checkpoints")
+    base_dir = shared_path(job.spec.storage.checkpoints.uriPrefix, purpose="checkpoints")
     base_dir.mkdir(parents=True, exist_ok=True)
     if final:
         return base_dir / "final.pt"

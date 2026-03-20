@@ -6,7 +6,7 @@ import os
 
 import pytest
 
-from flashrl.platform.minikube_e2e import run_minikube_math_e2e
+from flashrl.platform.dev.minikube import run_minikube_math_e2e
 
 
 pytestmark = [pytest.mark.integration, pytest.mark.minikube]

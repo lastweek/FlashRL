@@ -64,7 +64,7 @@ Install the operator:
 
 ```bash
 kubectl apply -f flashrl/platform/k8s/namespace.yaml
-kubectl apply -f flashrl/platform/k8s/crd.yaml
+kubectl apply -f flashrl/platform/k8s/job-crd.yaml
 kubectl apply -f flashrl/platform/k8s/operator-rbac.yaml
 kubectl apply -f flashrl/platform/k8s/operator.yaml
 ```

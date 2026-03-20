@@ -1,4 +1,4 @@
-"""FlashRLJob CRD models and manifest helpers."""
+"""FlashRLJob models, API constants, and CRD manifest helpers."""
 
 from __future__ import annotations
 
@@ -16,6 +16,13 @@ from flashrl.framework.config import (
     TrainerConfig,
     TrainingConfig,
 )
+
+
+GROUP = "platform.flashrl.dev"
+VERSION = "v1alpha1"
+PLURAL = "flashrljobs"
+KIND = "FlashRLJob"
+CRD_NAME = f"{PLURAL}.{GROUP}"
 
 
 ELASTIC_COMPONENTS = ("serving", "rollout", "reward")
@@ -408,8 +415,8 @@ class FlashRLJob(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    apiVersion: Literal["platform.flashrl.dev/v1alpha1"] = "platform.flashrl.dev/v1alpha1"
-    kind: Literal["FlashRLJob"] = "FlashRLJob"
+    apiVersion: Literal["platform.flashrl.dev/v1alpha1"] = f"{GROUP}/{VERSION}"
+    kind: Literal["FlashRLJob"] = KIND
     metadata: dict[str, Any]
     spec: FlashRLJobSpec
     status: FlashRLJobStatus = Field(default_factory=FlashRLJobStatus)
@@ -480,19 +487,19 @@ def flashrljob_crd_manifest() -> dict[str, Any]:
     return {
         "apiVersion": "apiextensions.k8s.io/v1",
         "kind": "CustomResourceDefinition",
-        "metadata": {"name": "flashrljobs.platform.flashrl.dev"},
+        "metadata": {"name": CRD_NAME},
         "spec": {
-            "group": "platform.flashrl.dev",
+            "group": GROUP,
             "scope": "Namespaced",
             "names": {
-                "plural": "flashrljobs",
+                "plural": PLURAL,
                 "singular": "flashrljob",
-                "kind": "FlashRLJob",
+                "kind": KIND,
                 "shortNames": ["frj"],
             },
             "versions": [
                 {
-                    "name": "v1alpha1",
+                    "name": VERSION,
                     "served": True,
                     "storage": True,
                     "schema": {

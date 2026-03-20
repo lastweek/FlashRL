@@ -6,14 +6,14 @@ import argparse
 
 import uvicorn
 
-from flashrl.platform.controller import create_controller_app
-from flashrl.platform.runtime import (
+from flashrl.platform.runtime.common import load_job_config
+from flashrl.platform.runtime.components import (
     create_learner_component_app,
     create_reward_component_app,
     create_rollout_component_app,
     create_serving_component_app,
-    load_job_config,
 )
+from flashrl.platform.runtime.controller import create_controller_app
 
 
 def build_component_argument_parser() -> argparse.ArgumentParser:

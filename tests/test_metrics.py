@@ -2078,7 +2078,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert Path("flashrl/examples/presets/grpo_naive.yaml").exists()
     assert Path("flashrl/platform/README.md").exists()
     assert Path("flashrl/platform/k8s/namespace.yaml").exists()
-    assert Path("flashrl/platform/k8s/crd.yaml").exists()
+    assert Path("flashrl/platform/k8s/job-crd.yaml").exists()
     assert Path("flashrl/platform/k8s/operator-rbac.yaml").exists()
     assert Path("flashrl/platform/k8s/operator.yaml").exists()
 

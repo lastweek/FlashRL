@@ -9,6 +9,27 @@ The primary workflow is:
 3. render one `FlashRLJob`
 4. apply it with `kubectl`
 
+## Code Map
+
+- `job.py`
+  The `FlashRLJob` API, schema, status model, and CRD manifest generator.
+- `config.py`
+  The config compiler from `config.yaml` into a validated `FlashRLJob`.
+- `k8s/renderer.py`
+  Pure rendering of child Kubernetes resources for one job.
+- `k8s/operator.py`
+  The reconcile loop, autoscaling, recovery, and status aggregation.
+- `runtime/common.py`
+  Shared pod-runtime helpers such as job loading, service URL resolution, and shared paths.
+- `runtime/components.py`
+  FastAPI app factories for rollout, reward, learner, and serving pods.
+- `runtime/controller.py`
+  The controller runtime that drives GRPO over HTTP clients.
+- `runtime/cli.py`
+  The `flashrl component run ...` entrypoint used by pod commands.
+- `dev/minikube.py`
+  The local minikube E2E helper used by the opt-in smoke path.
+
 ## Build Images
 
 ```bash
@@ -22,7 +43,7 @@ docker build -f docker/training-fsdp.Dockerfile -t flashrl-training-fsdp:dev .
 
 ```bash
 kubectl apply -f flashrl/platform/k8s/namespace.yaml
-kubectl apply -f flashrl/platform/k8s/crd.yaml
+kubectl apply -f flashrl/platform/k8s/job-crd.yaml
 kubectl apply -f flashrl/platform/k8s/operator-rbac.yaml
 kubectl apply -f flashrl/platform/k8s/operator.yaml
 ```
@@ -32,7 +53,7 @@ local build command above.
 
 What this does:
 
-- `crd.yaml` installs the `FlashRLJob` custom resource
+- `job-crd.yaml` installs the `FlashRLJob` custom resource
 - `operator-rbac.yaml` installs the service account and RBAC the operator needs
 - `operator.yaml` creates the operator `Deployment`
 - Kubernetes then starts the operator pod from `flashrl-operator:dev`

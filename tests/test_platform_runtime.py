@@ -7,7 +7,7 @@ from pathlib import Path
 
 import pytest
 
-import flashrl.platform.controller as controller_module
+import flashrl.platform.runtime.controller as controller_module
 
 
 pytestmark = pytest.mark.unit

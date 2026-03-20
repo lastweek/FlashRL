@@ -2,15 +2,18 @@
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
+import subprocess
+import sys
 
 import pytest
 
 from flashrl.framework.config import FlashRLConfig, RunConfig
 from flashrl.platform.cli import main as platform_main
 from flashrl.platform.config import PlatformConfig, build_flashrl_job
-from flashrl.platform.crd import FlashRLJob, flashrljob_crd_manifest
-from flashrl.platform.operator import render_child_resources, render_operator_resources
+from flashrl.platform.k8s.job import FlashRLJob, flashrljob_crd_manifest
+from flashrl.platform.k8s.renderer import render_child_resources
 
 
 pytestmark = pytest.mark.unit
@@ -195,6 +198,22 @@ def test_render_child_resources_builds_expected_workloads() -> None:
         deployments["demo-job-controller"]["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"]
         == "IfNotPresent"
     )
+
+
+def test_platform_module_surface_imports_cleanly() -> None:
+    """The structured platform modules should remain importable by responsibility."""
+    assert importlib.import_module("flashrl.platform.config") is not None
+    assert importlib.import_module("flashrl.platform.k8s.job") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator") is not None
+    assert importlib.import_module("flashrl.platform.runtime.controller") is not None
+    assert importlib.import_module("flashrl.platform.runtime.cli") is not None
+
+
+def test_platform_cli_no_longer_supports_render_operator() -> None:
+    """The debug-only operator render subcommand should stay removed."""
+    with pytest.raises(SystemExit) as exc_info:
+        platform_main(["platform", "render-operator"])
+    assert exc_info.value.code == 2
 
 
 def test_flashrl_job_defaults_platform_policy_knobs() -> None:
@@ -433,15 +452,32 @@ def test_flashrljob_crd_manifest_exposes_expected_kind() -> None:
     assert "failurePolicy" in spec_properties["rollout"]["properties"]
 
 
-def test_render_operator_resources_include_deployment_and_cluster_rbac() -> None:
-    """The platform package should ship install manifests for the operator itself."""
-    rendered = render_operator_resources(namespace="flashrl-system")
-    kinds = [item["kind"] for item in rendered]
-    assert kinds == ["ServiceAccount", "ClusterRole", "ClusterRoleBinding", "Deployment"]
-    cluster_role = next(item for item in rendered if item["kind"] == "ClusterRole")
-    core_resources = next(rule["resources"] for rule in cluster_role["rules"] if rule["apiGroups"] == [""])
-    assert "persistentvolumeclaims" in core_resources
+def test_platform_k8s_install_assets_exist() -> None:
+    """The platform package should ship raw Kubernetes install manifests."""
     assert Path("flashrl/platform/k8s/namespace.yaml").exists()
-    assert Path("flashrl/platform/k8s/crd.yaml").exists()
+    assert Path("flashrl/platform/k8s/job-crd.yaml").exists()
     assert Path("flashrl/platform/k8s/operator-rbac.yaml").exists()
     assert Path("flashrl/platform/k8s/operator.yaml").exists()
+
+
+def test_checked_in_job_crd_matches_generator_output() -> None:
+    """The committed CRD artifact should exactly match the generator output."""
+    repo_root = Path(__file__).resolve().parents[1]
+    generator = repo_root / "flashrl/platform/k8s/job-crd-gen.py"
+    checked_in = (repo_root / "flashrl/platform/k8s/job-crd.yaml").read_text(encoding="utf-8")
+    generated = subprocess.check_output(
+        [sys.executable, "-c", (
+            "import importlib.util, pathlib; "
+            "path = pathlib.Path(r'%s'); "
+            "spec = importlib.util.spec_from_file_location('job_crd_gen', path); "
+            "module = importlib.util.module_from_spec(spec); "
+            "spec.loader.exec_module(module); "
+            "print(module.render_job_crd_yaml(), end='')"
+        ) % str(generator)],
+        text=True,
+        cwd=str(repo_root),
+    )
+    assert checked_in == generated, (
+        "flashrl/platform/k8s/job-crd.yaml is out of date. "
+        "Run `python3 flashrl/platform/k8s/job-crd-gen.py` and commit the regenerated file."
+    )

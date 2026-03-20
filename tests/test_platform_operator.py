@@ -7,8 +7,8 @@ from urllib.parse import urlparse
 
 import pytest
 
-from flashrl.platform.crd import FlashRLJob
-from flashrl.platform.operator import FINALIZER, FlashRLOperator
+from flashrl.platform.k8s.job import FlashRLJob
+from flashrl.platform.k8s.operator import FINALIZER, FlashRLOperator
 
 
 pytestmark = pytest.mark.unit

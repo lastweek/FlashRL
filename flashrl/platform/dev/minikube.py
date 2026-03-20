@@ -17,7 +17,7 @@ import yaml
 from flashrl.platform.config import PlatformConfig, load_flashrl_config
 
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[3]
 DEFAULT_CONFIG = REPO_ROOT / "flashrl/examples/math/config.yaml"
 DEFAULT_PROFILE = "minikube"
 DEFAULT_OPERATOR_NAMESPACE = "flashrl-system"
@@ -370,7 +370,7 @@ def run_minikube_math_e2e(
     _ensure_namespace(operator_namespace)
     _ensure_namespace(namespace)
     _kubectl_apply_file(REPO_ROOT / "flashrl/platform/k8s/namespace.yaml")
-    _kubectl_apply_file(REPO_ROOT / "flashrl/platform/k8s/crd.yaml")
+    _kubectl_apply_file(REPO_ROOT / "flashrl/platform/k8s/job-crd.yaml")
     rbac_docs = _load_yaml_documents(REPO_ROOT / "flashrl/platform/k8s/operator-rbac.yaml")
     for payload in rbac_docs:
         if payload.get("kind") == "ServiceAccount":

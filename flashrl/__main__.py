@@ -16,7 +16,7 @@ def main(argv: list[str] | None = None) -> int:
 
         return int(platform_main(["platform", *args[1:]]))
     if args[0] == "component":
-        from flashrl.platform.component_cli import main as component_main
+        from flashrl.platform.runtime.cli import main as component_main
 
         return int(component_main(args[1:]))
     print(f"Unknown command: {args[0]}", file=sys.stderr)

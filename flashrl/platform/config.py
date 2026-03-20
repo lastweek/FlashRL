@@ -16,7 +16,7 @@ from flashrl.framework.config import (
     _expand_env_vars,
     load_yaml_mapping,
 )
-from flashrl.platform.crd import (
+from flashrl.platform.k8s.job import (
     DatasetSpec,
     FlashRLJob,
     FlashRLJobSpec,
