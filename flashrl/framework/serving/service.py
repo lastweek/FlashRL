@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from fastapi import FastAPI
 
 from flashrl.framework.data_models import WeightVersionInfo
@@ -15,14 +17,23 @@ from flashrl.framework.distributed.models import (
     GeneratedSamplePayload,
     StatusResponse,
 )
+from flashrl.framework.memory import capture_memory_snapshot
 from flashrl.framework.serving.base import ServingBackend
 
 
 class ServingService:
     """In-process serving service over one serving backend."""
 
-    def __init__(self, serving_backend: ServingBackend) -> None:
+    def __init__(
+        self,
+        serving_backend: ServingBackend,
+        *,
+        status_metadata: dict[str, Any] | None = None,
+        event_logger: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self._serving_backend = serving_backend
+        self._status_metadata = dict(status_metadata or {})
+        self._event_logger = event_logger
 
     def generate_grouped(self, request: GenerateGroupedRequest) -> GenerateGroupedResponse:
         active = self._serving_backend.current_weight_version()
@@ -104,6 +115,10 @@ class ServingService:
                 ready_replica_count=desired_replicas if active is not None else 0,
                 desired_replica_count=desired_replicas,
                 active_weight_version=active,
+                metadata={
+                    "memory": capture_memory_snapshot(self._serving_backend.device),
+                    **dict(self._status_metadata),
+                },
             )
         )
 
@@ -126,6 +141,7 @@ def create_serving_service_app(service: ServingService) -> FastAPI:
         kind="ServingService",
         name="serving",
         drainable=True,
+        event_logger=service._event_logger,
     )
 
     @app.post("/v1/generate-grouped")

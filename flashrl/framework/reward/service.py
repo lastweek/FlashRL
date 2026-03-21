@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from fastapi import FastAPI
 
 from flashrl.framework.distributed.http_common import install_common_routes
@@ -11,14 +13,23 @@ from flashrl.framework.distributed.models import (
     RewardBatchResponse,
     StatusResponse,
 )
+from flashrl.framework.memory import capture_memory_snapshot
 from flashrl.framework.reward.user_defined import UserDefinedReward
 
 
 class RewardService:
     """In-process reward service over one user-defined reward."""
 
-    def __init__(self, reward: UserDefinedReward) -> None:
+    def __init__(
+        self,
+        reward: UserDefinedReward,
+        *,
+        status_metadata: dict[str, Any] | None = None,
+        event_logger: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self._reward = reward
+        self._status_metadata = dict(status_metadata or {})
+        self._event_logger = event_logger
 
     def reward_batch(self, request: RewardBatchRequest) -> RewardBatchResponse:
         rewards = self._reward.compute_batch(request.rollouts)
@@ -43,6 +54,10 @@ class RewardService:
                 healthy=True,
                 ready_replica_count=1,
                 desired_replica_count=1,
+                metadata={
+                    "memory": capture_memory_snapshot(getattr(self._reward, "device", None)),
+                    **dict(self._status_metadata),
+                },
             )
         )
 
@@ -56,6 +71,7 @@ def create_reward_service_app(service: RewardService) -> FastAPI:
         kind="RewardService",
         name="reward",
         drainable=True,
+        event_logger=service._event_logger,
     )
 
     @app.post("/v1/reward-batches")

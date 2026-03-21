@@ -5,12 +5,14 @@ from __future__ import annotations
 import gc
 from dataclasses import dataclass
 import inspect
+import time
 from typing import TYPE_CHECKING, Any
 
 import torch
 import torch.nn.functional as F
 
 from flashrl.framework.data_models import LearnerBatch
+from flashrl.framework.memory import capture_memory_snapshot, memory_pressure_tags
 from flashrl.framework.observability import StageResult, timed_call
 from flashrl.framework.trainer.grpo.loss_variants import (
     LossAssemblyResult,
@@ -203,6 +205,50 @@ def compute_rollout_log_probs_from_actor(
 # The optimize_grpo_batch function below uses this unified interface.
 
 
+@dataclass
+class OptimizationStageError(RuntimeError):
+    """Wrap one learner-stage failure with stage and memory context."""
+
+    stage_name: str
+    message: str
+    memory_snapshot: dict[str, Any]
+    reason_tags: list[str]
+
+    def __post_init__(self) -> None:
+        self.args = (self.message,)
+
+    def __str__(self) -> str:
+        return self.message
+
+
+def _timed_stage(
+    *,
+    stage_name: str,
+    device: Any,
+    operation,
+    shared_device_pressure: bool = False,
+) -> tuple[Any, float, dict[str, Any], dict[str, Any]]:
+    """Run one learner substage and capture before/after memory."""
+    before_memory = capture_memory_snapshot(device)
+    started_at = time.perf_counter()
+    try:
+        result = operation()
+    except Exception as exc:
+        failure_memory = capture_memory_snapshot(device)
+        raise OptimizationStageError(
+            stage_name=stage_name,
+            message=str(exc),
+            memory_snapshot=failure_memory,
+            reason_tags=memory_pressure_tags(
+                exc,
+                snapshot=failure_memory,
+                shared_device_pressure=shared_device_pressure,
+            ),
+        ) from exc
+    after_memory = capture_memory_snapshot(device)
+    return result, time.perf_counter() - started_at, before_memory, after_memory
+
+
 def optimize_grpo_batch(
     *,
     actor_backend: "ActorTrainingBackend",
@@ -230,12 +276,18 @@ def optimize_grpo_batch(
             prompt_lengths,
             full_lengths,
             rollout_response_log_probs,
-        ), prepare_seconds = timed_call(lambda: actor_backend.prepare_inputs(learner_batch))
+        ), prepare_seconds, prepare_memory_before, prepare_memory_after = _timed_stage(
+            stage_name="prepare_inputs",
+            device=actor_backend.device,
+            operation=lambda: actor_backend.prepare_inputs(learner_batch),
+        )
         full_tokens_total = int(sum(full_lengths))
         response_tokens_total = int(sum(len(tokens) for tokens in learner_batch.response_token_ids))
 
-        actor_logits, actor_forward_seconds = timed_call(
-            lambda: actor_backend.forward_logits(input_ids, attention_mask)
+        actor_logits, actor_forward_seconds, actor_forward_memory_before, actor_forward_memory_after = _timed_stage(
+            stage_name="actor_forward",
+            device=actor_backend.device,
+            operation=lambda: actor_backend.forward_logits(input_ids, attention_mask),
         )
 
         # Compute π^train_old logprobs BEFORE optimizer update
@@ -252,19 +304,25 @@ def optimize_grpo_batch(
 
         reference_active = reference_backend is not None and grpo_config.kl_coefficient > 0.0
         if reference_active:
-            ref_logits, reference_forward_seconds = timed_call(
-                lambda: reference_logits(reference_backend, input_ids, attention_mask)
+            ref_logits, reference_forward_seconds, reference_memory_before, reference_memory_after = _timed_stage(
+                stage_name="reference_forward",
+                device=getattr(reference_backend, "device", actor_backend.device),
+                operation=lambda: reference_logits(reference_backend, input_ids, attention_mask),
             )
         else:
             reference_forward_seconds = 0.0
+            reference_memory_before = {}
+            reference_memory_after = {}
 
         advantages = torch.tensor(
             learner_batch.advantages,
             dtype=torch.float32,
             device=actor_backend.device,
         )
-        loss_result, loss_seconds = timed_call(
-            lambda: assemble_grpo_loss(
+        loss_result, loss_seconds, loss_memory_before, loss_memory_after = _timed_stage(
+            stage_name="loss_assembly",
+            device=actor_backend.device,
+            operation=lambda: assemble_grpo_loss(
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 prompt_lengths=prompt_lengths,
@@ -274,11 +332,19 @@ def optimize_grpo_batch(
                 training_response_log_probs=training_old_response_log_probs,  # π^train_old
                 advantages=advantages,
                 config=grpo_config,  # Pass full config instead of individual parameters
-            )
+            ),
         )
 
-        _, backward_seconds = timed_call(actor_backend.backward_step(loss_result.loss))
-        _, optimizer_seconds = timed_call(actor_backend.optimizer_step)
+        _, backward_seconds, backward_memory_before, backward_memory_after = _timed_stage(
+            stage_name="backward",
+            device=actor_backend.device,
+            operation=actor_backend.backward_step(loss_result.loss),
+        )
+        _, optimizer_seconds, optimizer_memory_before, optimizer_memory_after = _timed_stage(
+            stage_name="optimizer",
+            device=actor_backend.device,
+            operation=actor_backend.optimizer_step,
+        )
         learning_rate = float(actor_backend.optimizer.param_groups[0]["lr"])
 
         stages = [
@@ -289,12 +355,22 @@ def optimize_grpo_batch(
                     "full_tokens_mean": mean(full_lengths),
                     "full_tokens_max": max(full_lengths, default=0),
                     "response_tokens_total": response_tokens_total,
+                    "memory": {
+                        "before": prepare_memory_before,
+                        "after": prepare_memory_after,
+                    },
                 },
             ),
             StageResult(
                 name="actor_forward",
                 seconds=actor_forward_seconds,
-                metrics={"full_tokens_total": full_tokens_total},
+                metrics={
+                    "full_tokens_total": full_tokens_total,
+                    "memory": {
+                        "before": actor_forward_memory_before,
+                        "after": actor_forward_memory_after,
+                    },
+                },
             ),
         ]
         if reference_active:
@@ -302,7 +378,13 @@ def optimize_grpo_batch(
                 StageResult(
                     name="reference_forward",
                     seconds=reference_forward_seconds,
-                    metrics={"full_tokens_total": full_tokens_total},
+                    metrics={
+                        "full_tokens_total": full_tokens_total,
+                        "memory": {
+                            "before": reference_memory_before,
+                            "after": reference_memory_after,
+                        },
+                    },
                 )
             )
         stages.extend(
@@ -320,17 +402,33 @@ def optimize_grpo_batch(
                         "importance_sampling_ratio_min": loss_result.importance_sampling_ratio_min,
                         "importance_sampling_ratio_max": loss_result.importance_sampling_ratio_max,
                         "clip_fraction": loss_result.clip_fraction,
+                        "memory": {
+                            "before": loss_memory_before,
+                            "after": loss_memory_after,
+                        },
                     },
                 ),
                 StageResult(
                     name="backward",
                     seconds=backward_seconds,
-                    metrics={"loss": float(loss_result.loss.item())},
+                    metrics={
+                        "loss": float(loss_result.loss.item()),
+                        "memory": {
+                            "before": backward_memory_before,
+                            "after": backward_memory_after,
+                        },
+                    },
                 ),
                 StageResult(
                     name="optimizer",
                     seconds=optimizer_seconds,
-                    metrics={"learning_rate": learning_rate},
+                    metrics={
+                        "learning_rate": learning_rate,
+                        "memory": {
+                            "before": optimizer_memory_before,
+                            "after": optimizer_memory_after,
+                        },
+                    },
                 ),
             ]
         )

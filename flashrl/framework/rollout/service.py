@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any, Callable
+
 from fastapi import FastAPI
 
 from flashrl.framework.data_models import WeightVersionInfo
@@ -12,14 +14,23 @@ from flashrl.framework.distributed.models import (
     RolloutBatchResponse,
     StatusResponse,
 )
+from flashrl.framework.memory import capture_memory_snapshot
 from flashrl.framework.rollout.base import BaseRolloutGenerator
 
 
 class RolloutService:
     """In-process rollout service over one rollout generator."""
 
-    def __init__(self, rollout_generator: BaseRolloutGenerator) -> None:
+    def __init__(
+        self,
+        rollout_generator: BaseRolloutGenerator,
+        *,
+        status_metadata: dict[str, Any] | None = None,
+        event_logger: Callable[[str, dict[str, Any]], None] | None = None,
+    ) -> None:
         self._rollout_generator = rollout_generator
+        self._status_metadata = dict(status_metadata or {})
+        self._event_logger = event_logger
 
     def rollout_batch(self, request: RolloutBatchRequest) -> RolloutBatchResponse:
         original_config = self._rollout_generator.config
@@ -69,6 +80,12 @@ class RolloutService:
                 healthy=True,
                 ready_replica_count=1,
                 desired_replica_count=1,
+                metadata={
+                    "memory": capture_memory_snapshot(
+                        getattr(self._rollout_generator, "device", None)
+                    ),
+                    **dict(self._status_metadata),
+                },
             )
         )
 
@@ -82,6 +99,7 @@ def create_rollout_service_app(service: RolloutService) -> FastAPI:
         kind="RolloutService",
         name="rollout",
         drainable=True,
+        event_logger=service._event_logger,
     )
 
     @app.post("/v1/rollout-batches")

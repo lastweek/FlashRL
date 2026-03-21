@@ -40,3 +40,56 @@ def storage_path_from_uri(uri: str, *, purpose: str) -> Path:
     raise ValueError(
         f"Only plain paths and file:// URIs are supported for platform {purpose} storage today; got {uri!r}."
     )
+
+
+def job_uid_for(job: FlashRLJob) -> str:
+    """Resolve the stable per-job UID used in pod env and log paths."""
+    env_value = os.environ.get("FLASHRL_JOB_UID")
+    if env_value:
+        return env_value
+    metadata_uid = job.metadata.get("uid")
+    if metadata_uid:
+        return str(metadata_uid)
+    return f"{job.name}-pending"
+
+
+def pod_name_for(component: str) -> str:
+    """Resolve the current pod name or a readable fallback during tests."""
+    env_value = os.environ.get("FLASHRL_POD_NAME")
+    if env_value:
+        return env_value
+    return f"{os.environ.get('FLASHRL_JOB_NAME', 'flashrl')}-{component}"
+
+
+def resolve_job_log_root(job: FlashRLJob) -> Path:
+    """Resolve the canonical job log root for one platform run."""
+    env_value = os.environ.get("FLASHRL_JOB_LOG_ROOT")
+    if env_value:
+        return Path(env_value)
+    log_dir = Path(job.spec.framework.logging.log_dir).expanduser()
+    job_suffix = Path(job.name) / job_uid_for(job)
+    if log_dir.is_absolute():
+        return log_dir / job_suffix
+    if job.spec.sharedStorage.enabled:
+        mount_path = Path(job.spec.sharedStorage.mountPath)
+        return mount_path / log_dir / job_suffix
+    fallback_root = Path("/tmp/flashrl-platform-logs")
+    return fallback_root / log_dir / job_suffix
+
+
+def resolve_component_log_dir(job: FlashRLJob, component: str) -> Path:
+    """Resolve the canonical per-pod log directory for one component pod."""
+    env_value = os.environ.get("FLASHRL_COMPONENT_LOG_DIR")
+    if env_value:
+        return Path(env_value) / pod_name_for(component)
+    return resolve_job_log_root(job) / "_pods" / component / pod_name_for(component)
+
+
+def component_log_metadata(job: FlashRLJob, component: str) -> dict[str, str]:
+    """Build status metadata describing where one platform pod writes logs."""
+    return {
+        "jobLogRoot": str(resolve_job_log_root(job)),
+        "componentLogDir": str(resolve_component_log_dir(job, component)),
+        "podName": pod_name_for(component),
+        "jobUid": job_uid_for(job),
+    }

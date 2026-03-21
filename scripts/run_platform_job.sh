@@ -22,6 +22,39 @@ CHECKPOINT_INSPECT_PATH=""
 WEIGHT_INSPECT_PATH=""
 VERIFY_ARTIFACTS=0
 CONTROLLER_POD=""
+JOB_LOG_ROOT=""
+ACTIVE_CONTROLLER_RUN_DIR=""
+ANNOUNCED_JOB_LOG_ROOT=""
+ANNOUNCED_CONTROLLER_RUN_DIR=""
+STATUS_EVENTS_FILE="$TMP_DIR/status-events.seen"
+
+# Color support detection
+if [[ -t 2 ]] && [[ -z "${NO_COLOR:-}" ]]; then
+  # Terminal supports colors and NO_COLOR is not set
+  COLOR_RESET='\033[0m'
+  COLOR_BOLD='\033[1m'
+  COLOR_RED='\033[1;31m'
+  COLOR_GREEN='\033[1;32m'
+  COLOR_YELLOW='\033[1;33m'
+  COLOR_BLUE='\033[1;34m'
+  COLOR_MAGENTA='\033[1;35m'
+  COLOR_CYAN='\033[1;36m'
+  COLOR_WHITE='\033[1;37m'
+else
+  # Fallback to no colors
+  COLOR_RESET=''
+  COLOR_BOLD=''
+  COLOR_RED=''
+  COLOR_GREEN=''
+  COLOR_YELLOW=''
+  COLOR_BLUE=''
+  COLOR_MAGENTA=''
+  COLOR_CYAN=''
+  COLOR_WHITE=''
+fi
+
+# Script start time for elapsed time tracking
+SCRIPT_START_TIME="${SECONDS}"
 
 usage() {
   cat <<'EOF'
@@ -36,21 +69,37 @@ EOF
 }
 
 log_section() {
-  printf '\n== %s ==\n' "$1" >&2
+  local title="$1"
+  local line="═══════════════════════════════════════════════════════════════"
+  printf '\n${COLOR_MAGENTA}%s\n' "$line" >&2
+  printf '  %s\n' "$title" >&2
+  printf '%s${COLOR_RESET}\n\n' "$line" >&2
 }
 
 log_info() {
-  printf '[info] %s\n' "$*" >&2
+  printf '${COLOR_BLUE}[info]${COLOR_RESET} %s\n' "$*" >&2
+}
+
+log_success() {
+  printf '${COLOR_GREEN}✓${COLOR_RESET} %s\n' "$*" >&2
+}
+
+log_warn() {
+  printf '${COLOR_YELLOW}⚠${COLOR_RESET} %s\n' "$*" >&2
+}
+
+log_error() {
+  printf '${COLOR_RED}✗${COLOR_RESET} %s\n' "$*" >&2
 }
 
 log_cmd() {
-  printf '[cmd]' >&2
+  printf '${COLOR_CYAN}[cmd]${COLOR_RESET}' >&2
   printf ' %q' "$@" >&2
   printf '\n' >&2
 }
 
 log_cmd_text() {
-  printf '[cmd] %s\n' "$1" >&2
+  printf '${COLOR_CYAN}[cmd]${COLOR_RESET} %s\n' "$1" >&2
 }
 
 run_cmd() {
@@ -68,6 +117,21 @@ run_labeled_cmd() {
   shift
   log_cmd_text "$label"
   "$@"
+}
+
+format_elapsed_time() {
+  local total_seconds=$1
+  local hours=$((total_seconds / 3600))
+  local minutes=$(((total_seconds % 3600) / 60))
+  local seconds=$((total_seconds % 60))
+
+  if ((hours > 0)); then
+    printf "%dh %dm %ds" "$hours" "$minutes" "$seconds"
+  elif ((minutes > 0)); then
+    printf "%dm %ds" "$minutes" "$seconds"
+  else
+    printf "%ds" "$seconds"
+  fi
 }
 
 run_cmd_stdout_to_file() {
@@ -88,7 +152,7 @@ run_cmd_all_to_file() {
 
 require_command() {
   if ! command -v "$1" >/dev/null 2>&1; then
-    echo "Required command not found: $1" >&2
+    log_error "Required command not found: $1"
     exit 1
   fi
 }
@@ -105,7 +169,7 @@ validate_local_image_mode() {
     minikube)
       local expected_context="${FLASHRL_LOCAL_CLUSTER_PROFILE:-minikube}"
       if [[ "$current_context" != "$expected_context" ]]; then
-        echo "Local image env file targets minikube profile ${expected_context}, but current kubectl context is ${current_context}." >&2
+        log_error "Local image env file targets minikube profile ${expected_context}, but current kubectl context is ${current_context}"
         exit 1
       fi
       ;;
@@ -113,18 +177,18 @@ validate_local_image_mode() {
       local expected_name="${FLASHRL_LOCAL_CLUSTER_NAME:-kind}"
       local expected_context="kind-${expected_name}"
       if [[ "$current_context" != "$expected_context" ]]; then
-        echo "Local image env file targets kind cluster ${expected_name}, but current kubectl context is ${current_context}." >&2
+        log_error "Local image env file targets kind cluster ${expected_name}, but current kubectl context is ${current_context}"
         exit 1
       fi
       ;;
     docker-desktop)
       if [[ "$current_context" != "docker-desktop" ]]; then
-        echo "Local image env file targets docker-desktop, but current kubectl context is ${current_context}." >&2
+        log_error "Local image env file targets docker-desktop, but current kubectl context is ${current_context}"
         exit 1
       fi
       ;;
     *)
-      echo "Unsupported or missing FLASHRL_LOCAL_CLUSTER_TYPE for local image mode: ${cluster_type:-<empty>}." >&2
+      log_error "Unsupported or missing FLASHRL_LOCAL_CLUSTER_TYPE for local image mode: ${cluster_type:-<empty>}"
       exit 1
       ;;
   esac
@@ -169,9 +233,9 @@ on_error() {
   local exit_code=$1
   local line_no=$2
   trap - ERR
-  echo "run_platform_job.sh failed at line $line_no with exit code $exit_code" >&2
+  printf '${COLOR_RED}✗ run_platform_job.sh failed at line %d with exit code %d${COLOR_RESET}\n' "$line_no" "$exit_code" >&2
   if [[ -n "$ARTIFACT_DIR" ]]; then
-    echo "Writing diagnostics to $ARTIFACT_DIR" >&2
+    printf '${COLOR_YELLOW}⚠ Writing diagnostics to %s${COLOR_RESET}\n' "$ARTIFACT_DIR" >&2
   fi
   collect_diagnostics
   cleanup_tmp
@@ -193,7 +257,7 @@ wait_for_workload_rollout() {
     sleep "$POLL_SECONDS"
   done
 
-  echo "Timed out waiting for ${kind}/${name} in namespace=${namespace}" >&2
+  log_error "Timed out waiting for ${kind}/${name} in namespace=${namespace}"
   return 1
 }
 
@@ -204,6 +268,9 @@ wait_for_job_completion() {
   local finished_at=""
   local last_completed_step=""
   local last_error=""
+  local job_log_root=""
+  local active_controller_run_dir=""
+  local new_events=""
 
   log_info "Polling ${FLASHRL_JOB_RESOURCE}/${JOB_NAME} in namespace=${JOB_NAMESPACE} until finishedAt is set"
   while (( SECONDS < deadline )); do
@@ -222,6 +289,8 @@ fields = {
     "JOB_FINISHED_AT": status.get("finishedAt") or "",
     "JOB_LAST_COMPLETED_STEP": progress.get("lastCompletedStep", 0) or 0,
     "JOB_LAST_ERROR": status.get("lastError") or "",
+    "JOB_LOG_ROOT": status.get("logRoot") or "",
+    "ACTIVE_CONTROLLER_RUN_DIR": status.get("activeControllerRunDir") or "",
 }
 for key, value in fields.items():
     print(f"{key}={shlex.quote(str(value))}")
@@ -232,24 +301,94 @@ PY
     finished_at="$JOB_FINISHED_AT"
     last_completed_step="$JOB_LAST_COMPLETED_STEP"
     last_error="$JOB_LAST_ERROR"
+    job_log_root="$JOB_LOG_ROOT"
+    active_controller_run_dir="$ACTIVE_CONTROLLER_RUN_DIR"
 
-    echo "phase=${job_phase:-<none>} lastCompletedStep=${last_completed_step:-0} finishedAt=${finished_at:-<none>}"
+    if [[ -n "$job_log_root" && "$ANNOUNCED_JOB_LOG_ROOT" != "$job_log_root" ]]; then
+      ANNOUNCED_JOB_LOG_ROOT="$job_log_root"
+    fi
+    if [[ -n "$active_controller_run_dir" && "$ANNOUNCED_CONTROLLER_RUN_DIR" != "$active_controller_run_dir" ]]; then
+      ANNOUNCED_CONTROLLER_RUN_DIR="$active_controller_run_dir"
+    fi
+
+    printf '\r${COLOR_BLUE}ℹ${COLOR_RESET} phase=${COLOR_BOLD}%s${COLOR_RESET} lastCompletedStep=${COLOR_BOLD}%s${COLOR_RESET} finishedAt=${COLOR_BOLD}%s${COLOR_RESET}' \
+      "${job_phase:-<none>}" "${last_completed_step:-0}" "${finished_at:-<none>}" >&2
     if [[ -n "$last_error" ]]; then
-      echo "lastError=$last_error"
+      printf ' ${COLOR_RED}lastError=%s${COLOR_RESET}' "$last_error" >&2
+    fi
+    printf '\r' >&2
+
+    if [[ -n "$ANNOUNCED_JOB_LOG_ROOT" ]]; then
+      log_info "Job log root: $ANNOUNCED_JOB_LOG_ROOT"
+      ANNOUNCED_JOB_LOG_ROOT=""
+    fi
+    if [[ -n "$ANNOUNCED_CONTROLLER_RUN_DIR" ]]; then
+      log_info "Controller run dir: $ANNOUNCED_CONTROLLER_RUN_DIR"
+      ANNOUNCED_CONTROLLER_RUN_DIR=""
+    fi
+
+    new_events="$(python3 - "$STATUS_EVENTS_FILE" <<'PY' <<<"$status_json"
+import json
+from pathlib import Path
+import sys
+
+seen_path = Path(sys.argv[1])
+payload = json.load(sys.stdin)
+status = payload.get("status") or {}
+events = status.get("events") or []
+seen = set()
+if seen_path.exists():
+    seen = {
+        line.strip()
+        for line in seen_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    }
+new_lines = []
+new_keys = []
+for item in events:
+    if not isinstance(item, dict):
+        continue
+    key = "|".join(
+        str(item.get(field, ""))
+        for field in ("timestamp", "component", "event", "message")
+    )
+    if key in seen:
+        continue
+    new_keys.append(key)
+    component = item.get("component") or "job"
+    new_lines.append(
+        f"{item.get('timestamp', '<unknown>')} [{component}] {item.get('event', 'event')} {item.get('message', '')}"
+    )
+if new_keys:
+    with seen_path.open("a", encoding="utf-8") as handle:
+        for key in new_keys:
+            handle.write(key + "\n")
+print("\n".join(new_lines))
+PY
+    )"
+    if [[ -n "$new_events" ]]; then
+      printf '\n' >&2
+      while IFS= read -r event_line; do
+        [[ -n "$event_line" ]] || continue
+        log_info "$event_line"
+      done <<<"$new_events"
     fi
 
     if [[ "$job_phase" == "Failed" ]]; then
-      echo "FlashRLJob $JOB_NAME failed." >&2
+      printf '\n' >&2
+      log_error "FlashRLJob $JOB_NAME failed"
       return 1
     fi
     if [[ -n "$finished_at" ]]; then
+      printf '\n' >&2
       return 0
     fi
 
     sleep "$POLL_SECONDS"
   done
 
-  echo "Timed out waiting for FlashRLJob $JOB_NAME to finish." >&2
+  printf '\n' >&2
+  log_error "Timed out waiting for FlashRLJob $JOB_NAME to finish"
   return 1
 }
 
@@ -288,6 +427,7 @@ while [[ $# -gt 0 ]]; do
 done
 
 if [[ -z "$CONFIG_PATH" || -z "$IMAGE_ENV_FILE" ]]; then
+  log_error "Missing required arguments"
   usage >&2
   exit 1
 fi
@@ -300,7 +440,7 @@ require_command kubectl
 require_command python3
 
 if [[ ! -f "$IMAGE_ENV_FILE" ]]; then
-  echo "Image env file not found: $IMAGE_ENV_FILE" >&2
+  log_error "Image env file not found: $IMAGE_ENV_FILE"
   exit 1
 fi
 
@@ -310,7 +450,7 @@ trap cleanup_tmp EXIT
 log_section "Validate Cluster Connectivity"
 run_cmd kubectl cluster-info >/dev/null
 CURRENT_CONTEXT="$(capture_cmd kubectl config current-context)"
-log_info "kubectl context: $CURRENT_CONTEXT"
+log_success "kubectl context: $CURRENT_CONTEXT"
 
 log_section "Load Image References"
 log_info "Loading image environment from $IMAGE_ENV_FILE"
@@ -323,6 +463,8 @@ set +a
 : "${FLASHRL_RUNTIME_IMAGE:?FLASHRL_RUNTIME_IMAGE is required in the image env file}"
 : "${FLASHRL_SERVING_IMAGE:?FLASHRL_SERVING_IMAGE is required in the image env file}"
 : "${FLASHRL_TRAINING_IMAGE:?FLASHRL_TRAINING_IMAGE is required in the image env file}"
+
+log_success "Image references loaded successfully"
 
 validate_local_image_mode "$CURRENT_CONTEXT"
 log_info "Config path: $CONFIG_PATH"
@@ -387,6 +529,7 @@ run_cmd kubectl apply -f "$REPO_ROOT/flashrl/platform/k8s/job-crd.yaml"
 run_cmd kubectl apply -f "$PATCHED_RBAC_YAML"
 run_cmd kubectl apply -f "$PATCHED_OPERATOR_YAML"
 run_cmd kubectl rollout status deployment/flashrl-operator -n "$OPERATOR_NAMESPACE" --timeout="${TIMEOUT_SECONDS}s"
+log_success "FlashRL Operator installed successfully"
 
 log_section "Render FlashRLJob"
 run_cmd python3 -m flashrl platform render \
@@ -469,6 +612,7 @@ if kubectl get namespace "$JOB_NAMESPACE" >/dev/null 2>&1; then
   log_info "Namespace $JOB_NAMESPACE already exists"
 else
   run_cmd kubectl create namespace "$JOB_NAMESPACE"
+  log_success "Namespace $JOB_NAMESPACE created"
 fi
 
 log_section "Delete Previous FlashRLJob"
@@ -476,6 +620,7 @@ run_cmd kubectl delete "$FLASHRL_JOB_RESOURCE" "$JOB_NAME" -n "$JOB_NAMESPACE" -
 
 log_section "Apply FlashRLJob"
 run_cmd kubectl apply -f "$PATCHED_JOB_YAML"
+log_success "FlashRLJob $JOB_NAME applied successfully"
 
 log_section "Wait for FlashRL Workloads"
 wait_for_workload_rollout deployment "${JOB_NAME}-controller" "$JOB_NAMESPACE"
@@ -483,6 +628,7 @@ wait_for_workload_rollout statefulset "${JOB_NAME}-learner" "$JOB_NAMESPACE"
 wait_for_workload_rollout deployment "${JOB_NAME}-serving" "$JOB_NAMESPACE"
 wait_for_workload_rollout deployment "${JOB_NAME}-rollout" "$JOB_NAMESPACE"
 wait_for_workload_rollout deployment "${JOB_NAME}-reward" "$JOB_NAMESPACE"
+log_success "All FlashRL workloads rolled out successfully"
 
 log_section "Wait for FlashRLJob Completion"
 wait_for_job_completion
@@ -490,38 +636,41 @@ wait_for_job_completion
 log_section "Verify Artifacts"
 CONTROLLER_POD="$(capture_cmd kubectl get pods -n "$JOB_NAMESPACE" -l "flashrl.dev/job=$JOB_NAME,app.kubernetes.io/component=controller" -o jsonpath='{.items[0].metadata.name}')"
 if [[ -z "$CONTROLLER_POD" ]]; then
-  echo "Controller pod not found for $JOB_NAME" >&2
+  log_error "Controller pod not found for $JOB_NAME"
   exit 1
 fi
-log_info "Controller pod: $CONTROLLER_POD"
+log_success "Controller pod: $CONTROLLER_POD"
 
 if [[ "$VERIFY_ARTIFACTS" == "1" ]]; then
   run_cmd_stdout_to_file "$ARTIFACT_DIR/checkpoints.txt" kubectl exec -n "$JOB_NAMESPACE" "$CONTROLLER_POD" -- sh -c 'find "$1" -type f | sort' sh "$CHECKPOINT_INSPECT_PATH"
   run_cmd_stdout_to_file "$ARTIFACT_DIR/weights.txt" kubectl exec -n "$JOB_NAMESPACE" "$CONTROLLER_POD" -- sh -c 'find "$1" -type f | sort' sh "$WEIGHT_INSPECT_PATH"
 
   if [[ ! -s "$ARTIFACT_DIR/checkpoints.txt" ]]; then
-    echo "No checkpoint artifacts found under $CHECKPOINT_INSPECT_PATH" >&2
+    log_error "No checkpoint artifacts found under $CHECKPOINT_INSPECT_PATH"
     exit 1
   fi
   if [[ ! -s "$ARTIFACT_DIR/weights.txt" ]]; then
-    echo "No weight artifacts found under $WEIGHT_INSPECT_PATH" >&2
+    log_error "No weight artifacts found under $WEIGHT_INSPECT_PATH"
     exit 1
   fi
+  log_success "Artifact verification completed"
 else
-  echo "Skipping artifact file verification because storage paths are not inspectable filesystem paths."
+  log_warn "Skipping artifact file verification because storage paths are not inspectable filesystem paths"
 fi
 
 trap - ERR
 
 log_section "FlashRLJob Finished"
-log_info "Job: $JOB_NAME"
-log_info "Namespace: $JOB_NAMESPACE"
-log_info "Artifacts: $ARTIFACT_DIR"
+log_success "Job: $JOB_NAME"
+log_success "Namespace: $JOB_NAMESPACE"
+log_success "Artifacts: $ARTIFACT_DIR"
+ELAPSED_TIME=$((SECONDS - SCRIPT_START_TIME))
+log_info "Total execution time: $(format_elapsed_time "$ELAPSED_TIME")"
 echo
-echo "Inspect:"
+echo "${COLOR_GREEN}Inspect:${COLOR_RESET}"
 echo "  kubectl get $FLASHRL_JOB_RESOURCE $JOB_NAME -n $JOB_NAMESPACE -o yaml"
 echo "  kubectl get pods -n $JOB_NAMESPACE -l flashrl.dev/job=$JOB_NAME"
 echo "  kubectl logs -n $JOB_NAMESPACE -l flashrl.dev/job=$JOB_NAME --prefix=true"
 echo
-echo "Cleanup:"
+echo "${COLOR_YELLOW}Cleanup:${COLOR_RESET}"
 echo "  bash scripts/cleanup_platform.sh --operator-namespace $OPERATOR_NAMESPACE"

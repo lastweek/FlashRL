@@ -9,8 +9,11 @@ from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from flashrl.framework.config import BuilderSpec
 from flashrl.framework.config import (
+    AdminConfig,
     CheckpointingConfig,
     GrpoConfig,
+    LoggingConfig,
+    MetricsConfig,
     ServingConfig,
     TrainerConfig,
     TrainingConfig,
@@ -170,13 +173,14 @@ class SharedStorageSpec(BaseModel):
     mountPath: str = "/var/lib/flashrl/shared"
     checkpointsSubPath: str = "checkpoints"
     weightsSubPath: str = "weights"
+    logsSubPath: str = "logs"
     claim: PersistentVolumeClaimSpec = Field(default_factory=PersistentVolumeClaimSpec)
 
     @model_validator(mode="after")
     def validate_paths(self) -> "SharedStorageSpec":
         if not str(self.mountPath).startswith("/"):
             raise ValueError("sharedStorage.mountPath must be an absolute container path.")
-        for field_name in ("checkpointsSubPath", "weightsSubPath"):
+        for field_name in ("checkpointsSubPath", "weightsSubPath", "logsSubPath"):
             raw_value = str(getattr(self, field_name))
             if raw_value.startswith("/"):
                 raise ValueError(f"sharedStorage.{field_name} must be a relative path.")
@@ -201,6 +205,9 @@ class ObservabilitySpec(BaseModel):
 
     adminEnabled: bool = True
     metricsEnabled: bool = True
+    podLogsEnabled: bool = True
+    statusSnapshotsEnabled: bool = True
+    jobEventHistoryLimit: int = Field(default=100, ge=1, le=1000)
 
 
 class FrameworkSpec(BaseModel):
@@ -213,6 +220,9 @@ class FrameworkSpec(BaseModel):
     serving: ServingConfig
     trainer: TrainerConfig
     grpo: GrpoConfig
+    logging: LoggingConfig = Field(default_factory=LoggingConfig)
+    metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    admin: AdminConfig = Field(default_factory=AdminConfig)
 
     @model_validator(mode="after")
     def validate_platform_mode(self) -> "FrameworkSpec":
@@ -284,6 +294,18 @@ class ConditionStatus(BaseModel):
     reason: str
     lastTransitionTime: str
     message: str | None = None
+
+
+class JobEventStatus(BaseModel):
+    """Bounded job-scoped event recorded in CRD status."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    timestamp: str
+    event: str
+    message: str
+    component: str | None = None
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 def _default_failure_policy(component: str) -> FailurePolicySpec:
@@ -407,6 +429,10 @@ class FlashRLJobStatus(BaseModel):
     components: dict[str, WorkloadStatus] = Field(default_factory=dict)
     conditions: list[ConditionStatus] = Field(default_factory=list)
     lastError: str | None = None
+    logRoot: str | None = None
+    activeControllerRunDir: str | None = None
+    activeControllerRunId: str | None = None
+    events: list[JobEventStatus] = Field(default_factory=list)
 
 
 class FlashRLJob(BaseModel):
@@ -424,6 +450,33 @@ class FlashRLJob(BaseModel):
     def name(self) -> str:
         """Return the Kubernetes object name."""
         return str(self.metadata["name"])
+
+
+def append_job_event(
+    events: list[dict[str, Any]] | list[JobEventStatus],
+    *,
+    timestamp: str,
+    event: str,
+    message: str,
+    component: str | None = None,
+    metadata: dict[str, Any] | None = None,
+    limit: int = 100,
+) -> list[dict[str, Any]]:
+    """Append one bounded event to the CRD status event ring."""
+    normalized = [
+        item.model_dump(mode="json") if isinstance(item, JobEventStatus) else dict(item)
+        for item in list(events)
+    ]
+    normalized.append(
+        JobEventStatus(
+            timestamp=timestamp,
+            event=event,
+            message=message,
+            component=component,
+            metadata=dict(metadata or {}),
+        ).model_dump(mode="json")
+    )
+    return normalized[-max(int(limit), 1) :]
 
 
 def flashrljob_openapi_schema() -> dict[str, Any]:

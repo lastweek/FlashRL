@@ -33,10 +33,11 @@ class Autoscaler:
         observations: dict[str, ComponentObservation],
         *,
         namespace: str,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         """Apply autoscaling policy to the elastic workload pools only."""
         now_iso = self._now_fn()
         now = parse_timestamp(now_iso) or datetime.now(timezone.utc)
+        events: list[dict[str, Any]] = []
         for component in ELASTIC_WORKLOADS:
             workload = job_workload_spec(job, component)
             policy = workload.autoscaling or AutoscalingSpec()
@@ -59,6 +60,21 @@ class Autoscaler:
                 self._patch_replicas(job, component, replicas=desired, namespace=namespace)
                 observation.status.desiredReplicas = desired
                 observation.status.lastScaleAt = now_iso
+                events.append(
+                    {
+                        "event": "autoscale_applied",
+                        "message": f"Scaled {component} from {current} to {desired} replicas.",
+                        "component": component,
+                        "metadata": {
+                            "currentReplicas": current,
+                            "desiredReplicas": desired,
+                            "queueDepth": observation.load.queue_depth,
+                            "inflightRequests": observation.load.inflight_requests,
+                            "p95LatencySeconds": observation.load.p95_latency_seconds,
+                        },
+                    }
+                )
+        return events
 
     def desired_scale_target(
         self,

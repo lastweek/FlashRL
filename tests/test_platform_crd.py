@@ -9,6 +9,7 @@ import sys
 
 import pytest
 
+import flashrl.platform.cli as platform_cli_module
 from flashrl.framework.config import FlashRLConfig, RunConfig
 from flashrl.platform.cli import main as platform_main
 from flashrl.platform.config import PlatformConfig, build_flashrl_job
@@ -198,6 +199,50 @@ def test_render_job_resources_builds_expected_workloads() -> None:
         deployments["demo-job-controller"]["spec"]["template"]["spec"]["containers"][0]["imagePullPolicy"]
         == "IfNotPresent"
     )
+    controller_env = {
+        item["name"]: item
+        for item in deployments["demo-job-controller"]["spec"]["template"]["spec"]["containers"][0]["env"]
+    }
+    assert controller_env["FLASHRL_JOB_UID"]["value"] == "demo-job-pending"
+    assert controller_env["FLASHRL_COMPONENT_NAME"]["value"] == "controller"
+    assert controller_env["FLASHRL_JOB_LOG_ROOT"]["value"].endswith("/logs/demo-job/demo-job-pending")
+    assert controller_env["FLASHRL_COMPONENT_LOG_DIR"]["value"].endswith("/_pods/controller")
+    assert controller_env["FLASHRL_POD_NAME"]["valueFrom"]["fieldRef"]["fieldPath"] == "metadata.name"
+
+
+def test_platform_logs_prints_job_summary(monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]) -> None:
+    """`flashrl platform logs` should show the CRD-backed log root, run dir, and recent events."""
+
+    class _StubOperator:
+        def get_job(self, name: str, *, namespace: str = "default") -> dict[str, object]:
+            assert name == "demo-job"
+            assert namespace == "flashrl"
+            return {
+                "metadata": {"name": "demo-job"},
+                "status": {
+                    "phase": "Running",
+                    "logRoot": "/var/lib/flashrl/shared/logs/demo-job/uid-123",
+                    "activeControllerRunDir": "/var/lib/flashrl/shared/logs/demo-job/uid-123/000001-run",
+                    "activeControllerRunId": "000001-run",
+                    "progress": {"currentEpoch": 1, "currentStep": 3, "lastCompletedStep": 3},
+                    "events": [
+                        {
+                            "timestamp": "2026-03-21T00:00:00Z",
+                            "component": "operator",
+                            "event": "reconcile_finished",
+                            "message": "Reconcile finished with phase=Running.",
+                        }
+                    ],
+                },
+            }
+
+    monkeypatch.setattr(platform_cli_module, "FlashRLOperator", lambda: _StubOperator())
+
+    assert platform_main(["platform", "logs", "demo-job", "--namespace", "flashrl"]) == 0
+    output = capsys.readouterr().out
+    assert "log_root: /var/lib/flashrl/shared/logs/demo-job/uid-123" in output
+    assert "controller_run_dir: /var/lib/flashrl/shared/logs/demo-job/uid-123/000001-run" in output
+    assert "reconcile_finished" in output
 
 
 def test_platform_module_surface_imports_cleanly() -> None:
@@ -293,10 +338,14 @@ def test_platform_readme_matches_simplified_runtime_layout() -> None:
     assert "runtime/pod.py" not in content
     assert "runtime/platform_shim_controller.py" in content
     assert "runtime/platform_shim_common.py" in content
+    assert "runtime/platform_pod_logging.py" in content
+    assert "../framework/train_runtime.py" in content
     assert "scripts/build_platform_images.sh" in content
     assert "scripts/run_platform_job.sh" in content
     assert "scripts/cleanup_platform.sh" in content
     assert "--image-env-file" in content
+    assert "flashrl platform logs" in content
+    assert "--follow" in content
     assert "--profile" not in content
     assert "profiles:" not in content
     assert "IMAGE_MODE=local" in content
@@ -304,6 +353,11 @@ def test_platform_readme_matches_simplified_runtime_layout() -> None:
     assert "LOCAL_CLUSTER_TYPE=kind" in content
     assert "LOCAL_CLUSTER_TYPE=docker-desktop" in content
     assert "flashrl/platform/dev/math-minikube.yaml" in content
+    assert "framework.logging.log_dir" in content
+    assert "activeControllerRunDir" in content
+    assert "events.jsonl" in content
+    assert "console.log" in content
+    assert "_pods/controller" in content
 
 
 def test_platform_bash_scripts_parse_cleanly() -> None:
@@ -397,6 +451,8 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     assert "ServingService" in content
     assert "RemoteServingBackend" in content
     assert "http_common.py" in content
+    assert "flashrl.framework.train_runtime" in content
+    assert "platform_pod_logging" in content
     assert "install_common_routes" in content
     assert "create_rollout_service_app" in content
     assert "create_reward_service_app" in content
@@ -412,6 +468,13 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     assert "/v1/optimize-steps" in content
     assert "/v1/generate-grouped" in content
     assert "/v1/activate-weight-version" in content
+    assert "## Observability And Logs" in content
+    assert "framework.logging.log_dir" in content
+    assert "FlashRLJob.status.logRoot" in content
+    assert "activeControllerRunDir" in content
+    assert "status-snapshots.jsonl" in content
+    assert "_pods/controller" in content
+    assert "flashrl platform logs <job>" in content
     for legacy_name in (
         "HttpRolloutClient",
         "HttpRewardClient",

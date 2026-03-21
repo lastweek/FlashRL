@@ -1026,6 +1026,19 @@ def test_tensorboard_metrics_sink_writes_expected_scalars_and_flushes(tmp_path: 
             "full_tokens_mean": 20.0,
             "full_tokens_max": 24,
             "response_tokens_total": 8,
+            "memory": {
+                "after": {
+                    "captured_at": "2026-03-21T00:00:00.000+00:00",
+                    "device_type": "mps",
+                    "process": {"rss_bytes": 1024},
+                    "system": {"total_bytes": 4096, "available_bytes": 2048},
+                    "device": {
+                        "current_allocated_bytes": 512,
+                        "driver_allocated_bytes": 768,
+                        "recommended_max_bytes": 1024,
+                    },
+                }
+            },
         }
     )
     sink.observe_stage(
@@ -1048,6 +1061,14 @@ def test_tensorboard_metrics_sink_writes_expected_scalars_and_flushes(tmp_path: 
             "learning_rate": 1.0e-5,
         }
     )
+    sink.observe_stage(
+        {
+            "step": 3,
+            "stage": "publish_weights",
+            "latency_seconds": 0.07,
+            "weight_version_id": 4,
+        }
+    )
     sink.observe_step(
         {
             "step": 3,
@@ -1056,6 +1077,23 @@ def test_tensorboard_metrics_sink_writes_expected_scalars_and_flushes(tmp_path: 
             "kl_divergence": 0.25,
             "tokens_per_second": 42.0,
             "step_duration_seconds": 2.0,
+            "memory_summary": {
+                "peak_process_rss_bytes": 4096,
+                "lowest_system_available_bytes": 1024,
+                "peak_device_current_allocated_bytes": 2048,
+                "peak_device_driver_allocated_bytes": 3072,
+                "end": {
+                    "captured_at": "2026-03-21T00:00:01.000+00:00",
+                    "device_type": "mps",
+                    "process": {"rss_bytes": 2048},
+                    "system": {"total_bytes": 4096, "available_bytes": 1536},
+                    "device": {
+                        "current_allocated_bytes": 1536,
+                        "driver_allocated_bytes": 2048,
+                        "recommended_max_bytes": 4096,
+                    },
+                },
+            },
         }
     )
     sink.observe_serving_debug({"step": 3, "ttft_seconds": 0.12, "tpot_seconds": 0.03})
@@ -1069,6 +1107,27 @@ def test_tensorboard_metrics_sink_writes_expected_scalars_and_flushes(tmp_path: 
     records = read_tensorboard_scalars(tmp_path)
     assert any(record["tag"] == "train/loss" and record["step"] == 3 for record in records)
     assert any(record["tag"] == "train/learning_rate" and record["step"] == 3 for record in records)
+    assert any(
+        record["tag"] == "timing/stage/publish_weights_seconds"
+        and record["step"] == 3
+        and record["value"] == pytest.approx(0.07)
+        for record in records
+    )
+    assert any(
+        record["tag"] == "memory/stage/prepare_inputs/process_rss_bytes"
+        and record["value"] == pytest.approx(1024.0)
+        for record in records
+    )
+    assert any(
+        record["tag"] == "memory/step/end/device_current_allocated_bytes"
+        and record["value"] == pytest.approx(1536.0)
+        for record in records
+    )
+    assert any(
+        record["tag"] == "memory/step/peak_process_rss_bytes"
+        and record["value"] == pytest.approx(4096.0)
+        for record in records
+    )
     assert any(record["tag"] == "reward/mean" and record["value"] == pytest.approx(1.5) for record in records)
     assert any(
         record["tag"] == "importance_sampling_ratio/clip_fraction"

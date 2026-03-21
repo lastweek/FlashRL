@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 from pathlib import Path
 import tempfile
+from typing import Any, Callable
 
 from fastapi import FastAPI
 import torch
@@ -24,10 +25,11 @@ from flashrl.framework.distributed.models import (
     StatusResponse,
     WeightVersionRef,
 )
-from flashrl.framework.observability import StageResult
+from flashrl.framework.memory import capture_memory_snapshot, memory_pressure_tags
+from flashrl.framework.observability import StageResult, timed_call
 from flashrl.framework.serving.base import ServingBackend
 from flashrl.framework.training.base import ActorTrainingBackend, ReferenceTrainingBackend
-from flashrl.framework.training.optimization import optimize_grpo_batch
+from flashrl.framework.training.optimization import OptimizationStageError, optimize_grpo_batch
 
 
 def _stage_payload(stage: StageResult) -> StageResultPayload:
@@ -73,6 +75,8 @@ class LearnerService:
         serving_backend: ServingBackend | None = None,
         publish_dir: str | Path | None = None,
         synchronize_serving: bool = True,
+        status_metadata: dict[str, Any] | None = None,
+        event_logger: Callable[[str, dict[str, Any]], None] | None = None,
     ) -> None:
         self._actor_backend = actor_backend
         self._reference_backend = reference_backend
@@ -84,6 +88,8 @@ class LearnerService:
         if root_dir is None and not synchronize_serving:
             root_dir = Path(tempfile.mkdtemp(prefix="flashrl-published-weights-"))
         self._publish_dir = root_dir
+        self._status_metadata = dict(status_metadata or {})
+        self._event_logger = event_logger
 
     def reset_state(self) -> None:
         """Clear per-run exactly-once caches when a new local run starts."""
@@ -93,13 +99,75 @@ class LearnerService:
         if request.step_id is not None and request.step_id in self._step_results:
             return self._step_results[int(request.step_id)].model_copy(deep=True)
 
-        result = optimize_grpo_batch(
-            actor_backend=self._actor_backend,
-            reference_backend=self._reference_backend,
-            grpo_config=self._grpo_config,
-            learner_batch=request.learner_batch,
+        try:
+            result = optimize_grpo_batch(
+                actor_backend=self._actor_backend,
+                reference_backend=self._reference_backend,
+                grpo_config=self._grpo_config,
+                learner_batch=request.learner_batch,
+            )
+        except OptimizationStageError as exc:
+            if self._event_logger is not None:
+                self._event_logger(
+                    "learner_stage_failed",
+                    {
+                        "stage": exc.stage_name,
+                        "error": str(exc),
+                        "memory": exc.memory_snapshot,
+                        "memoryReasonTags": list(exc.reason_tags),
+                    },
+                )
+            raise
+
+        publish_memory_before = capture_memory_snapshot(self._actor_backend.device)
+        try:
+            weight_version, publish_weights_seconds = timed_call(
+                lambda: self._publish_weight_version(request)
+            )
+        except Exception as exc:
+            publish_memory = capture_memory_snapshot(self._actor_backend.device)
+            stage_error = OptimizationStageError(
+                stage_name="publish_weights",
+                message=str(exc),
+                memory_snapshot=publish_memory,
+                reason_tags=memory_pressure_tags(
+                    exc,
+                    snapshot=publish_memory,
+                    shared_device_pressure=(
+                        str(getattr(self._actor_backend.device, "type", self._actor_backend.device))
+                        == "mps"
+                        and self._serving_backend is not None
+                        and str(getattr(self._serving_backend.device, "type", self._serving_backend.device))
+                        == "mps"
+                    ),
+                ),
+            )
+            if self._event_logger is not None:
+                self._event_logger(
+                    "learner_stage_failed",
+                    {
+                        "stage": stage_error.stage_name,
+                        "error": str(stage_error),
+                        "memory": stage_error.memory_snapshot,
+                        "memoryReasonTags": list(stage_error.reason_tags),
+                    },
+                )
+            raise stage_error from exc
+        publish_memory_after = capture_memory_snapshot(self._actor_backend.device)
+        result.stages.append(
+            StageResult(
+                name="publish_weights",
+                seconds=publish_weights_seconds,
+                metrics={
+                    "weight_version_id": int(weight_version.version_id),
+                    "artifact_uri": str(weight_version.artifact_uri),
+                    "memory": {
+                        "before": publish_memory_before,
+                        "after": publish_memory_after,
+                    },
+                },
+            )
         )
-        weight_version = self._publish_weight_version(request)
         response = OptimizeStepResponse(
             api_version=request.api_version,
             job_id=request.job_id,
@@ -214,6 +282,8 @@ class LearnerService:
                 metadata={
                     "backend": self._actor_backend.backend_name,
                     "optimizer": self._actor_backend.optimizer_name,
+                    "memory": capture_memory_snapshot(self._actor_backend.device),
+                    **dict(self._status_metadata),
                 },
             )
         )
@@ -268,6 +338,7 @@ def create_learner_service_app(service: LearnerService) -> FastAPI:
         status_getter=lambda: service.status().status,
         kind="LearnerService",
         name="learner",
+        event_logger=service._event_logger,
     )
 
     @app.post("/v1/optimize-steps")

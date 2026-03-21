@@ -30,6 +30,7 @@ from flashrl.framework.rollout.agent import AgentRolloutGenerator
 from flashrl.framework.rollout.function import FunctionRolloutGenerator
 from flashrl.framework.run_logger import RunLogger, _factor_shared_messages
 from flashrl.framework.training import ActorTrainingBackend, TrainingBackend
+from flashrl.framework.training.optimization import OptimizationStageError
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
 
 
@@ -1773,6 +1774,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "loss_assembly",
         "backward",
         "optimizer",
+        "publish_weights",
         "sync",
     ]
     rollout_event = next(
@@ -1803,12 +1805,23 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         and event["payload"]["stage"] == "sync"
     )
     assert sync_event["payload"]["weight_version_id"] == 1
+    publish_event = next(
+        event
+        for event in events
+        if event["event"] == "step_stage"
+        and event["payload"]["step"] == 1
+        and event["payload"]["stage"] == "publish_weights"
+    )
+    assert publish_event["payload"]["weight_version_id"] == 1
+    assert "memory" in publish_event["payload"]
+    assert "after" in publish_event["payload"]["memory"]
 
     step_done = next(event for event in events if event["event"] == "step_done")
     assert step_done["payload"]["reference_configured"] is False
     assert step_done["payload"]["rollout_weight_version"]["version_id"] == 0
     assert step_done["payload"]["rollout_weight_version"]["origin"] == "startup"
     assert step_done["payload"]["stage_timings"]["reference_forward"] == 0.0
+    assert step_done["payload"]["stage_timings"]["publish_weights"] >= 0.0
     assert step_done["payload"]["stage_order"] == [
         "rollout",
         "reward",
@@ -1818,9 +1831,15 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "loss_assembly",
         "backward",
         "optimizer",
+        "publish_weights",
         "sync",
     ]
     assert step_done["payload"]["dominant_stage"] in step_done["payload"]["stage_timings"]
+    assert step_done["payload"]["learner_total_seconds"] >= 0.0
+    assert step_done["payload"]["learner_unaccounted_seconds"] >= 0.0
+    assert step_done["payload"]["learner_unaccounted_seconds"] < 0.1
+    assert "memory_summary" in step_done["payload"]
+    assert "peak_process_rss_bytes" in step_done["payload"]["memory_summary"]
     assert "phase_breakdown" not in step_done["payload"]
     assert "phase_groups" not in step_done["payload"]
     assert "timings" not in step_done["payload"]
@@ -1831,6 +1850,10 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
     assert epoch_summary["payload"]["stage_totals"].get("reference_forward", 0.0) == 0.0
     assert "hot_path_totals" not in epoch_summary["payload"]
     assert "phase_group_totals" not in epoch_summary["payload"]
+
+    run_finished = next(event for event in events if event["event"] == "run_finished")
+    assert "memory_summary" in run_finished["payload"]
+    assert "peak_process_rss_bytes" in run_finished["payload"]["memory_summary"]
 
     transcript = (logger.run_dir / "console.log").read_text(encoding="utf-8")
     assert "  runtime  single-device-per-backend  reference=disabled" in transcript
@@ -1843,6 +1866,7 @@ def test_grpo_trainer_without_reference_logs_append_only_hot_path(tmp_path: Path
         "prompts_this_step=2 planned_prompts_per_step=2 completions_per_prompt=2 "
         "planned_completions_per_step=4 stage=rollout"
     ) in transcript
+    assert "stage=publish_weights" in transcript
     assert "stage=reward" in transcript
     assert "stage=loss_assembly" in transcript
     assert "stage=backward" in transcript
@@ -2176,6 +2200,7 @@ def test_flashrl_default_path_skips_reference_and_uses_append_only_logs(
     assert "  reward" in output
     assert "  prepare_inputs" in output
     assert "  backward" in output
+    assert "  publish_weights" in output
     assert "  done" in output
     assert "epoch 1/1 summary" in output
     assert "  lifecycle " in output
@@ -2695,3 +2720,67 @@ def test_flashrl_train_failure_uses_active_step_context(
     assert train_exception["payload"]["context"]["epoch"] == 1
 
     trainer._run_logger.close()
+
+
+def test_flashrl_logs_learner_stage_memory_on_oom(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Learner OOMs should identify the failing learner stage and memory snapshot."""
+    patch_backends(monkeypatch)
+
+    import flashrl.framework.training.service as learner_service_module
+
+    def failing_optimize_grpo_batch(**kwargs):
+        del kwargs
+        raise OptimizationStageError(
+            stage_name="backward",
+            message="MPS backend out of memory",
+            memory_snapshot={
+                "captured_at": "2026-03-21T00:00:00.000+00:00",
+                "device_type": "mps",
+                "process": {"rss_bytes": 1234},
+                "system": {"total_bytes": 4096, "available_bytes": 512},
+                "device": {
+                    "current_allocated_bytes": 2048,
+                    "driver_allocated_bytes": 3072,
+                    "recommended_max_bytes": 4096,
+                },
+            },
+            reason_tags=["oom_during_stage", "device_pressure", "shared_device_pressure"],
+        )
+
+    monkeypatch.setattr(learner_service_module, "optimize_grpo_batch", failing_optimize_grpo_batch)
+
+    trainer = build_flashrl(
+        tmp_path,
+        rollout_callback=make_rollout_fn(response_suffix="oom"),
+        reward_callback=reward_fn,
+        serving_config=ServingConfig(model_name="fake/model", backend="huggingface", device="mps"),
+        trainer_config=TrainerConfig(batch_size=2, max_epochs=1, shuffle_each_epoch=False),
+        logging_config=LoggingConfig(log_dir=tmp_path, console=False, file=True),
+        metrics_config=MetricsConfig(enabled=False),
+    )
+    trainer.actor_config.device = "mps"
+
+    with pytest.raises(OptimizationStageError, match="MPS backend out of memory"):
+        trainer.train([Prompt(text="why oom?")])
+
+    events = read_events(trainer._run_logger.run_dir)
+    train_exception = next(
+        event
+        for event in events
+        if event["event"] == "exception"
+        and event["payload"].get("context", {}).get("stage") == "train"
+    )
+    assert train_exception["payload"]["context"]["learner_stage"] == "backward"
+    assert train_exception["payload"]["context"]["memory"]["device_type"] == "mps"
+    assert train_exception["payload"]["context"]["memory_reason_tags"] == [
+        "oom_during_stage",
+        "device_pressure",
+        "shared_device_pressure",
+    ]
+
+    transcript = (trainer._run_logger.run_dir / "console.log").read_text(encoding="utf-8")
+    assert "learner_stage=backward" in transcript
+    assert "oom_during_stage" in transcript

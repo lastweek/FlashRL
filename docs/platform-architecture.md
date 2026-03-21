@@ -19,12 +19,15 @@ There are four separate concerns in platform mode:
   These are the controller, learner, serving, rollout, and reward pods created for one job.
 - framework service layer
   These are the remote clients, in-process services, and shared HTTP route helpers inside the pods that actually move rollout, reward, optimize, and serve requests.
+- observability
+  These are the shared controller run artifacts, per-pod platform log files, and bounded per-job operator events that make one Kubernetes run debuggable.
 
 The important split is:
 
 - the operator manages Kubernetes objects
 - the controller pod runs training
 - the other job pods expose services the controller talks to
+- controller training artifacts follow the same framework run lifecycle in local and platform modes
 
 Inside `flashrl.framework.distributed`, the current code shape is:
 
@@ -34,6 +37,15 @@ Inside `flashrl.framework.distributed`, the current code shape is:
   Domain-owned in-process service logic plus the `create_*_service_app(...)` FastAPI app builders.
 - `http_common.py`
   Shared HTTP lifecycle, readiness, drain, status, and admin route wiring.
+
+One more important split now exists around observability:
+
+- `flashrl.framework.train_runtime`
+  Shared run-scoped controller lifecycle for `RunLogger`, metrics sinks, checkpoint load/save, and run finalization.
+- `flashrl.platform.runtime.platform_pod_logging`
+  Platform-owned pod logging for split service pods and shim startup/runtime events.
+- `FlashRLJob.status`
+  Per-job `logRoot`, active controller run metadata, and recent operator/controller events.
 
 ## What Runs Where
 
@@ -54,7 +66,7 @@ That means there is no separate controller image. Controller, rollout, and rewar
 
 | Pod | Platform software in the pod | What platform adds | Framework software used | User hook or backend |
 | --- | --- | --- | --- | --- |
-| controller | `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop | `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
+| controller | `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop, and open the shared framework run logger/metrics lifecycle under a job-scoped log root | `flashrl.framework.train_runtime`, `RunLogger`, metrics sinks, `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
 | rollout | `PlatformShimRollout` in `flashrl.platform.runtime.platform_shim_rollout` | Load mounted job, instantiate rollout hook, create remote serving client, wire rollout generator into the rollout service | `ServingClient` from `flashrl.framework.distributed`, `RemoteServingBackend` from `flashrl.framework.serving`, `build_rollout_generator`, `RolloutService`, `create_rollout_service_app` from `flashrl.framework.rollout` | `userCode.rollout` |
 | reward | `PlatformShimReward` in `flashrl.platform.runtime.platform_shim_reward` | Load mounted job and instantiate the reward hook, then wire it into the reward service | `UserDefinedReward`, `RewardService`, `create_reward_service_app` from `flashrl.framework.reward` | `userCode.reward` |
 | learner | `PlatformShimLearner` in `flashrl.platform.runtime.platform_shim_learner` | Load mounted job, create actor/reference backends, resolve shared storage paths, publish learner artifacts | `create_training_backend`, `LearnerService`, `create_learner_service_app` from `flashrl.framework.training` | training backends from framework config |
@@ -259,6 +271,44 @@ sequenceDiagram
 ```
 
 Interpretation: the controller pod is different from every other pod because `PlatformShimController` does not just expose one adapter. It installs common HTTP routes through `http_common.py`, then launches a background training loop that coordinates the other services and patches job status back into Kubernetes.
+
+## Observability And Logs
+
+Platform mode now uses the same controller run lifecycle as local framework mode.
+
+- `framework.logging.log_dir` is the canonical logging knob in both modes
+- local mode writes directly under that configured log root
+- platform mode resolves it into one job-scoped root:
+  - relative `log_dir`: `<shared-mount>/<log_dir>/<job-name>/<job-uid>/`
+  - absolute `log_dir`: `<absolute-log-dir>/<job-name>/<job-uid>/`
+
+Within that job root, the controller uses the normal framework run artifact layout:
+
+- `<job-root>/<run-id>/console.log`
+- `<job-root>/<run-id>/events.jsonl`
+- `<job-root>/<run-id>/rollouts.jsonl`
+
+Platform-only pod logs live alongside those controller run artifacts:
+
+- `<job-root>/_pods/controller/<pod-name>/console.log`
+- `<job-root>/_pods/controller/<pod-name>/events.jsonl`
+- `<job-root>/_pods/rollout/<pod-name>/...`
+- `<job-root>/_pods/reward/<pod-name>/...`
+- `<job-root>/_pods/learner/<pod-name>/...`
+- `<job-root>/_pods/serving/<pod-name>/...`
+
+The operator stays cluster-scoped, but it still contributes job-scoped visibility:
+
+- bounded per-job events are appended into `FlashRLJob.status.events`
+- `FlashRLJob.status.logRoot` points at the canonical job log root
+- `FlashRLJob.status.activeControllerRunDir` and `activeControllerRunId` point at the active controller run
+- the controller also writes JSONL status snapshots under `<job-root>/_status/status-snapshots.jsonl`
+
+That gives one supported debugging flow:
+
+1. inspect job status and log root with `flashrl platform logs <job>`
+2. follow live CRD job events and one component stream with `flashrl platform logs <job> --follow --component controller`
+3. inspect durable files under the shared job root for postmortem analysis
 
 ### Rollout Pod
 

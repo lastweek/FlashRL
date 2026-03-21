@@ -402,10 +402,12 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
     assert "ServingBackend" in kinds
     assert "VLLMInstance" in kinds
     assert runtime_object["spec"]["adminBaseUrl"] == trainer.admin_base_url
+    assert runtime_object["status"]["memory"]["process"]["rss_bytes"] >= 0
     assert serving_object["status"]["activeWeightVersion"]["version_id"] == 0
     assert serving_object["status"]["activeWeightVersion"]["origin"] == "startup"
     assert serving_object["status"]["pendingWeightVersion"] is None
     assert serving_object["status"]["syncHealthy"] is True
+    assert serving_object["status"]["memory"]["process"]["rss_bytes"] >= 0
     assert vllm_list["items"][0]["spec"]["port"] == 8100
     assert vllm_list["items"][0]["status"]["phase"] == "Ready"
     assert vllm_list["items"][0]["status"]["activeWeightVersion"]["version_id"] == 0

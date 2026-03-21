@@ -6,7 +6,7 @@ from collections import deque
 from math import ceil
 from threading import Lock
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from fastapi import FastAPI, HTTPException, Request
 
@@ -90,6 +90,7 @@ def install_common_routes(
     name: str,
     drainable: bool = False,
     queue_depth_getter: Callable[[], int] | None = None,
+    event_logger: Callable[[str, dict[str, Any]], None] | None = None,
 ) -> None:
     """Install shared health, readiness, status, and admin routes."""
 
@@ -117,11 +118,39 @@ def install_common_routes(
         if track:
             runtime_state.begin_request()
         started_at = time.perf_counter()
+        status_code = 500
         try:
-            return await call_next(request)
+            response = await call_next(request)
+            status_code = int(getattr(response, "status_code", 200))
+            return response
+        except Exception as exc:
+            if event_logger is not None and track:
+                event_logger(
+                    "request_error",
+                    {
+                        "method": request.method,
+                        "path": request.url.path,
+                        "statusCode": 500,
+                        "latencySeconds": time.perf_counter() - started_at,
+                        "error": f"{type(exc).__name__}: {exc}",
+                    },
+                )
+            raise
         finally:
             if track:
-                runtime_state.finish_request(elapsed_seconds=time.perf_counter() - started_at)
+                elapsed_seconds = time.perf_counter() - started_at
+                runtime_state.finish_request(elapsed_seconds=elapsed_seconds)
+                if event_logger is not None:
+                    event_logger(
+                        "request_completed",
+                        {
+                            "method": request.method,
+                            "path": request.url.path,
+                            "statusCode": status_code,
+                            "latencySeconds": elapsed_seconds,
+                            **runtime_state.snapshot(),
+                        },
+                    )
 
     @app.get("/healthz")
     def healthz() -> dict[str, str]:

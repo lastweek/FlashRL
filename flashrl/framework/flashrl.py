@@ -3,8 +3,6 @@
 from __future__ import annotations
 
 import argparse
-from dataclasses import dataclass
-import math
 import os
 from pathlib import Path
 import random
@@ -35,29 +33,25 @@ from .config import (
     TrainingConfig,
 )
 from .data_models import Prompt, RewardOutput, RolloutOutput, WeightVersionInfo
+from .memory import capture_memory_snapshot
 from .metrics import MetricsSink, build_metrics_sink
 from .observability import timed_call
 from .reward.user_defined import UserDefinedReward
 from .rollout.base import BaseRolloutGenerator, build_rollout_generator
 from .run_logger import RunLogger
 from .serving import ServingBackend, create_serving_backend
+from .train_runtime import (
+    TrainRunState,
+    build_train_run_state,
+    finish_run_observers,
+    open_run_logger as open_shared_run_logger,
+    start_run_metrics,
+)
 from .training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend, create_training_backend
 from .trainer.grpo.trainer import GRPOTrainer
 
 if TYPE_CHECKING:
     from .agent import Agent
-
-
-@dataclass
-class TrainRunState:
-    """Precomputed metadata shared across one FlashRL training run."""
-
-    dataset: list[Prompt]
-    dataset_size: int
-    prompts_per_step: int
-    steps_per_epoch: int
-    total_planned_steps: int
-    run_logger: RunLogger | None = None
 
 
 class FlashRL:
@@ -497,6 +491,7 @@ class FlashRL:
                     "currentEpoch": self._admin_current_epoch(),
                     "currentStep": self._admin_current_step(),
                     "lastError": self._last_runtime_error,
+                    "memory": self._runtime_memory_snapshot(),
                 },
             )
         ]
@@ -526,6 +521,7 @@ class FlashRL:
                     "optimizer": self._actor_backend.optimizer_name,
                     "loaded": True,
                     "worldSize": self._actor_backend.world_size,
+                    "memory": capture_memory_snapshot(self._actor_backend.device),
                 },
             )
         ]
@@ -560,6 +556,7 @@ class FlashRL:
                     "device": str(self._reference_backend.device),
                     "loaded": True,
                     "worldSize": self._reference_backend.world_size,
+                    "memory": capture_memory_snapshot(self._reference_backend.device),
                 },
             )
         ]
@@ -615,6 +612,7 @@ class FlashRL:
                     "lastSuccessfulSyncAt": sync_status.get("lastSuccessfulSyncAt"),
                     "syncHealthy": sync_status.get("syncHealthy"),
                     "lastSyncError": sync_status.get("lastSyncError"),
+                    "memory": capture_memory_snapshot(self._serving_backend.device),
                 },
             )
         ]
@@ -679,6 +677,12 @@ class FlashRL:
         if self._runtime_phase == "Training":
             return "Ready"
         return self._runtime_phase
+
+    def _runtime_memory_snapshot(self) -> dict[str, Any]:
+        """Return the runtime-level memory snapshot for admin/status surfaces."""
+        if self._actor_backend is not None:
+            return capture_memory_snapshot(self._actor_backend.device)
+        return capture_memory_snapshot(self.actor_config.device)
 
     def _admin_current_epoch(self) -> int:
         """Return the user-facing epoch number for the runtime object."""
@@ -795,95 +799,40 @@ class FlashRL:
 
     def _build_train_run_state(self, dataset: list[Prompt]) -> TrainRunState:
         """Compute the per-run dataset and step metadata once."""
-        prompts_per_step = self.trainer_config.batch_size // self.grpo_config.group_size
-        steps_per_epoch = math.ceil(len(dataset) / prompts_per_step) if dataset else 0
-        return TrainRunState(
-            dataset=dataset,
-            dataset_size=len(dataset),
-            prompts_per_step=prompts_per_step,
-            steps_per_epoch=steps_per_epoch,
-            total_planned_steps=steps_per_epoch * self.trainer_config.max_epochs,
+        return build_train_run_state(
+            dataset,
+            trainer_config=self.trainer_config,
+            grpo_config=self.grpo_config,
         )
 
     def _open_run_logger(self, run_state: TrainRunState) -> RunLogger:
         """Open and initialize the run-scoped logger for one training invocation."""
         assert self._actor_backend is not None
         assert self._serving_backend is not None
-        run_open_kwargs = {
-            "dataset_size": run_state.dataset_size,
-            "batch_size": self.trainer_config.batch_size,
-            "max_epochs": self.trainer_config.max_epochs,
-            "total_batches": run_state.total_planned_steps,
-            "device": self.actor_config.device or "auto",
-            "dtype": self.actor_config.dtype,
-            "cpu_threads": self.actor_config.num_threads,
-            "runtime_shape": "single-device-per-backend",
-            "group_size": self.grpo_config.group_size,
-            "clip_ratio": self.grpo_config.clip_ratio,
-            "prompts_per_step": run_state.prompts_per_step,
-            "steps_per_epoch": run_state.steps_per_epoch,
-            "total_planned_steps": run_state.total_planned_steps,
-            "actor_backend": self.actor_config.backend,
-            "actor_device": str(self._actor_backend.device),
-            "actor_dp_size": self.actor_config.dp_size,
-            "reference_configured": self.reference_config is not None,
-            "reference_backend": (
-                self.reference_config.backend if self.reference_config is not None else None
-            ),
-            "reference_device": (
+        set_log_dir = getattr(self._serving_backend, "set_log_dir", None)
+        run_logger = open_shared_run_logger(
+            logging_config=self.logging_config,
+            model_name=self.actor_config.model_name,
+            actor_config=self.actor_config,
+            reference_config=self.reference_config,
+            serving_config=self.serving_config,
+            trainer_config=self.trainer_config,
+            grpo_config=self.grpo_config,
+            run_state=run_state,
+            actor_device=str(self._actor_backend.device),
+            reference_device=(
                 str(self._reference_backend.device) if self._reference_backend is not None else None
             ),
-            "reference_dp_size": (
-                self.reference_config.dp_size if self.reference_config is not None else None
-            ),
-            "serving_backend": self.serving_config.backend,
-            "serving_device": str(self._serving_backend.device),
-            "serving_num_replicas": self.serving_config.num_replicas,
-            "admin_base_url": self.admin_base_url,
-            "max_new_tokens": self.rollout_config.max_new_tokens,
-            "include_startup_divider": bool(self._runtime_bootstrap_console_lines),
-        }
-        if self._managed_resume is not None:
-            run_logger = RunLogger.open_existing_run(
-                self.logging_config,
-                model_name=self.actor_config.model_name,
-                run_id=self._managed_resume.run_id,
-                run_index=self._managed_resume.run_index,
-                run_dir=self._managed_resume.run_dir,
-                restored_state=self._managed_resume.run_logger_state,
-            )
-        else:
-            run_logger = RunLogger(
-                self.logging_config,
-                model_name=self.actor_config.model_name,
-            )
-        set_log_dir = getattr(self._serving_backend, "set_log_dir", None)
-        if callable(set_log_dir):
-            set_log_dir(run_logger.run_dir)
-        run_logger.replay_startup_lines(self._runtime_bootstrap_console_lines)
-        if self._managed_resume is not None:
-            run_logger.resume_run(
-                checkpoint_path=str(self._managed_resume.checkpoint_path),
-                **run_open_kwargs,
-            )
-        else:
-            run_logger.start_run(**run_open_kwargs)
-        for event in self._runtime_bootstrap_events:
-            run_logger.log_model_load(
-                event["component"],
-                event["status"],
-                event["metadata"],
-            )
-        if self._managed_resume is not None:
-            run_logger.log_checkpoint(
-                "load",
-                str(self._managed_resume.checkpoint_path),
-                epoch=self._trainer.current_epoch + 1,
-                step=self._trainer.total_steps,
-                duration_seconds=self._managed_resume_load_seconds,
-                trigger="resume",
-            )
-
+            serving_device=str(self._serving_backend.device),
+            admin_base_url=self.admin_base_url,
+            bootstrap_console_lines=self._runtime_bootstrap_console_lines,
+            bootstrap_events=self._runtime_bootstrap_events,
+            managed_resume=self._managed_resume,
+            managed_resume_load_seconds=self._managed_resume_load_seconds,
+            resumed_epoch=self._trainer.current_epoch + 1,
+            resumed_step=self._trainer.total_steps,
+            serving_log_dir_setter=set_log_dir,
+        )
         self._run_logger = run_logger
         run_state.run_logger = run_logger
         return run_logger
@@ -1067,12 +1016,7 @@ class FlashRL:
 
     def _start_run_metrics(self, run_logger: RunLogger) -> None:
         """Open the metrics sink for the current run when enabled."""
-        if self._metrics_sink is None:
-            return
-        self._metrics_sink.start_run(
-            run_dir=run_logger.run_dir,
-            run_id=run_logger.run_id,
-        )
+        start_run_metrics(self._metrics_sink, run_logger=run_logger)
 
     def _execute_training_loop(self, dataset: list[Prompt]) -> None:
         """Mark the runtime as training and delegate to the trainer."""
@@ -1092,9 +1036,8 @@ class FlashRL:
         self._last_runtime_error = f"{type(exc).__name__}: {exc}"
         active_context = self._trainer.active_step_context
         if self._run_logger is not None:
-            self._run_logger.log_exception(
-                exc,
-                context={
+            if not bool(getattr(exc, "_flashrl_logged", False)):
+                context: dict[str, Any] = {
                     "stage": "train",
                     "step": (
                         active_context.step
@@ -1106,8 +1049,17 @@ class FlashRL:
                         if active_context is not None
                         else self._trainer.current_epoch + 1
                     ),
-                },
-            )
+                }
+                learner_stage = getattr(exc, "stage_name", None)
+                if learner_stage is not None:
+                    context["learner_stage"] = str(learner_stage)
+                memory_snapshot = getattr(exc, "memory_snapshot", None)
+                if isinstance(memory_snapshot, dict):
+                    context["memory"] = memory_snapshot
+                reason_tags = getattr(exc, "reason_tags", None)
+                if isinstance(reason_tags, list) and reason_tags:
+                    context["memory_reason_tags"] = [str(tag) for tag in reason_tags]
+                self._run_logger.log_exception(exc, context=context)
         if self._serving_backend is not None:
             self._serving_backend.close()
 
@@ -1134,15 +1086,13 @@ class FlashRL:
             self._managed_resume = None
             self._managed_resume_load_seconds = 0.0
             self._restored_run_lifecycle_totals = {}
-            if self._metrics_sink is not None:
-                self._metrics_sink.finish_run()
-            if self._run_logger is not None:
-                self._run_logger.finish_run(
-                    status=final_status,
-                    total_steps=self._trainer.total_steps,
-                    lifecycle_totals=self._run_lifecycle_totals,
-                )
-                self._run_logger.close()
+            finish_run_observers(
+                run_logger=self._run_logger,
+                metrics_sink=self._metrics_sink,
+                status=final_status,
+                total_steps=self._trainer.total_steps,
+                lifecycle_totals=self._run_lifecycle_totals,
+            )
 
     def train(self, dataset: list[Prompt] | list[str] | None = None) -> None:
         """Train on dataset or use the configured dataset loader."""

@@ -27,6 +27,7 @@ from flashrl.framework.distributed.models import (
 from flashrl.framework.distributed.reward_client import RewardClient
 from flashrl.framework.distributed.rollout_client import RolloutClient
 from flashrl.framework.distributed.serving_client import ServingClient
+from flashrl.framework.memory import capture_memory_snapshot, summarize_memory_window
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -268,6 +269,7 @@ class GRPOTrainer:
     ) -> dict[str, Any]:
         """Run one full training step and emit detailed stage logs."""
         step_started_at = current_time()
+        step_memory_start = capture_memory_snapshot(self._actor_device_for_memory())
         if self.run_logger is not None:
             self.run_logger.log_step_start(context.payload())
 
@@ -398,6 +400,7 @@ class GRPOTrainer:
         }
         all_stage_timings.setdefault("reference_forward", 0.0)
         step_duration_seconds = elapsed_seconds(step_started_at)
+        step_memory_end = capture_memory_snapshot(self._actor_device_for_memory())
         response_tokens_total = result.response_tokens_total
         tokens_per_second = (
             response_tokens_total / step_duration_seconds if step_duration_seconds > 0.0 else 0.0
@@ -426,6 +429,15 @@ class GRPOTrainer:
             "response_tokens_total": response_tokens_total,
             "tokens_per_second": tokens_per_second,
             "step_duration_seconds": step_duration_seconds,
+            "learner_total_seconds": result.learner_total_seconds,
+            "learner_unaccounted_seconds": result.learner_unaccounted_seconds,
+            "memory_summary": summarize_memory_window(
+                step_memory_start,
+                *self._stage_memory_snapshots(result.stages),
+                step_memory_end,
+                start=step_memory_start,
+                end=step_memory_end,
+            ),
             "stage_timings": all_stage_timings,
             "stage_order": visible_stage_order,
             "reference_configured": self.reference_configured,
@@ -545,14 +557,21 @@ class GRPOTrainer:
         rollout_weight_version: WeightVersionInfo | None,
     ) -> OptimizationResult:
         """Delegate learner-side tensor work to the training backend."""
-        optimize_response = self.learner.optimize_step(
-            OptimizeStepRequest(
-                step_id=(context.step if context is not None else None),
-                epoch=(context.epoch if context is not None else 0),
-                learner_batch=learner_batch,
-                rollout_weight_version=rollout_weight_version,
+        learner_started_at = current_time()
+        try:
+            optimize_response = self.learner.optimize_step(
+                OptimizeStepRequest(
+                    step_id=(context.step if context is not None else None),
+                    epoch=(context.epoch if context is not None else 0),
+                    learner_batch=learner_batch,
+                    rollout_weight_version=rollout_weight_version,
+                )
             )
-        )
+        except Exception as exc:
+            setattr(exc, "learner_total_seconds", elapsed_seconds(learner_started_at))
+            raise
+        learner_total_seconds = elapsed_seconds(learner_started_at)
+        learner_stage_seconds = sum(float(stage.seconds) for stage in optimize_response.stages)
         result = OptimizationResult(
             loss=optimize_response.loss,
             policy_loss=optimize_response.policy_loss,
@@ -568,6 +587,8 @@ class GRPOTrainer:
                 )
                 for stage in optimize_response.stages
             ],
+            learner_total_seconds=learner_total_seconds,
+            learner_unaccounted_seconds=max(0.0, learner_total_seconds - learner_stage_seconds),
         )
         for stage in result.stages:
             if stage.name == "reference_forward" and not result.reference_active:
@@ -613,6 +634,31 @@ class GRPOTrainer:
             self._log_stage(context, sync_stage)
         result.refresh_stage_views()
         return result
+
+    def _actor_device_for_memory(self) -> Any | None:
+        """Return the best local device handle for step-level memory snapshots."""
+        if self.actor_backend is not None:
+            return self.actor_backend.device
+        if self.serving_backend is not None:
+            return getattr(self.serving_backend, "device", None)
+        return None
+
+    def _stage_memory_snapshots(self, stages: list[StageResult]) -> list[dict[str, Any]]:
+        """Collect before/after memory snapshots from measured learner stages."""
+        snapshots: list[dict[str, Any]] = []
+        for stage in stages:
+            memory_payload = (
+                stage.metrics.get("memory") if isinstance(stage.metrics.get("memory"), dict) else None
+            )
+            if not isinstance(memory_payload, dict):
+                continue
+            before = memory_payload.get("before")
+            after = memory_payload.get("after")
+            if isinstance(before, dict):
+                snapshots.append(before)
+            if isinstance(after, dict):
+                snapshots.append(after)
+        return snapshots
 
     def _build_batch_metadata(self, rollouts: list[Any]) -> dict[str, Any]:
         """Capture batch-wide rollout provenance and reject mixed serving versions."""

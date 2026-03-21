@@ -12,6 +12,7 @@ license = { text = "Apache-2.0" }
 dependencies = [
     "datasets>=3.0.0",
     "fastapi>=0.115.0",
+    "psutil>=7.0.0",
     "torch>=2.0.0",
     "transformers>=4.40.0",
     "pydantic>=2.0.0",

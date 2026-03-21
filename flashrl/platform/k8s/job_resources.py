@@ -195,6 +195,26 @@ def _job_with_mounted_storage_paths(job: FlashRLJob) -> FlashRLJob:
     return runtime_job
 
 
+def _job_uid(job: FlashRLJob) -> str:
+    value = job.metadata.get("uid")
+    if value is None:
+        return f"{job.name}-pending"
+    return str(value)
+
+
+def _job_log_root(job: FlashRLJob) -> str:
+    log_dir = PurePosixPath(str(job.spec.framework.logging.log_dir))
+    job_suffix = PurePosixPath(job.name) / _job_uid(job)
+    if log_dir.is_absolute():
+        return str(log_dir / job_suffix)
+    mount_root = PurePosixPath(job.spec.sharedStorage.mountPath if job.spec.sharedStorage.enabled else "/tmp/flashrl-platform-logs")
+    return str(mount_root / log_dir / job_suffix)
+
+
+def _component_log_root(job: FlashRLJob, workload: str) -> str:
+    return str(PurePosixPath(_job_log_root(job)) / "_pods" / workload)
+
+
 def _job_config_map_resource(job: FlashRLJob) -> dict[str, Any]:
     runtime_job = _job_with_mounted_storage_paths(job)
     return {
@@ -283,9 +303,17 @@ def _pod_environment(job: FlashRLJob, workload: str, workload_spec: WorkloadSpec
         {"name": "FLASHRL_REWARD_URL", "value": f"http://{job_workload_name(job, 'reward')}.{namespace}.svc.cluster.local"},
         {"name": "FLASHRL_LEARNER_URL", "value": f"http://{learner_host}"},
         {"name": "FLASHRL_SERVING_URL", "value": f"http://{job_workload_name(job, 'serving')}.{namespace}.svc.cluster.local"},
+        {"name": "FLASHRL_JOB_UID", "value": _job_uid(job)},
+        {"name": "FLASHRL_COMPONENT_NAME", "value": workload},
+        {"name": "FLASHRL_JOB_LOG_ROOT", "value": _job_log_root(job)},
+        {"name": "FLASHRL_COMPONENT_LOG_DIR", "value": _component_log_root(job, workload)},
         {
             "name": "FLASHRL_NAMESPACE",
             "valueFrom": {"fieldRef": {"fieldPath": "metadata.namespace"}},
+        },
+        {
+            "name": "FLASHRL_POD_NAME",
+            "valueFrom": {"fieldRef": {"fieldPath": "metadata.name"}},
         },
     ]
     env.extend({"name": key, "value": value} for key, value in sorted(workload_spec.env.items()))

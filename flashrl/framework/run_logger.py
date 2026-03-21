@@ -16,6 +16,11 @@ from uuid import uuid4
 
 from . import log_paths, rollout_logging
 from flashrl.framework.config import LoggingConfig
+from flashrl.framework.memory import (
+    capture_memory_snapshot,
+    format_memory_brief,
+    update_memory_summary,
+)
 from flashrl.framework.observability import RuntimeEvent
 
 
@@ -29,6 +34,7 @@ STAGE_DISPLAY_ORDER = [
     "loss_assembly",
     "backward",
     "optimizer",
+    "publish_weights",
     "sync",
 ]
 
@@ -371,6 +377,7 @@ class RunLogger:
         self._slowest_step_seconds = 0.0
         self._dominant_stage = "n/a"
         self._stage_totals: dict[str, float] = {}
+        self._memory_summary: dict[str, Any] = {}
 
     def export_state(self) -> dict[str, Any]:
         """Serialize the aggregate logger state needed for append-resume."""
@@ -381,6 +388,7 @@ class RunLogger:
             "slowest_step_seconds": self._slowest_step_seconds,
             "dominant_stage": self._dominant_stage,
             "stage_totals": dict(self._stage_totals),
+            "memory_summary": dict(self._memory_summary),
         }
 
     def restore_state(self, restored_state: dict[str, Any] | None) -> None:
@@ -399,6 +407,9 @@ class RunLogger:
                 for key, value in stage_totals.items()
                 if isinstance(value, (int, float))
             }
+        memory_summary = restored_state.get("memory_summary", {})
+        if isinstance(memory_summary, dict):
+            self._memory_summary = dict(memory_summary)
 
     def start_run(
         self,
@@ -561,6 +572,8 @@ class RunLogger:
         self._current_step_header = None
         self._current_serving_prompt_key = None
         self._step_block_complete = False
+        startup_memory = capture_memory_snapshot(device)
+        self._record_memory_snapshot(startup_memory)
 
         payload = {
             "run_id": self.run_id,
@@ -595,12 +608,14 @@ class RunLogger:
             "serving_num_replicas": serving_num_replicas,
             "admin_base_url": admin_base_url,
             "run_dir": str(self.run_dir),
+            "memory": startup_memory,
         }
         if resume_checkpoint_path is not None:
             payload["checkpoint_path"] = resume_checkpoint_path
         self._emit_event(event_name, payload)
 
         header_lines = self._format_compact_run_header(
+            startup_memory=startup_memory,
             device=device,
             dtype=dtype,
             cpu_threads=cpu_threads,
@@ -708,6 +723,7 @@ class RunLogger:
 
     def log_step_stage(self, payload: dict[str, Any]) -> None:
         """Log one completed training stage."""
+        self._record_memory_payload(payload)
         if not self._should_log_step(int(payload["step"])):
             return
 
@@ -723,6 +739,9 @@ class RunLogger:
         for key in self._verbose_stage_keys(str(payload["stage"])):
             if key in payload:
                 line += f" {key}={self._format_verbose_value(key, payload[key])}"
+        memory_suffix = self._memory_suffix_for_payload(payload)
+        if memory_suffix:
+            line += f" {memory_suffix}"
         self._emit_console(line)
 
     def log_step_done(self, payload: dict[str, Any]) -> None:
@@ -736,6 +755,7 @@ class RunLogger:
         self._total_step_count += 1
         self._total_step_seconds += step_duration_seconds
         self._accumulate_totals(self._stage_totals, stage_timings)
+        self._record_memory_payload(payload)
         if step_duration_seconds >= self._slowest_step_seconds:
             self._slowest_step_seconds = step_duration_seconds
             self._dominant_stage = str(payload.get("dominant_stage", self._dominant_stage))
@@ -978,6 +998,9 @@ class RunLogger:
 
     def log_exception(self, exc: BaseException, context: dict[str, Any]) -> None:
         """Log an exception during training."""
+        memory_snapshot = context.get("memory")
+        if isinstance(memory_snapshot, dict):
+            self._record_memory_snapshot(memory_snapshot)
         payload = {
             "type": type(exc).__name__,
             "message": str(exc),
@@ -989,6 +1012,16 @@ class RunLogger:
         stage = context.get("stage")
         if stage is not None:
             line += f" stage={stage}"
+        learner_stage = context.get("learner_stage")
+        if learner_stage is not None:
+            line += f" learner_stage={learner_stage}"
+        reason_tags = context.get("memory_reason_tags")
+        if isinstance(reason_tags, list) and reason_tags:
+            line += f" tags={','.join(str(tag) for tag in reason_tags)}"
+        if isinstance(memory_snapshot, dict):
+            memory_suffix = format_memory_brief(memory_snapshot)
+            if memory_suffix:
+                line += f" {memory_suffix}"
         self._emit_console(line)
 
     def log_checkpoint(
@@ -1057,6 +1090,7 @@ class RunLogger:
             "slowest_step_seconds": 0.0 if no_training_steps_completed else self._slowest_step_seconds,
             "dominant_stage": "n/a" if no_training_steps_completed else self._dominant_stage,
             "no_training_steps_completed": no_training_steps_completed,
+            "memory_summary": dict(self._memory_summary),
         }
         self._emit_event("run_finished", payload)
         self._current_step_header = None
@@ -1096,6 +1130,9 @@ class RunLogger:
                     for key, value in lifecycle_totals.items()
                 )
             )
+        memory_line = self._format_run_memory_summary()
+        if memory_line:
+            self._emit_console(memory_line)
 
     def close(self) -> None:
         """Close the logger."""
@@ -1103,6 +1140,7 @@ class RunLogger:
     def _format_compact_run_header(
         self,
         *,
+        startup_memory: dict[str, Any],
         device: str,
         dtype: str,
         cpu_threads: int,
@@ -1160,6 +1198,9 @@ class RunLogger:
             lines.append(serving_line)
         if admin_base_url is not None:
             lines.append(f"  admin    {admin_base_url}")
+        memory_line = format_memory_brief(startup_memory)
+        if memory_line:
+            lines.append(f"  memory   {memory_line}")
         if group_size is not None:
             grpo_line = f"  grpo     completions_per_prompt={group_size}"
             if clip_ratio is not None:
@@ -1277,6 +1318,9 @@ class RunLogger:
         row = f"  {stage:<15} {latency:>8}"
         if details:
             row += f"  {details}"
+        memory_suffix = self._memory_suffix_for_payload(payload)
+        if memory_suffix:
+            row += f"  {memory_suffix}"
         return row
 
     def _format_compact_stage_details(self, stage: str, payload: dict[str, Any]) -> str:
@@ -1322,6 +1366,11 @@ class RunLogger:
             return f"loss {self._format_fixed(float(payload['loss']), 4)}"
         if stage == "optimizer":
             return f"lr {self._format_fixed(float(payload['learning_rate']), 4)}"
+        if stage == "publish_weights":
+            version_id = payload.get("weight_version_id")
+            if version_id is None:
+                return ""
+            return f"version {self._format_compact_scalar(version_id)}"
         if stage == "sync":
             return (
                 f"partial {self._format_precise_duration(float(payload['step_duration_seconds']))}  "
@@ -1330,13 +1379,17 @@ class RunLogger:
         return ""
 
     def _format_compact_done_row(self, payload: dict[str, Any]) -> str:
-        return (
+        row = (
             f"  {'done':<15} {self._format_duration(float(payload['step_duration_seconds'])):>8}  "
             f"loss {self._format_fixed(float(payload['loss']), 4)}  "
             f"reward {self._format_fixed(float(payload['reward_mean']), 4)}  "
             f"tok/s {self._format_fixed(float(payload['tokens_per_second']), 2)}  "
             f"dominant {payload['dominant_stage']}"
         )
+        memory_suffix = self._memory_suffix_for_payload(payload)
+        if memory_suffix:
+            row += f"  {memory_suffix}"
+        return row
 
     def _format_compact_epoch_summary(self, payload: dict[str, Any]) -> list[str]:
         lines = [
@@ -1393,6 +1446,9 @@ class RunLogger:
                     payload["stage_percentages"],
                 )
             )
+        memory_line = self._format_run_memory_summary()
+        if memory_line:
+            lines.append(memory_line)
         lines.append(f"  logs      {self.run_dir}")
         return lines
 
@@ -1483,6 +1539,7 @@ class RunLogger:
             ],
             "backward": ["loss"],
             "optimizer": ["learning_rate"],
+            "publish_weights": ["weight_version_id"],
             "sync": ["step_duration_seconds", "tokens_per_second"],
         }
         return ordered_keys.get(stage, [])
@@ -1565,6 +1622,97 @@ class RunLogger:
         for key, value in update.items():
             target[key] = target.get(key, 0.0) + float(value)
 
+    def _record_memory_snapshot(self, snapshot: dict[str, Any] | None) -> None:
+        """Merge one memory snapshot into the run-level summary."""
+        self._memory_summary = update_memory_summary(self._memory_summary, snapshot)
+
+    def _record_memory_payload(self, payload: dict[str, Any]) -> None:
+        """Merge any nested memory snapshots present in an event payload."""
+        memory_payload = payload.get("memory")
+        if isinstance(memory_payload, dict):
+            for snapshot in (memory_payload.get("before"), memory_payload.get("after")):
+                if isinstance(snapshot, dict):
+                    self._record_memory_snapshot(snapshot)
+
+        memory_summary = payload.get("memory_summary")
+        if isinstance(memory_summary, dict):
+            start_snapshot = memory_summary.get("start")
+            end_snapshot = memory_summary.get("end")
+            if isinstance(start_snapshot, dict):
+                self._record_memory_snapshot(start_snapshot)
+            if isinstance(end_snapshot, dict):
+                self._record_memory_snapshot(end_snapshot)
+            for key, value in memory_summary.items():
+                if isinstance(value, dict):
+                    self._record_memory_snapshot(value)
+            scalar_fields = {
+                key: value
+                for key, value in memory_summary.items()
+                if not isinstance(value, dict)
+            }
+            peak_fields = (
+                "peak_process_rss_bytes",
+                "peak_device_current_allocated_bytes",
+                "peak_device_driver_allocated_bytes",
+                "peak_device_reserved_bytes",
+                "peak_device_max_allocated_bytes",
+            )
+            for key in peak_fields:
+                value = scalar_fields.get(key)
+                if value is not None:
+                    current = self._memory_summary.get(key, 0) or 0
+                    self._memory_summary[key] = max(int(current), int(value))
+            low_value = scalar_fields.get("lowest_system_available_bytes")
+            if low_value is not None:
+                current_low = self._memory_summary.get("lowest_system_available_bytes")
+                self._memory_summary["lowest_system_available_bytes"] = (
+                    int(low_value)
+                    if current_low is None
+                    else min(int(current_low), int(low_value))
+                )
+            for key in ("device_type", "system_total_bytes", "device_recommended_max_bytes"):
+                value = scalar_fields.get(key)
+                if value is not None:
+                    self._memory_summary[key] = value
+
+    def _memory_suffix_for_payload(self, payload: dict[str, Any]) -> str:
+        """Render a short memory suffix from a stage/done/exception payload."""
+        memory_payload = payload.get("memory")
+        if isinstance(memory_payload, dict) and isinstance(memory_payload.get("after"), dict):
+            return format_memory_brief(memory_payload["after"])
+        if isinstance(memory_payload, dict):
+            return format_memory_brief(memory_payload)
+        memory_summary = payload.get("memory_summary")
+        if isinstance(memory_summary, dict) and isinstance(memory_summary.get("end"), dict):
+            return format_memory_brief(memory_summary["end"])
+        return ""
+
+    def _format_run_memory_summary(self) -> str:
+        """Render a bounded run-level memory summary line."""
+        if not self._memory_summary:
+            return ""
+        parts: list[str] = []
+        process_peak = self._memory_summary.get("peak_process_rss_bytes")
+        if process_peak is not None:
+            parts.append(f"peak_rss={self._format_bytes(process_peak)}")
+        device_type = self._memory_summary.get("device_type")
+        if device_type == "mps":
+            device_peak = self._memory_summary.get("peak_device_current_allocated_bytes")
+            device_limit = self._memory_summary.get("device_recommended_max_bytes")
+            if device_peak is not None:
+                ratio = self._format_bytes(device_peak)
+                if device_limit is not None:
+                    ratio += f"/{self._format_bytes(device_limit)}"
+                parts.append(f"peak_mps={ratio}")
+        elif device_type == "cuda":
+            device_peak = self._memory_summary.get("peak_device_current_allocated_bytes")
+            if device_peak is not None:
+                parts.append(f"peak_cuda={self._format_bytes(device_peak)}")
+        low_available = self._memory_summary.get("lowest_system_available_bytes")
+        if low_available is not None:
+            parts.append(f"low_avail={self._format_bytes(low_available)}")
+        return "  memory    " + "  ".join(parts) if parts else ""
+
     def _format_verbose_value(self, key: str, value: Any) -> str:
         if isinstance(value, bool):
             return "true" if value else "false"
@@ -1601,6 +1749,19 @@ class RunLogger:
         if value < 1.0:
             return f"{value * 1000.0:.1f}ms"
         return f"{value:.4f}s"
+
+    def _format_bytes(self, value: Any) -> str:
+        if value is None:
+            return "n/a"
+        scaled = float(value)
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        unit_index = 0
+        while scaled >= 1024.0 and unit_index < len(units) - 1:
+            scaled /= 1024.0
+            unit_index += 1
+        if unit_index == 0:
+            return f"{int(scaled)}{units[unit_index]}"
+        return f"{scaled:.2f}{units[unit_index]}"
 
     def _truncate(self, text: str, *, limit: int = 240) -> str:
         normalized = " ".join(text.strip().split())

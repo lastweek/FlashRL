@@ -780,3 +780,67 @@ def test_job_reconciler_orders_main_reconcile_steps() -> None:
     assert calls.index("recover") < calls.index("summarize")
     assert calls.index("summarize") < calls.index("build-status")
     assert calls.index("build-status") < calls.index("patch-status")
+
+
+def test_job_reconciler_appends_operator_events_to_status() -> None:
+    """Reconcile should append operator lifecycle, scaling, and recovery events to CRD status."""
+    captured: dict[str, object] = {}
+    job = FlashRLJob.model_validate(_job_payload())
+
+    class StubStatusCollector:
+        def collect(self, job: FlashRLJob, *, namespace: str) -> dict[str, object]:
+            return {}
+
+        def summarize(self, job: FlashRLJob, observations: dict[str, object]) -> JobStatusSummary:
+            return JobStatusSummary(phase="Ready", conditions=[], last_error=None)
+
+        def build_status_patch(
+            self,
+            job: FlashRLJob,
+            *,
+            summary: JobStatusSummary,
+            observations: dict[str, object],
+        ) -> dict[str, object]:
+            return {"phase": summary.phase}
+
+    class StubAutoscaler:
+        def apply(self, job: FlashRLJob, observations: dict[str, object], *, namespace: str):
+            return [
+                {
+                    "event": "autoscale_applied",
+                    "message": "Scaled rollout from 1 to 2 replicas.",
+                    "component": "rollout",
+                    "metadata": {"desiredReplicas": 2},
+                }
+            ]
+
+    class StubRecoveryManager:
+        def apply(self, job: FlashRLJob, observations: dict[str, object], *, namespace: str):
+            return [
+                {
+                    "event": "recovery_restart",
+                    "message": "Restarting reward Deployment after readiness timeout.",
+                    "component": "reward",
+                    "metadata": {"recoveryAttempts": 1},
+                }
+            ]
+
+    reconciler = JobReconciler(
+        lambda: object(),
+        lambda: (lambda: object()),
+        StubStatusCollector(),
+        StubAutoscaler(),
+        StubRecoveryManager(),
+        finalizer=FINALIZER,
+    )
+    reconciler._ensure_finalizer = lambda job, namespace: None  # type: ignore[method-assign]
+    reconciler._apply_resource = lambda resource, namespace: None  # type: ignore[method-assign]
+    reconciler._patch_job_status = lambda job, namespace, status: captured.setdefault("status", status)  # type: ignore[method-assign]
+
+    reconciler.reconcile(job)
+
+    events = captured["status"]["events"]
+    assert events[0]["event"] == "reconcile_started"
+    assert any(event["event"] == "autoscale_applied" for event in events)
+    assert any(event["event"] == "recovery_restart" for event in events)
+    assert events[-1]["event"] == "reconcile_finished"

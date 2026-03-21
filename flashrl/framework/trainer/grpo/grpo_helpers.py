@@ -21,6 +21,7 @@ STAGE_ORDER = (
     "loss_assembly",
     "backward",
     "optimizer",
+    "publish_weights",
     "sync",
 )
 

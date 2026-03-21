@@ -31,10 +31,11 @@ class RecoveryManager:
         observations: dict[str, ComponentObservation],
         *,
         namespace: str,
-    ) -> None:
+    ) -> list[dict[str, Any]]:
         """Apply controller, learner, and elastic-pool recovery policies."""
         now_iso = self._now_fn()
         now = parse_timestamp(now_iso) or datetime.now(timezone.utc)
+        events: list[dict[str, Any]] = []
         for component, observation in observations.items():
             workload = job_workload_spec(job, component)
             policy = workload.failurePolicy or FailurePolicySpec()
@@ -48,7 +49,7 @@ class RecoveryManager:
                 continue
 
             if component == "learner":
-                self._recover_learner(
+                recovered = self._recover_learner(
                     job,
                     status=status,
                     policy=policy,
@@ -56,10 +57,12 @@ class RecoveryManager:
                     now=now,
                     now_iso=now_iso,
                 )
+                if recovered is not None:
+                    events.append(recovered)
                 continue
 
             if component in ELASTIC_WORKLOADS:
-                self._recover_elastic_pool(
+                recovered = self._recover_elastic_pool(
                     job,
                     component=component,
                     status=status,
@@ -68,6 +71,9 @@ class RecoveryManager:
                     now=now,
                     now_iso=now_iso,
                 )
+                if recovered is not None:
+                    events.append(recovered)
+        return events
 
     def _recover_learner(
         self,
@@ -78,7 +84,7 @@ class RecoveryManager:
         namespace: str,
         now: datetime,
         now_iso: str,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Recover the learner by scaling to zero, backing off, then restoring world size."""
         # Learner recovery is a two-step reset: scale to zero, wait through
         # backoff, then scale back to the configured world size.
@@ -89,29 +95,41 @@ class RecoveryManager:
                 status.desiredReplicas = world_size
                 status.phase = "Recovering"
                 status.lastRecoveryAt = now_iso
-            return
+                return {
+                    "event": "recovery_restore",
+                    "message": f"Restored learner StatefulSet to {world_size} replicas after backoff.",
+                    "component": "learner",
+                    "metadata": {"desiredReplicas": world_size},
+                }
+            return None
 
         if status.desiredReplicas <= 0 or status.readyReplicas >= status.desiredReplicas:
             status.unreadySince = None
             status.lastError = None
-            return
+            return None
         if seconds_since(now, status.unreadySince) < float(policy.readinessTimeoutSeconds):
             status.phase = "Degraded"
             status.lastError = "Learner set is below desired readiness."
-            return
+            return None
         if status.recoveryAttempts >= int(policy.maxRecoveryAttempts):
             status.phase = "Failed"
             status.lastError = "Learner recovery attempts exhausted."
-            return
+            return None
         if seconds_since(now, status.lastRecoveryAt) < float(policy.backoffSeconds):
             status.phase = "Recovering"
-            return
+            return None
         self._set_workload_replicas(job, "learner", replicas=0, namespace=namespace)
         status.desiredReplicas = 0
         status.recoveryAttempts += 1
         status.lastRecoveryAt = now_iso
         status.phase = "Recovering"
         status.lastError = "Restarting learner StatefulSet after readiness timeout."
+        return {
+            "event": "recovery_restart",
+            "message": "Restarting learner StatefulSet after readiness timeout.",
+            "component": "learner",
+            "metadata": {"recoveryAttempts": status.recoveryAttempts},
+        }
 
     def _recover_elastic_pool(
         self,
@@ -123,7 +141,7 @@ class RecoveryManager:
         namespace: str,
         now: datetime,
         now_iso: str,
-    ) -> None:
+    ) -> dict[str, Any] | None:
         """Recover an elastic pool by forcing a Deployment rollout restart."""
         # Elastic pools recover by forcing a Deployment rollout restart rather
         # than changing their long-term replica target.
@@ -131,23 +149,29 @@ class RecoveryManager:
             status.unreadySince = None
             if status.phase != "Failed":
                 status.lastError = None
-            return
+            return None
         if seconds_since(now, status.unreadySince) < float(policy.readinessTimeoutSeconds):
             status.phase = "Degraded"
             status.lastError = f"{component} pool has no ready replicas."
-            return
+            return None
         if status.recoveryAttempts >= int(policy.maxRecoveryAttempts):
             status.phase = "Failed"
             status.lastError = f"{component} recovery attempts exhausted."
-            return
+            return None
         if seconds_since(now, status.lastRecoveryAt) < float(policy.backoffSeconds):
             status.phase = "Recovering"
-            return
+            return None
         self._restart_workload(job, component, namespace=namespace, now_iso=now_iso)
         status.recoveryAttempts += 1
         status.lastRecoveryAt = now_iso
         status.phase = "Recovering"
         status.lastError = f"Restarting {component} Deployment after readiness timeout."
+        return {
+            "event": "recovery_restart",
+            "message": f"Restarting {component} Deployment after readiness timeout.",
+            "component": component,
+            "metadata": {"recoveryAttempts": status.recoveryAttempts},
+        }
 
     def _set_workload_replicas(
         self,

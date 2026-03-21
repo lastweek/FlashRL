@@ -75,6 +75,8 @@ class OptimizationResult:
     stages: list[StageResult] = field(default_factory=list)
     stage_timings: dict[str, float] = field(default_factory=dict)
     stage_metrics: dict[str, dict[str, Any]] = field(default_factory=dict)
+    learner_total_seconds: float = 0.0
+    learner_unaccounted_seconds: float = 0.0
 
     def stage(self, name: str) -> StageResult | None:
         """Return one named stage result when present."""

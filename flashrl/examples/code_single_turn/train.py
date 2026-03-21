@@ -44,6 +44,7 @@ CODE_PREVIEW_MAX_LINES = 6
 CODE_PREVIEW_MAX_CHARS = 240
 SUPPORTED_TRAINING_MODES = ("code", "reasoning-code")
 DEFAULT_GENERATED_CODE_LOG_DIR = "generated_code"
+GeneratedCodeRunDirResolver = Callable[[], str | Path | None]
 
 THINK_BLOCK_PATTERN = re.compile(r"<think>(.*?)</think>", re.IGNORECASE | re.DOTALL)
 ANSWER_BLOCK_PATTERN = re.compile(r"<answer>(.*?)</answer>", re.IGNORECASE | re.DOTALL)
@@ -662,13 +663,10 @@ def make_code_reward_fn(
     run_timeout_seconds: float,
     memory_limit_mb: int | None,
     training_mode: str = "code",
-    log_dir: str = DEFAULT_GENERATED_CODE_LOG_DIR,
+    log_dir: str | Path | None = None,
+    run_dir_resolver: GeneratedCodeRunDirResolver | None = None,
 ) -> Callable[[RolloutOutput], RewardOutput]:
     """Build one reward function with the selected local execution limits."""
-
-    # Create logging directory
-    log_path = Path(log_dir)
-    log_path.mkdir(parents=True, exist_ok=True)
 
     def reward_fn(rollout: RolloutOutput) -> RewardOutput:
         result = score_code_rollout(
@@ -679,6 +677,10 @@ def make_code_reward_fn(
         )
 
         # Log generated code and reward
+        log_path = _resolve_generated_code_log_dir(
+            log_dir=log_dir,
+            run_dir_resolver=run_dir_resolver,
+        )
         task_id = result.metadata.get("task_id", "unknown")
         # Sanitize task_id to replace special characters that are problematic in filenames
         safe_task_id = task_id.replace("/", "_").replace("\\", "_")
@@ -686,7 +688,7 @@ def make_code_reward_fn(
         filename = f"{safe_task_id}_{timestamp}.txt"
         filepath = log_path / filename
 
-        with open(filepath, "w") as f:
+        with open(filepath, "w", encoding="utf-8") as f:
             f.write(f"Task ID: {task_id}\n")
             f.write(f"Timestamp: {timestamp}\n")
             f.write(f"Log File: {filename}\n")
@@ -708,6 +710,29 @@ def make_code_reward_fn(
         return result
 
     return reward_fn
+
+
+def _resolve_generated_code_log_dir(
+    *,
+    log_dir: str | Path | None,
+    run_dir_resolver: GeneratedCodeRunDirResolver | None = None,
+) -> Path:
+    """Resolve the generated-code artifact directory for one reward write."""
+    configured_log_dir = Path(log_dir) if log_dir is not None else Path(DEFAULT_GENERATED_CODE_LOG_DIR)
+    if configured_log_dir.is_absolute():
+        resolved_log_dir = configured_log_dir
+    elif run_dir_resolver is None:
+        resolved_log_dir = configured_log_dir
+    else:
+        run_dir = run_dir_resolver()
+        if run_dir is None:
+            raise RuntimeError(
+                "Generated code log directory could not be resolved because the active "
+                "FlashRL run directory is not available yet."
+            )
+        resolved_log_dir = Path(run_dir) / configured_log_dir
+    resolved_log_dir.mkdir(parents=True, exist_ok=True)
+    return resolved_log_dir
 
 
 # Rollout hook
@@ -832,7 +857,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--log-dir",
         type=str,
         default=None,
-        help="Directory to save generated code and rewards. Defaults to 'generated_code/' in the current directory.",
+        help="Directory to save generated code and rewards. Training defaults to '<run_dir>/generated_code/' under logs/; absolute paths stay absolute.",
     )
     return parser
 
@@ -844,6 +869,12 @@ def main(argv: list[str] | None = None) -> int:
     prepare_reasoning_code_environment(args.config)
 
     flashrl: FlashRL | None = None
+
+    def resolve_training_run_dir() -> Path | None:
+        if flashrl is None or flashrl._run_logger is None:
+            return None
+        return flashrl._run_logger.run_dir
+
     try:
         dataset = build_code_train_dataset(
             limit=args.train_limit,
@@ -859,7 +890,8 @@ def main(argv: list[str] | None = None) -> int:
                 run_timeout_seconds=float(args.run_timeout_seconds),
                 memory_limit_mb=args.memory_limit_mb,
                 training_mode=args.training_mode,
-                log_dir=args.log_dir if args.log_dir is not None else DEFAULT_GENERATED_CODE_LOG_DIR,
+                log_dir=args.log_dir,
+                run_dir_resolver=resolve_training_run_dir,
             ),
         )
         flashrl.train(dataset)

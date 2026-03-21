@@ -130,13 +130,30 @@ def test_learner_and_serving_service_apps_publish_and_activate_weights(
         json=optimize_request.model_dump(mode="json"),
     )
     assert optimize_response.status_code == 200
-    published = optimize_response.json()["weight_version"]
+    optimize_payload = optimize_response.json()
+    published = optimize_payload["weight_version"]
     assert published["version_id"] == 1
     assert Path(published["artifact_uri"]).exists()
+    learner_stages = optimize_payload["stages"]
+    assert [stage["name"] for stage in learner_stages] == [
+        "prepare_inputs",
+        "actor_forward",
+        "loss_assembly",
+        "backward",
+        "optimizer",
+        "publish_weights",
+    ]
+    publish_stage = learner_stages[-1]
+    assert publish_stage["metrics"]["weight_version_id"] == 1
+    assert publish_stage["seconds"] >= 0.0
+    assert "memory" in publish_stage["metrics"]
 
     serving_service = ServingService(serving_backend)
     serving_app = create_serving_service_app(serving_service)
     serving_http = TestClient(serving_app)
+    learner_status = learner_http.get("/v1/status")
+    assert learner_status.status_code == 200
+    assert learner_status.json()["status"]["metadata"]["memory"]["process"]["rss_bytes"] >= 0
 
     activate_response = serving_http.post(
         "/v1/activate-weight-version",
@@ -147,6 +164,9 @@ def test_learner_and_serving_service_apps_publish_and_activate_weights(
     assert payload["converged"] is True
     assert payload["active_weight_version"]["version_id"] == 1
     assert serving_backend.current_weight_version().version_id == 1
+    serving_status = serving_http.get("/v1/status")
+    assert serving_status.status_code == 200
+    assert serving_status.json()["status"]["metadata"]["memory"]["process"]["rss_bytes"] >= 0
 
 
 def test_rollout_and_reward_service_apps_round_trip_batches(

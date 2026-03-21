@@ -38,6 +38,8 @@ If you want the system picture before the code map, start here:
   The literal shared substrate for every `PlatformShim`: load the mounted job, resolve sibling service URLs, and turn storage URIs into container paths.
 - `runtime/platform_shim_base.py`
   The tiny `PlatformShim` base class that owns only `create_app()` and `run()`.
+- `runtime/platform_pod_logging.py`
+  Durable pod-runtime logging for controller, rollout, reward, learner, and serving, with paired `console.log` and `events.jsonl` files under one job root.
 - `runtime/cli.py`
   The thin pod-command dispatcher used by `flashrl controller|rollout|reward|learner|serving`; it instantiates the matching `PlatformShim*`.
 - `runtime/platform_shim_rollout.py`
@@ -48,6 +50,8 @@ If you want the system picture before the code map, start here:
   `PlatformShimLearner`: actor/reference backends plus learner HTTP service.
 - `runtime/platform_shim_serving.py`
   `PlatformShimServing`: serving backend plus serving HTTP service.
+- `../framework/train_runtime.py`
+  Shared framework run lifecycle helpers for `RunLogger`, metrics sinks, checkpoint lifecycle, and run finalization, used by both local `FlashRL` and the platform controller.
 - `dev/minikube.py`
   The local minikube E2E helper used by the opt-in smoke path.
 
@@ -109,6 +113,41 @@ The launch script is raw:
 - it applies the rendered `FlashRLJob` with `kubectl`
 - it waits for `status.finishedAt`
 - it validates local-mode image env files against the current kubectl context
+
+## Observability
+
+Platform mode now follows the same controller run-artifact model as local framework mode.
+
+- `framework.logging.log_dir` is the canonical logging knob in both modes
+- in platform mode, that log dir resolves to one job-scoped root:
+  `<shared-mount>/<log_dir>/<job-name>/<job-uid>/`
+- the controller then writes the same run artifacts as local `FlashRL` under that job root:
+  - `<job-root>/<run-id>/console.log`
+  - `<job-root>/<run-id>/events.jsonl`
+  - `<job-root>/<run-id>/rollouts.jsonl`
+- split service pods also write durable logs under the same job root:
+  - `<job-root>/_pods/controller/<pod-name>/console.log`
+  - `<job-root>/_pods/controller/<pod-name>/events.jsonl`
+  - same pattern for `rollout`, `reward`, `learner`, and `serving`
+- the operator records bounded per-job events in `FlashRLJob.status.events`
+- `FlashRLJob.status.logRoot`, `activeControllerRunDir`, and `activeControllerRunId` point at the active log locations
+
+Inspect one job summary:
+
+```bash
+python3 -m flashrl platform logs flashrl-math-demo --namespace default
+```
+
+Follow live CRD job events and one component log stream:
+
+```bash
+python3 -m flashrl platform logs flashrl-math-demo \
+  --namespace default \
+  --follow \
+  --component controller
+```
+
+During `scripts/run_platform_job.sh`, the launcher also prints the resolved job log root and recent CRD job events as the run progresses.
 
 ## Manual Image Build
 

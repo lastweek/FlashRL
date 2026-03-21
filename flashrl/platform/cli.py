@@ -5,6 +5,10 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import subprocess
+import threading
+import time
+from typing import Any
 
 import yaml
 
@@ -32,6 +36,116 @@ def _load_job_from_config(*, config: str) -> FlashRLJob:
 
 def _dump_yaml(payload: dict[str, object]) -> str:
     return yaml.safe_dump(payload, sort_keys=False)
+
+
+def _recent_job_events(payload: dict[str, Any], *, limit: int = 10) -> list[dict[str, Any]]:
+    status = payload.get("status") or {}
+    events = status.get("events") or []
+    if not isinstance(events, list):
+        return []
+    return [dict(item) for item in events[-limit:] if isinstance(item, dict)]
+
+
+def _print_job_logs_summary(payload: dict[str, Any]) -> None:
+    status = payload.get("status") or {}
+    progress = status.get("progress") or {}
+    print(f"job: {payload.get('metadata', {}).get('name', '<unknown>')}")
+    print(f"phase: {status.get('phase', '<unknown>')}")
+    print(f"log_root: {status.get('logRoot') or '<unknown>'}")
+    print(f"controller_run_dir: {status.get('activeControllerRunDir') or '<unknown>'}")
+    print(f"controller_run_id: {status.get('activeControllerRunId') or '<unknown>'}")
+    print(
+        "progress:"
+        f" epoch={progress.get('currentEpoch', 0)}"
+        f" step={progress.get('currentStep', 0)}"
+        f" lastCompletedStep={progress.get('lastCompletedStep', 0)}"
+    )
+    last_error = status.get("lastError")
+    if last_error:
+        print(f"last_error: {last_error}")
+    events = _recent_job_events(payload)
+    if not events:
+        print("recent_events: <none>")
+        return
+    print("recent_events:")
+    for event in events:
+        component = event.get("component") or "job"
+        print(
+            f"  {event.get('timestamp', '<unknown>')} "
+            f"[{component}] {event.get('event', 'event')} "
+            f"{event.get('message', '')}"
+        )
+
+
+def _stream_status_events(
+    *,
+    operator: FlashRLOperator,
+    name: str,
+    namespace: str,
+    poll_seconds: float,
+    stop_event: threading.Event,
+) -> None:
+    seen: set[tuple[str, str, str]] = set()
+    while not stop_event.is_set():
+        try:
+            payload = operator.get_job(name, namespace=namespace)
+        except Exception:
+            time.sleep(poll_seconds)
+            continue
+        for event in _recent_job_events(payload, limit=100):
+            key = (
+                str(event.get("timestamp", "")),
+                str(event.get("event", "")),
+                str(event.get("message", "")),
+            )
+            if key in seen:
+                continue
+            seen.add(key)
+            component = event.get("component") or "job"
+            print(
+                f"{event.get('timestamp', '<unknown>')} "
+                f"[{component}] {event.get('event', 'event')} "
+                f"{event.get('message', '')}",
+                flush=True,
+            )
+        time.sleep(poll_seconds)
+
+
+def _follow_component_logs(
+    *,
+    name: str,
+    namespace: str,
+    component: str,
+    operator_namespace: str,
+) -> int:
+    if component == "operator":
+        command = [
+            "kubectl",
+            "logs",
+            "-f",
+            "-n",
+            operator_namespace,
+            "-l",
+            "app.kubernetes.io/name=flashrl-operator",
+            "--tail=200",
+            "--prefix=true",
+        ]
+    else:
+        selector = f"flashrl.dev/job={name}"
+        if component != "all":
+            selector += f",app.kubernetes.io/component={component}"
+        command = [
+            "kubectl",
+            "logs",
+            "-f",
+            "-n",
+            namespace,
+            "-l",
+            selector,
+            "--tail=200",
+            "--prefix=true",
+        ]
+    return subprocess.call(command)
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -73,9 +187,22 @@ def build_argument_parser() -> argparse.ArgumentParser:
     cancel.add_argument("name", help="FlashRLJob name.")
     cancel.add_argument("--namespace", default="default")
 
-    logs = platform_subparsers.add_parser("logs", help="Show child pod labels for one job")
+    logs = platform_subparsers.add_parser("logs", help="Show platform job logs and progress")
     logs.add_argument("name", help="FlashRLJob name.")
     logs.add_argument("--namespace", default="default")
+    logs.add_argument(
+        "--follow",
+        action="store_true",
+        help="Stream recent job events and selected component logs.",
+    )
+    logs.add_argument(
+        "--component",
+        choices=("controller", "learner", "serving", "rollout", "reward", "operator", "all"),
+        default="controller",
+        help="Which component logs to follow when --follow is set.",
+    )
+    logs.add_argument("--poll-seconds", type=float, default=5.0)
+    logs.add_argument("--operator-namespace", default="flashrl-system")
 
     operator = platform_subparsers.add_parser("operator", help="Run the FlashRL platform operator")
     operator.add_argument("--namespace", default=None, help="Namespace to watch. Defaults to all namespaces.")
@@ -127,9 +254,36 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.platform_command == "logs":
-        print(
-            f"Select logs for job={args.name} in namespace={args.namespace} with label flashrl.dev/job={args.name}."
+        operator = FlashRLOperator()
+        payload = operator.get_job(args.name, namespace=args.namespace)
+        _print_job_logs_summary(payload)
+        if not args.follow:
+            return 0
+        stop_event = threading.Event()
+        watcher = threading.Thread(
+            target=_stream_status_events,
+            kwargs={
+                "operator": operator,
+                "name": args.name,
+                "namespace": args.namespace,
+                "poll_seconds": float(args.poll_seconds),
+                "stop_event": stop_event,
+            },
+            daemon=True,
         )
+        watcher.start()
+        try:
+            return int(
+                _follow_component_logs(
+                    name=args.name,
+                    namespace=args.namespace,
+                    component=args.component,
+                    operator_namespace=args.operator_namespace,
+                )
+            )
+        finally:
+            stop_event.set()
+            watcher.join(timeout=1.0)
         return 0
 
     if args.platform_command == "operator":

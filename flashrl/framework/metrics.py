@@ -20,6 +20,7 @@ from flashrl.framework.config import (
     PushgatewayMetricsConfig,
     TensorBoardMetricsConfig,
 )
+from flashrl.framework.memory import extract_memory_counters
 from flashrl.framework.observability import RuntimeEvent, observe_event
 
 
@@ -200,6 +201,16 @@ class TensorBoardMetricsSink:
         step = int(payload["step"])
         stage = str(payload["stage"])
         self._add_scalar(writer, f"timing/stage/{stage}_seconds", payload["latency_seconds"], step)
+        self._add_memory_scalars(
+            writer,
+            step=step,
+            snapshot=(
+                payload.get("memory", {}).get("after")
+                if isinstance(payload.get("memory"), dict)
+                else None
+            ),
+            prefix=f"memory/stage/{stage}",
+        )
 
         if stage == "rollout":
             self._add_scalar(writer, "tokens/prompt_mean", payload["prompt_tokens_mean"], step)
@@ -292,6 +303,38 @@ class TensorBoardMetricsSink:
         self._add_scalar(writer, "train/kl_divergence", payload["kl_divergence"], step)
         self._add_scalar(writer, "train/tokens_per_second", payload["tokens_per_second"], step)
         self._add_scalar(writer, "timing/step_duration_seconds", payload["step_duration_seconds"], step)
+        memory_summary = payload.get("memory_summary")
+        if isinstance(memory_summary, dict):
+            self._add_memory_scalars(
+                writer,
+                step=step,
+                snapshot=memory_summary.get("end"),
+                prefix="memory/step/end",
+            )
+            self._add_scalar(
+                writer,
+                "memory/step/peak_process_rss_bytes",
+                memory_summary.get("peak_process_rss_bytes"),
+                step,
+            )
+            self._add_scalar(
+                writer,
+                "memory/step/lowest_system_available_bytes",
+                memory_summary.get("lowest_system_available_bytes"),
+                step,
+            )
+            self._add_scalar(
+                writer,
+                "memory/step/peak_device_current_allocated_bytes",
+                memory_summary.get("peak_device_current_allocated_bytes"),
+                step,
+            )
+            self._add_scalar(
+                writer,
+                "memory/step/peak_device_driver_allocated_bytes",
+                memory_summary.get("peak_device_driver_allocated_bytes"),
+                step,
+            )
 
     def observe_serving_debug(self, payload: dict[str, Any]) -> None:
         """Record serving debug timings for the current step."""
@@ -324,6 +367,49 @@ class TensorBoardMetricsSink:
         if value is None:
             return
         writer.add_scalar(tag, float(value), global_step=step)
+
+    def _add_memory_scalars(
+        self,
+        writer: Any,
+        *,
+        step: int,
+        snapshot: dict[str, Any] | None,
+        prefix: str,
+    ) -> None:
+        counters = extract_memory_counters(snapshot)
+        if not counters:
+            return
+        self._add_scalar(writer, f"{prefix}/process_rss_bytes", counters.get("process_rss_bytes"), step)
+        self._add_scalar(
+            writer,
+            f"{prefix}/system_available_bytes",
+            counters.get("system_available_bytes"),
+            step,
+        )
+        self._add_scalar(
+            writer,
+            f"{prefix}/device_current_allocated_bytes",
+            counters.get("device_current_allocated_bytes"),
+            step,
+        )
+        self._add_scalar(
+            writer,
+            f"{prefix}/device_driver_allocated_bytes",
+            counters.get("device_driver_allocated_bytes"),
+            step,
+        )
+        self._add_scalar(
+            writer,
+            f"{prefix}/device_reserved_bytes",
+            counters.get("device_reserved_bytes"),
+            step,
+        )
+        self._add_scalar(
+            writer,
+            f"{prefix}/device_recommended_max_bytes",
+            counters.get("device_recommended_max_bytes"),
+            step,
+        )
 
 
 class PrometheusMetricsSink:

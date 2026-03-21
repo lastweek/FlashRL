@@ -6,7 +6,8 @@ import json
 from time import sleep
 from typing import TYPE_CHECKING, Any, Callable
 
-from flashrl.platform.k8s.job import GROUP, PLURAL, VERSION, FlashRLJob
+from flashrl.framework.admin.objects import utc_now_iso
+from flashrl.platform.k8s.job import GROUP, PLURAL, VERSION, FlashRLJob, append_job_event
 from flashrl.platform.k8s.job_resources import job_namespace, render_job_resources
 from flashrl.platform.k8s.operator.kube import get_path, is_not_found, to_plain
 
@@ -59,6 +60,14 @@ class JobReconciler:
     def reconcile(self, job: FlashRLJob) -> dict[str, Any]:
         """Reconcile one validated FlashRLJob payload."""
         namespace = job_namespace(job)
+        job_events = append_job_event(
+            job.status.events,
+            timestamp=utc_now_iso(),
+            event="reconcile_started",
+            message=f"Reconciling FlashRLJob {job.name}.",
+            component="operator",
+            limit=int(job.spec.observability.jobEventHistoryLimit),
+        )
         # Deletion is the only early-exit path because Kubernetes expects the
         # operator to release owned resources before removing its finalizer.
         if job.metadata.get("deletionTimestamp") is not None:
@@ -86,14 +95,35 @@ class JobReconciler:
 
         observations = self._status_collector.collect(job, namespace=namespace)
         if not job.spec.suspend:
-            self._autoscaler.apply(job, observations, namespace=namespace)
-            self._recovery_manager.apply(job, observations, namespace=namespace)
+            for event in (self._autoscaler.apply(job, observations, namespace=namespace) or []):
+                job_events = append_job_event(
+                    job_events,
+                    timestamp=utc_now_iso(),
+                    limit=int(job.spec.observability.jobEventHistoryLimit),
+                    **event,
+                )
+            for event in (self._recovery_manager.apply(job, observations, namespace=namespace) or []):
+                job_events = append_job_event(
+                    job_events,
+                    timestamp=utc_now_iso(),
+                    limit=int(job.spec.observability.jobEventHistoryLimit),
+                    **event,
+                )
 
         summary = self._status_collector.summarize(job, observations)
         status_payload = self._status_collector.build_status_patch(
             job,
             summary=summary,
             observations=observations,
+        )
+        status_payload["events"] = append_job_event(
+            job_events,
+            timestamp=utc_now_iso(),
+            event="reconcile_finished",
+            message=f"Reconcile finished with phase={summary.phase}.",
+            component="operator",
+            metadata={"phase": summary.phase},
+            limit=int(job.spec.observability.jobEventHistoryLimit),
         )
         self._patch_job_status(job, namespace=namespace, status=status_payload)
         return status_payload
