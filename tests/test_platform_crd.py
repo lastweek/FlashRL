@@ -698,12 +698,14 @@ def test_flashrljob_crd_manifest_exposes_expected_kind() -> None:
     assert manifest["kind"] == "CustomResourceDefinition"
     assert manifest["spec"]["names"]["kind"] == "FlashRLJob"
     schema = manifest["spec"]["versions"][0]["schema"]["openAPIV3Schema"]
-    spec_properties = schema["properties"]["spec"]["properties"]
-    assert "images" in spec_properties
-    assert "userCode" in spec_properties
-    assert "sharedStorage" in spec_properties
-    assert "autoscaling" in spec_properties["serving"]["properties"]
-    assert "failurePolicy" in spec_properties["rollout"]["properties"]
+    assert schema["type"] == "object"
+    assert schema["required"] == ["spec"]
+    assert schema["properties"]["apiVersion"]["type"] == "string"
+    assert schema["properties"]["kind"]["type"] == "string"
+    assert schema["properties"]["spec"]["type"] == "object"
+    assert schema["properties"]["spec"]["x-kubernetes-preserve-unknown-fields"] is True
+    assert schema["properties"]["status"]["type"] == "object"
+    assert schema["properties"]["status"]["x-kubernetes-preserve-unknown-fields"] is True
 
 
 def test_platform_k8s_install_assets_exist() -> None:

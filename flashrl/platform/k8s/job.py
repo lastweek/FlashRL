@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-from copy import deepcopy
 from pathlib import PurePosixPath
 from typing import Any, Literal
 
@@ -427,59 +426,34 @@ class FlashRLJob(BaseModel):
         return str(self.metadata["name"])
 
 
-def _resolve_local_refs(schema: dict[str, Any]) -> dict[str, Any]:
-    """Inline Pydantic ``$defs`` references into one CRD-safe schema."""
-    definitions = deepcopy(schema.pop("$defs", {}))
-    resolved_definitions: dict[str, dict[str, Any]] = {}
-    resolving: set[str] = set()
-
-    def _resolve(node: Any) -> Any:
-        if isinstance(node, list):
-            return [_resolve(item) for item in node]
-        if not isinstance(node, dict):
-            return node
-        if "$ref" in node:
-            ref = str(node["$ref"])
-            if not ref.startswith("#/$defs/"):
-                return {key: _resolve(value) for key, value in node.items() if key != "$ref"}
-            target_name = ref.rsplit("/", 1)[-1]
-            if target_name in resolved_definitions:
-                merged = deepcopy(resolved_definitions[target_name])
-            elif target_name in resolving:
-                merged = {"type": "object", "x-kubernetes-preserve-unknown-fields": True}
-            else:
-                resolving.add(target_name)
-                target = deepcopy(definitions[target_name])
-                merged = _resolve(target)
-                resolving.remove(target_name)
-                resolved_definitions[target_name] = deepcopy(merged)
-            for key, value in node.items():
-                if key == "$ref":
-                    continue
-                merged[key] = _resolve(value)
-            return merged
-        return {
-            key: _resolve(value)
-            for key, value in node.items()
-            if key not in {"title", "$defs"}
-        }
-
-    return _resolve(schema)
-
-
 def flashrljob_openapi_schema() -> dict[str, Any]:
-    """Return a dereferenced OpenAPI schema for the FlashRLJob CRD."""
-    schema = FlashRLJob.model_json_schema(mode="validation")
-    resolved = _resolve_local_refs(schema)
-    metadata_schema = resolved.setdefault("properties", {}).setdefault("metadata", {"type": "object"})
-    metadata_schema.clear()
-    metadata_schema.update(
-        {
-            "type": "object",
-            "x-kubernetes-preserve-unknown-fields": True,
-        }
-    )
-    return resolved
+    """Return a Kubernetes-structural CRD schema for FlashRLJob.
+
+    The CRD schema is intentionally shallow. Kubernetes only needs a
+    structural shell so it can store the custom resource. The real semantic
+    validation lives in ``FlashRLJob.model_validate(...)`` inside the platform
+    CLI and operator reconcile path.
+    """
+    return {
+        "type": "object",
+        "description": (
+            "FlashRLJob custom resource. Nested spec/status validation is performed "
+            "by the FlashRL Python models in the CLI and operator."
+        ),
+        "required": ["spec"],
+        "properties": {
+            "apiVersion": {"type": "string"},
+            "kind": {"type": "string"},
+            "spec": {
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": True,
+            },
+            "status": {
+                "type": "object",
+                "x-kubernetes-preserve-unknown-fields": True,
+            },
+        },
+    }
 
 
 def flashrljob_crd_manifest() -> dict[str, Any]:
