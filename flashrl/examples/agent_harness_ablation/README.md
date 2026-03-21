@@ -16,6 +16,7 @@ Role in the ladder:
 
 - `train.py`
 - `eval.py`
+- `study.py`
 - `config.yaml`
 - `config-vllm.yaml`
 
@@ -34,6 +35,9 @@ The default variants are:
 - `tools_compaction`
 - `tools_subagents`
 - `full_harness`
+
+The study imports the reference harness from `flashrl.examples.agent_harness`
+and varies only `AgentHarnessConfig` values.
 
 ## Local Runs
 

@@ -43,5 +43,4 @@ The examples under `flashrl.examples` show this progression:
 
 Additional examples:
 
-- `flashrl.examples.agent_react`: optional ReAct recipe/reference example outside the primary ladder
 - `flashrl.examples.math`: training-integrated whitebox rollout example

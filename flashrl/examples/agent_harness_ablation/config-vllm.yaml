@@ -47,7 +47,7 @@ framework:
     admin_enabled: true
 
 study:
-  name: coding-harness-ablation
+  name: agent-harness-ablation
   seeds: [13, 29]
   dataset:
     train_limit: 4
@@ -57,7 +57,6 @@ study:
     enable_skills: true
     enable_compaction: true
     enable_subagents: true
-    scheduler_mode: dynamic
     max_steps: 6
     max_parallel_calls: 4
     compaction_trigger_message_count: 10

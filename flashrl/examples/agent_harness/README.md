@@ -23,8 +23,11 @@ Role in the ladder:
 
 ## Files
 
-- `harness.py`
 - `config.py`
+- `common.py`
+- `dataset.py`
+- `harness.py`
+- `evaluation.py`
 - `tool_helpers.py`
 - `train.py`
 - `eval.py`
@@ -53,5 +56,6 @@ python3 -m flashrl.examples.agent_harness.eval --config flashrl/examples/agent_h
 
 - Tasks are deterministic local repo-inspection fixtures, not an external dataset.
 - Reward is task correctness only.
+- The example-local config type is `AgentHarnessConfig`, and the main builder is `build_agent_harness(...)`.
 - The harness records tool, skill, compaction, subagent, and scheduler activity in `agent_trace`.
 - The public framework still remains generic; this package is the coding-oriented reference assembly.

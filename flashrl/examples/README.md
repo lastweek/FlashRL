@@ -13,10 +13,6 @@ Start with these four examples in order:
 | `agent_harness` | A serious coding-oriented reference harness assembled from framework primitives | You want a usable reference system rather than another toy loop | Harness comparison workflow |
 | `agent_harness_ablation` | Controlled variant comparison for the reference harness | You want to compare harness configurations under one training/eval workflow | New agent-building primitives or another assembled harness |
 
-Optional recipe example:
-
-- `agent_react`: a ReAct-style parsing recipe in normal example code. Keep it as reference material, not part of the primary learning path.
-
 Other examples:
 
 - `math`: training-integrated whitebox rollout example
@@ -32,12 +28,6 @@ python3 -m flashrl.examples.agent_tools.run
 python3 -m flashrl.examples.agent_dynamic_tools.run
 python3 -m flashrl.examples.agent_harness.train
 python3 -m flashrl.examples.agent_harness_ablation.train
-```
-
-Optional recipe:
-
-```bash
-python3 -m flashrl.examples.agent_react.run
 ```
 
 Other examples:
@@ -64,7 +54,6 @@ Example docs:
 - [agent_dynamic_tools/README.md](agent_dynamic_tools/README.md)
 - [agent_harness/README.md](agent_harness/README.md)
 - [agent_harness_ablation/README.md](agent_harness_ablation/README.md)
-- [agent_react/README.md](agent_react/README.md)
 - [math/README.md](math/README.md)
 - [code_single_turn/README.md](code_single_turn/README.md)
 - [mock_checkpointing/README.md](mock_checkpointing/README.md)

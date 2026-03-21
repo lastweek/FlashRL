@@ -55,7 +55,6 @@ example:
     enable_skills: true
     enable_compaction: true
     enable_subagents: true
-    scheduler_mode: dynamic
     max_steps: 6
     max_parallel_calls: 4
     compaction_trigger_message_count: 10

@@ -679,18 +679,6 @@ def test_agent_tools_example_runs_and_prints_rollout_json(capsys: pytest.Capture
     assert [message["content"] for message in tool_messages] == ["42", "42"]
 
 
-def test_agent_react_example_runs_and_prints_rollout_json(capsys: pytest.CaptureFixture[str]) -> None:
-    """The explicit ReAct recipe example should run offline and print one rollout payload."""
-    module = load_script_module(
-        "flashrl_agent_react_demo",
-        "flashrl/examples/agent_react/run.py",
-    )
-
-    assert module.main() == 0
-    payload = json.loads(capsys.readouterr().out)
-    assert payload["text"] == "8 + 13 is 21 and 7 * 6 is 42."
-
-
 def test_agent_dynamic_tools_example_runs_and_prints_rollout_json(
     capsys: pytest.CaptureFixture[str],
 ) -> None:

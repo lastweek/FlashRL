@@ -1,19 +1,25 @@
 """Reference agent harness example built from generic agent primitives."""
 
-from flashrl.examples.agent_harness.config import CodingHarnessConfig
+from flashrl.examples.agent_harness.config import AgentHarnessConfig
+from flashrl.examples.agent_harness.dataset import (
+    build_eval_dataset,
+    build_train_dataset,
+    reward_fn,
+)
+from flashrl.examples.agent_harness.evaluation import (
+    evaluate_model,
+    summarize_rollouts,
+)
 from flashrl.examples.agent_harness.harness import (
-    build_coding_agent,
-    build_coding_eval_dataset,
-    build_coding_reward_fn,
-    build_coding_train_dataset,
-    evaluate_rollouts,
+    build_agent_harness,
 )
 
 __all__ = [
-    "CodingHarnessConfig",
-    "build_coding_agent",
-    "build_coding_train_dataset",
-    "build_coding_eval_dataset",
-    "build_coding_reward_fn",
-    "evaluate_rollouts",
+    "AgentHarnessConfig",
+    "build_agent_harness",
+    "build_train_dataset",
+    "build_eval_dataset",
+    "reward_fn",
+    "evaluate_model",
+    "summarize_rollouts",
 ]

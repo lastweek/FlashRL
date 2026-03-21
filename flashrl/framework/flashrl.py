@@ -274,6 +274,20 @@ class FlashRL:
             dataset_loader=dataset_fn,
         )
 
+    @property
+    def serving_backend(self) -> ServingBackend:
+        """Return the initialized serving backend for direct rollout/eval usage."""
+        if self._serving_backend is None:
+            raise RuntimeError("FlashRL serving backend is not initialized.")
+        return self._serving_backend
+
+    @property
+    def run_dir(self) -> Path | None:
+        """Return the active run directory when one has been opened."""
+        if self._run_logger is None:
+            return None
+        return self._run_logger.run_dir
+
     def _initialize_runtime(self) -> None:
         """Initialize training and serving backends."""
         self._runtime_phase = "Starting"

@@ -11,6 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from flashrl.framework import FlashRL
 from flashrl.framework.agent import (
     Agent,
     CompactionManager,
@@ -181,7 +182,7 @@ def test_agent_run_grouped_uses_grouped_step0_and_preserves_indices() -> None:
 
 
 def test_agent_harness_example_runs_offline_with_special_tools() -> None:
-    module = importlib.import_module("flashrl.examples.agent_harness.harness")
+    module = importlib.import_module("flashrl.examples.agent_harness")
 
     class ScriptedBackend:
         def __init__(self) -> None:
@@ -208,8 +209,8 @@ def test_agent_harness_example_runs_offline_with_special_tools() -> None:
                 for _ in prompts
             ]
 
-    agent = module.build_coding_agent(module.CodingHarnessConfig())
-    prompt = module.build_coding_train_dataset(limit=1)[0]
+    agent = module.build_agent_harness(module.AgentHarnessConfig())
+    prompt = module.build_train_dataset(limit=1)[0]
     rollout = agent.run_batch([prompt], ScriptedBackend())[0]
 
     assert rollout.text == "v3"
@@ -219,9 +220,8 @@ def test_agent_harness_example_runs_offline_with_special_tools() -> None:
 
 
 def test_agent_harness_ablation_matrix_and_summary() -> None:
-    train_module = importlib.import_module("flashrl.examples.agent_harness_ablation.train")
-    eval_module = importlib.import_module("flashrl.examples.agent_harness_ablation.eval")
-    variants = train_module.expand_matrix(
+    study_module = importlib.import_module("flashrl.examples.agent_harness_ablation.study")
+    variants = study_module.expand_matrix(
         {
             "base_harness": {
                 "enable_skills": True,
@@ -237,7 +237,7 @@ def test_agent_harness_ablation_matrix_and_summary() -> None:
 
     assert [name for name, _ in variants] == ["tools_only", "full_harness"]
     assert variants[0][1].enable_skills is False
-    summary = eval_module.summarize_manifest(
+    summary = study_module.summarize_manifest(
         {
             "study_name": "demo",
             "runs": [
@@ -266,3 +266,31 @@ def test_agent_harness_ablation_matrix_and_summary() -> None:
     assert summary["variant_count"] == 2
     assert summary["variants"][0]["variant"] == "full_harness"
     assert isinstance(summary["variants"][0]["pareto_optimal"], bool)
+
+
+def test_flashrl_public_helpers_expose_serving_backend_and_run_dir(tmp_path: Path) -> None:
+    flashrl = FlashRL.__new__(FlashRL)
+    flashrl._serving_backend = None
+    flashrl._run_logger = None
+
+    with pytest.raises(RuntimeError, match="serving backend is not initialized"):
+        _ = flashrl.serving_backend
+
+    assert flashrl.run_dir is None
+
+    backend = object()
+    flashrl._serving_backend = backend
+    flashrl._run_logger = SimpleNamespace(run_dir=tmp_path)
+
+    assert flashrl.serving_backend is backend
+    assert flashrl.run_dir == tmp_path
+
+
+def test_agent_harness_examples_do_not_use_private_flashrl_fields() -> None:
+    eval_text = Path("flashrl/examples/agent_harness/eval.py").read_text(encoding="utf-8")
+    ablation_train_text = Path(
+        "flashrl/examples/agent_harness_ablation/train.py"
+    ).read_text(encoding="utf-8")
+
+    assert "_serving_backend" not in eval_text
+    assert "_run_logger" not in ablation_train_text
