@@ -215,13 +215,32 @@ def test_platform_module_surface_imports_cleanly() -> None:
         importlib.import_module("flashrl.platform.k8s.renderer")
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("flashrl.platform.k8s.operator.store")
-    assert importlib.import_module("flashrl.platform.runtime.controller") is not None
-    assert importlib.import_module("flashrl.platform.runtime.pod") is not None
     assert importlib.import_module("flashrl.platform.runtime.cli") is not None
-    assert importlib.import_module("flashrl.platform.runtime.rollout") is not None
-    assert importlib.import_module("flashrl.platform.runtime.reward") is not None
-    assert importlib.import_module("flashrl.platform.runtime.learner") is not None
-    assert importlib.import_module("flashrl.platform.runtime.serving") is not None
+    runtime_pkg = importlib.import_module("flashrl.platform.runtime")
+    assert runtime_pkg.PlatformShimController is not None
+    assert runtime_pkg.PlatformShimRollout is not None
+    assert runtime_pkg.PlatformShimReward is not None
+    assert runtime_pkg.PlatformShimLearner is not None
+    assert runtime_pkg.PlatformShimServing is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_base") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_common") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_controller") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_rollout") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_reward") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_learner") is not None
+    assert importlib.import_module("flashrl.platform.runtime.platform_shim_serving") is not None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.controller")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.rollout")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.reward")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.learner")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.serving")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.pod")
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("flashrl.platform.runtime.common")
     with pytest.raises(ModuleNotFoundError):
@@ -270,6 +289,10 @@ def test_platform_readme_matches_simplified_runtime_layout() -> None:
     assert "runtime/components.py" not in content
     assert "k8s/renderer.py" not in content
     assert "k8s/job_resources.py" in content
+    assert "runtime/controller.py" not in content
+    assert "runtime/pod.py" not in content
+    assert "runtime/platform_shim_controller.py" in content
+    assert "runtime/platform_shim_common.py" in content
 
 
 def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
@@ -278,12 +301,17 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     content = architecture_doc.read_text(encoding="utf-8")
 
     assert "## What Platform Adds Per Pod" in content
-    assert "flashrl.platform.runtime.pod" in content
-    assert "flashrl.platform.runtime.controller" in content
-    assert "flashrl.platform.runtime.rollout" in content
-    assert "flashrl.platform.runtime.reward" in content
-    assert "flashrl.platform.runtime.learner" in content
-    assert "flashrl.platform.runtime.serving" in content
+    assert "PlatformShimController" in content
+    assert "PlatformShimRollout" in content
+    assert "PlatformShimReward" in content
+    assert "PlatformShimLearner" in content
+    assert "PlatformShimServing" in content
+    assert "flashrl.platform.runtime.platform_shim_common" in content
+    assert "flashrl.platform.runtime.platform_shim_controller" in content
+    assert "flashrl.platform.runtime.platform_shim_rollout" in content
+    assert "flashrl.platform.runtime.platform_shim_reward" in content
+    assert "flashrl.platform.runtime.platform_shim_learner" in content
+    assert "flashrl.platform.runtime.platform_shim_serving" in content
     for heading in (
         "## Inside Each Pod",
         "### Controller Pod",
@@ -331,6 +359,10 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     assert "create_reward_service_app" in content
     assert "create_learner_service_app" in content
     assert "create_serving_service_app" in content
+    assert "flashrl.framework.rollout" in content
+    assert "flashrl.framework.reward" in content
+    assert "flashrl.framework.training" in content
+    assert "flashrl.framework.serving" in content
     assert "GRPOTrainer" in content
     assert "/v1/rollout-batches" in content
     assert "/v1/reward-batches" in content
@@ -349,6 +381,17 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
         "create_reward_app",
         "create_learner_app",
         "create_serving_app",
+        "flashrl.framework.distributed.rollout_service",
+        "flashrl.framework.distributed.reward_service",
+        "flashrl.framework.distributed.learner_service",
+        "flashrl.framework.distributed.serving_service",
+        "flashrl.framework.distributed.remote_serving_backend",
+        "flashrl.platform.runtime.controller",
+        "flashrl.platform.runtime.rollout",
+        "flashrl.platform.runtime.reward",
+        "flashrl.platform.runtime.learner",
+        "flashrl.platform.runtime.serving",
+        "flashrl.platform.runtime.pod",
     ):
         assert legacy_name not in content
 

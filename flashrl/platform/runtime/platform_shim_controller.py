@@ -1,4 +1,4 @@
-"""Explicit controller pod runtime for FlashRL platform mode."""
+"""Platform shim for the controller pod."""
 
 from __future__ import annotations
 
@@ -9,7 +9,6 @@ from threading import Lock, Thread
 from typing import Any
 
 from fastapi import FastAPI
-import uvicorn
 
 from flashrl.framework.admin import utc_now_iso
 from flashrl.framework import runtime_support
@@ -24,7 +23,8 @@ from flashrl.framework.distributed import (
 from flashrl.framework.data_models import Prompt
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
 from flashrl.platform.k8s.job import DatasetSpec, FlashRLJob, GROUP, PLURAL, VERSION
-from flashrl.platform.runtime.pod import (
+from flashrl.platform.runtime.platform_shim_base import PlatformShim
+from flashrl.platform.runtime.platform_shim_common import (
     load_mounted_job,
     service_url_for,
     storage_path_from_uri,
@@ -102,8 +102,8 @@ def load_controller_dataset(job: FlashRLJob) -> list[Prompt]:
 class _ControllerServiceState:
     """Track the long-lived controller pod state while training runs in the background."""
 
-    def __init__(self, *, job_path: str | Path | None = None) -> None:
-        self._job_path = job_path
+    def __init__(self, *, shim: "PlatformShimController") -> None:
+        self._shim = shim
         self._lock = Lock()
         self._phase = "Starting"
         self._healthy = True
@@ -138,7 +138,7 @@ class _ControllerServiceState:
 
     def _run(self) -> None:
         try:
-            run_controller(self._job_path)
+            self._shim.run_training_loop()
         except Exception as exc:
             with self._lock:
                 self._phase = "Failed"
@@ -151,33 +151,27 @@ class _ControllerServiceState:
             self._completed = True
 
 
-def create_controller_app(job_path: str | Path | None = None) -> FastAPI:
-    """Create the long-lived controller pod app with background training execution.
+class PlatformShimController(PlatformShim):
+    """Load the mounted job, then run controller training behind a small HTTP surface."""
 
-    This module is the only platform-specific long-running runtime. It loads
-    the mounted job, talks to the distributed services through remote clients, and patches
-    controller-owned status back into the FlashRLJob CR.
-    """
-    state = _ControllerServiceState(job_path=job_path)
-    app = FastAPI(title="FlashRL Controller")
-    install_common_routes(
-        app,
-        status_getter=state.status,
-        kind="ControllerService",
-        name="controller",
-    )
+    def create_app(self) -> FastAPI:
+        state = _ControllerServiceState(shim=self)
+        app = FastAPI(title="FlashRL Controller")
+        install_common_routes(
+            app,
+            status_getter=state.status,
+            kind="ControllerService",
+            name="controller",
+        )
 
-    @app.on_event("startup")
-    def startup() -> None:
-        state.start()
+        @app.on_event("startup")
+        def startup() -> None:
+            state.start()
 
-    return app
+        return app
 
-
-def run_controller_pod(*, host: str = "0.0.0.0", port: int = 8000) -> int:
-    """Run the controller pod HTTP server."""
-    uvicorn.run(create_controller_app(), host=host, port=port, log_level="info")
-    return 0
+    def run_training_loop(self) -> None:
+        run_controller(self._job_path)
 
 
 def run_controller(job_path: str | Path | None = None) -> None:

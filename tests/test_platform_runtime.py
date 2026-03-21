@@ -9,11 +9,11 @@ import pytest
 
 import flashrl.__main__ as root_cli_module
 import flashrl.platform.runtime.cli as runtime_cli_module
-import flashrl.platform.runtime.controller as controller_module
-import flashrl.platform.runtime.learner as learner_runtime_module
-import flashrl.platform.runtime.reward as reward_runtime_module
-import flashrl.platform.runtime.rollout as rollout_runtime_module
-import flashrl.platform.runtime.serving as serving_runtime_module
+import flashrl.platform.runtime.platform_shim_controller as controller_module
+import flashrl.platform.runtime.platform_shim_learner as learner_runtime_module
+import flashrl.platform.runtime.platform_shim_reward as reward_runtime_module
+import flashrl.platform.runtime.platform_shim_rollout as rollout_runtime_module
+import flashrl.platform.runtime.platform_shim_serving as serving_runtime_module
 
 
 pytestmark = pytest.mark.unit
@@ -224,21 +224,22 @@ def test_top_level_cli_rejects_old_component_subtree(capsys: pytest.CaptureFixtu
 
 
 def test_runtime_cli_dispatches_to_explicit_role_modules(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The runtime CLI should only parse args and delegate to one role module."""
+    """The runtime CLI should only parse args and delegate to one PlatformShim."""
     captured: dict[str, object] = {}
 
-    def _stub_run_rollout_pod(*, host: str, port: int) -> int:
-        captured["dispatch"] = ("rollout", host, port)
-        return 0
+    class _StubPlatformShimRollout:
+        def run(self, *, host: str, port: int) -> int:
+            captured["dispatch"] = ("rollout", host, port)
+            return 0
 
-    monkeypatch.setattr(runtime_cli_module, "run_rollout_pod", _stub_run_rollout_pod)
+    monkeypatch.setattr(runtime_cli_module, "PlatformShimRollout", _StubPlatformShimRollout)
 
     assert runtime_cli_module.main(["rollout", "--host", "127.0.0.1", "--port", "9000"]) == 0
     assert captured["dispatch"] == ("rollout", "127.0.0.1", 9000)
 
 
-def test_create_rollout_pod_app_builds_rollout_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The rollout module should wire the rollout hook into the rollout server."""
+def test_platform_shim_rollout_builds_rollout_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The rollout shim should wire the rollout hook into the rollout service."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
@@ -269,14 +270,14 @@ def test_create_rollout_pod_app_builds_rollout_service(monkeypatch: pytest.Monke
         lambda service: {"app": "rollout", "service": service},
     )
 
-    app = rollout_runtime_module.create_rollout_pod_app()
+    app = rollout_runtime_module.PlatformShimRollout().create_app()
     assert app["app"] == "rollout"
     assert str(captured["serving_url"]).endswith("/demo-job-serving.default.svc.cluster.local")
     assert captured["rollout_builder"]["rollout_fn"] == "rollout-impl"
 
 
-def test_create_reward_pod_app_builds_reward_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The reward module should wire the reward hook into the reward server."""
+def test_platform_shim_reward_builds_reward_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The reward shim should wire the reward hook into the reward service."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
@@ -295,13 +296,13 @@ def test_create_reward_pod_app_builds_reward_service(monkeypatch: pytest.MonkeyP
         lambda service: {"app": "reward", "service": service},
     )
 
-    app = reward_runtime_module.create_reward_pod_app()
+    app = reward_runtime_module.PlatformShimReward().create_app()
     assert app["app"] == "reward"
     assert captured["reward_impl"]["reward"]["reward_fn"] == "reward-hook"
 
 
-def test_create_learner_pod_app_builds_learner_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The learner module should build backends and publish weights to shared storage."""
+def test_platform_shim_learner_builds_learner_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The learner shim should build backends and publish weights to shared storage."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
@@ -331,15 +332,15 @@ def test_create_learner_pod_app_builds_learner_service(monkeypatch: pytest.Monke
         lambda service: {"app": "learner", "service": service},
     )
 
-    app = learner_runtime_module.create_learner_pod_app()
+    app = learner_runtime_module.PlatformShimLearner().create_app()
     assert app["app"] == "learner"
     assert captured["actor_backend"] == "huggingface"
     assert str(captured["learner_service"]["publish_dir"]).endswith("/tmp/flashrl/weights")
     assert captured["learner_service"]["synchronize_serving"] is False
 
 
-def test_create_serving_pod_app_builds_serving_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The serving module should build the serving backend and serving server app."""
+def test_platform_shim_serving_builds_serving_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The serving shim should build the serving backend and serving service app."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
@@ -357,7 +358,21 @@ def test_create_serving_pod_app_builds_serving_service(monkeypatch: pytest.Monke
         lambda service: {"app": "serving", "service": service},
     )
 
-    app = serving_runtime_module.create_serving_pod_app()
+    app = serving_runtime_module.PlatformShimServing().create_app()
     assert app["app"] == "serving"
     assert captured["serving_backend"]["backend"] == "huggingface"
     assert str(captured["serving_backend"]["log_dir"]).endswith("/tmp/flashrl/weights")
+
+
+def test_platform_shim_modules_remove_old_free_function_surface() -> None:
+    """The shim modules should expose classes, not the old free-function pod entrypoints."""
+    assert not hasattr(controller_module, "create_controller_app")
+    assert not hasattr(controller_module, "run_controller_pod")
+    assert not hasattr(rollout_runtime_module, "create_rollout_pod_app")
+    assert not hasattr(rollout_runtime_module, "run_rollout_pod")
+    assert not hasattr(reward_runtime_module, "create_reward_pod_app")
+    assert not hasattr(reward_runtime_module, "run_reward_pod")
+    assert not hasattr(learner_runtime_module, "create_learner_pod_app")
+    assert not hasattr(learner_runtime_module, "run_learner_pod")
+    assert not hasattr(serving_runtime_module, "create_serving_pod_app")
+    assert not hasattr(serving_runtime_module, "run_serving_pod")

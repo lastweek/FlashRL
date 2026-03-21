@@ -1,4 +1,4 @@
-"""Mounted pod contract shared by every FlashRL platform workload."""
+"""Literal mounted pod contract shared by every PlatformShim."""
 
 from __future__ import annotations
 

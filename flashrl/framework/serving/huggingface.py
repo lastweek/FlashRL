@@ -7,6 +7,7 @@ import threading
 from typing import Callable
 from typing import Any
 
+from flashrl.framework.admin import utc_now_iso
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.distributed.models import WeightVersionRef
@@ -119,3 +120,28 @@ class HuggingFaceServingBackend(ServingBackend):
     def close(self) -> None:
         with self._lifecycle_lock:
             return None
+
+
+def activate_huggingface_serving_backend_from_ref(
+    serving_backend: ServingBackend,
+    weight_version: WeightVersionRef,
+) -> WeightVersionInfo:
+    """Activate a local file-based weight artifact on a Hugging Face serving backend."""
+    weight_path = Path(weight_version.artifact_uri)
+    if weight_path.is_dir():
+        candidate = weight_path / "model_state.pt"
+        if candidate.exists():
+            weight_path = candidate
+    state_dict = torch.load(weight_path, weights_only=False)
+    serving_backend._actor.model.load_state_dict(state_dict)  # type: ignore[attr-defined]
+    activated = weight_version.to_info(activated_at=utc_now_iso())
+    serving_backend._active_weight_version = activated
+    serving_backend._pending_weight_version = None
+    serving_backend._next_weight_version_id = max(
+        int(getattr(serving_backend, "_next_weight_version_id", 1)),
+        weight_version.version_id + 1,
+    )
+    serving_backend._last_successful_sync_at = serving_backend._active_weight_version.activated_at
+    serving_backend._sync_healthy = True
+    serving_backend._last_sync_error = None
+    return serving_backend.current_weight_version()

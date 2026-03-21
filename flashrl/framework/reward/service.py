@@ -1,4 +1,4 @@
-"""In-process reward service implementation and HTTP app builder."""
+"""Domain-owned reward service implementation and HTTP app builder."""
 
 from __future__ import annotations
 

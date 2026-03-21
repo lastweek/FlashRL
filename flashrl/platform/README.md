@@ -33,20 +33,22 @@ If you want the system picture before the code map, start here:
   Recovery logic for learner and elastic pools, using explicit StatefulSet and Deployment operations.
 - `k8s/operator/reconcile.py`
   The explicit reconcile sequence: apply children, observe, scale, recover, summarize, and patch status through raw Kubernetes APIs.
-- `runtime/controller.py`
-  The only platform-specific long-running runtime. It loads the mounted job, builds HTTP clients, and starts GRPO training.
-- `runtime/pod.py`
-  The literal mounted pod contract: load the mounted job, resolve sibling service URLs, and turn storage URIs into container paths.
+- `runtime/platform_shim_controller.py`
+  `PlatformShimController`, the controller-side platform shim that loads the mounted job, builds remote clients, and starts GRPO training.
+- `runtime/platform_shim_common.py`
+  The literal shared substrate for every `PlatformShim`: load the mounted job, resolve sibling service URLs, and turn storage URIs into container paths.
+- `runtime/platform_shim_base.py`
+  The tiny `PlatformShim` base class that owns only `create_app()` and `run()`.
 - `runtime/cli.py`
-  The thin pod-command dispatcher used by `flashrl controller|rollout|reward|learner|serving`.
-- `runtime/rollout.py`
-  The explicit rollout pod bootstrap: rollout hook plus remote serving client plus rollout HTTP server.
-- `runtime/reward.py`
-  The explicit reward pod bootstrap: reward hook plus reward HTTP server.
-- `runtime/learner.py`
-  The explicit learner pod bootstrap: actor/reference backends plus learner HTTP server.
-- `runtime/serving.py`
-  The explicit serving pod bootstrap: serving backend plus serving HTTP server.
+  The thin pod-command dispatcher used by `flashrl controller|rollout|reward|learner|serving`; it instantiates the matching `PlatformShim*`.
+- `runtime/platform_shim_rollout.py`
+  `PlatformShimRollout`: rollout hook plus remote serving client plus rollout HTTP service.
+- `runtime/platform_shim_reward.py`
+  `PlatformShimReward`: reward hook plus reward HTTP service.
+- `runtime/platform_shim_learner.py`
+  `PlatformShimLearner`: actor/reference backends plus learner HTTP service.
+- `runtime/platform_shim_serving.py`
+  `PlatformShimServing`: serving backend plus serving HTTP service.
 - `dev/minikube.py`
   The local minikube E2E helper used by the opt-in smoke path.
 

@@ -14,6 +14,7 @@ from flashrl.framework.training.huggingface import (
     HuggingFaceReferenceBackend,
     HuggingFaceTrainingBackend,
 )
+from flashrl.framework.training.service import LearnerService, create_learner_service_app
 
 
 def create_training_backend(
@@ -50,4 +51,6 @@ __all__ = [
     "HuggingFaceTrainingBackend",
     "FSDP2TrainingBackend",
     "create_training_backend",
+    "LearnerService",
+    "create_learner_service_app",
 ]

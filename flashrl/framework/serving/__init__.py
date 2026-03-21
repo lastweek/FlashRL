@@ -7,7 +7,12 @@ from typing import Callable
 
 from flashrl.framework.config import ServingConfig
 from flashrl.framework.serving.base import ServingBackend
-from flashrl.framework.serving.huggingface import HuggingFaceServingBackend
+from flashrl.framework.serving.huggingface import (
+    HuggingFaceServingBackend,
+    activate_huggingface_serving_backend_from_ref,
+)
+from flashrl.framework.serving.remote_backend import RemoteServingBackend
+from flashrl.framework.serving.service import ServingService, create_serving_service_app
 from flashrl.framework.serving.vllm import VLLMServingBackend
 
 
@@ -29,4 +34,8 @@ __all__ = [
     "HuggingFaceServingBackend",
     "VLLMServingBackend",
     "create_serving_backend",
+    "ServingService",
+    "create_serving_service_app",
+    "RemoteServingBackend",
+    "activate_huggingface_serving_backend_from_ref",
 ]

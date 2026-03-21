@@ -1,4 +1,4 @@
-"""In-process rollout service implementation and HTTP app builder."""
+"""Domain-owned rollout service implementation and HTTP app builder."""
 
 from __future__ import annotations
 

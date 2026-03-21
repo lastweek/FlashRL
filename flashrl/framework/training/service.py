@@ -1,4 +1,4 @@
-"""In-process learner service implementation and HTTP app builder."""
+"""Domain-owned learner service implementation and HTTP app builder."""
 
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ from flashrl.framework.distributed.models import (
 )
 from flashrl.framework.observability import StageResult
 from flashrl.framework.serving.base import ServingBackend
-from flashrl.framework.training import ActorTrainingBackend, ReferenceTrainingBackend
+from flashrl.framework.training.base import ActorTrainingBackend, ReferenceTrainingBackend
 from flashrl.framework.training.optimization import optimize_grpo_batch
 
 

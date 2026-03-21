@@ -31,7 +31,7 @@ Inside `flashrl.framework.distributed`, the current code shape is:
 - `*_client.py`
   Remote callers used by the controller or by one pod calling another pod.
 - `*_service.py`
-  In-process service logic plus the `create_*_service_app(...)` FastAPI app builders.
+  Domain-owned in-process service logic plus the `create_*_service_app(...)` FastAPI app builders.
 - `http_common.py`
   Shared HTTP lifecycle, readiness, drain, status, and admin route wiring.
 
@@ -54,11 +54,11 @@ That means there is no separate controller image. Controller, rollout, and rewar
 
 | Pod | Platform software in the pod | What platform adds | Framework software used | User hook or backend |
 | --- | --- | --- | --- | --- |
-| controller | `flashrl.platform.runtime.controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop | `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
-| rollout | `flashrl.platform.runtime.rollout` | Load mounted job, instantiate rollout hook, create remote serving client, wire rollout generator into the rollout service | `ServingClient`, `RemoteServingBackend`, `build_rollout_generator`, `RolloutService`, `create_rollout_service_app` | `userCode.rollout` |
-| reward | `flashrl.platform.runtime.reward` | Load mounted job and instantiate the reward hook, then wire it into the reward service | `UserDefinedReward`, `RewardService`, `create_reward_service_app` | `userCode.reward` |
-| learner | `flashrl.platform.runtime.learner` | Load mounted job, create actor/reference backends, resolve shared storage paths, publish learner artifacts | `create_training_backend`, `LearnerService`, `create_learner_service_app` | training backends from framework config |
-| serving | `flashrl.platform.runtime.serving` | Load mounted job, resolve shared artifact paths, create the configured serving backend, expose serving RPCs | `create_serving_backend`, `ServingService`, `create_serving_service_app` | serving backend from framework config |
+| controller | `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop | `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
+| rollout | `PlatformShimRollout` in `flashrl.platform.runtime.platform_shim_rollout` | Load mounted job, instantiate rollout hook, create remote serving client, wire rollout generator into the rollout service | `ServingClient` from `flashrl.framework.distributed`, `RemoteServingBackend` from `flashrl.framework.serving`, `build_rollout_generator`, `RolloutService`, `create_rollout_service_app` from `flashrl.framework.rollout` | `userCode.rollout` |
+| reward | `PlatformShimReward` in `flashrl.platform.runtime.platform_shim_reward` | Load mounted job and instantiate the reward hook, then wire it into the reward service | `UserDefinedReward`, `RewardService`, `create_reward_service_app` from `flashrl.framework.reward` | `userCode.reward` |
+| learner | `PlatformShimLearner` in `flashrl.platform.runtime.platform_shim_learner` | Load mounted job, create actor/reference backends, resolve shared storage paths, publish learner artifacts | `create_training_backend`, `LearnerService`, `create_learner_service_app` from `flashrl.framework.training` | training backends from framework config |
+| serving | `PlatformShimServing` in `flashrl.platform.runtime.platform_shim_serving` | Load mounted job, resolve shared artifact paths, create the configured serving backend, expose serving RPCs | `create_serving_backend`, `ServingService`, `create_serving_service_app`, `RemoteServingBackend` from `flashrl.framework.serving` | serving backend from framework config |
 
 ## Image Inventory
 
@@ -97,8 +97,8 @@ flowchart TB
     subgraph RuntimeImage[flashrl-runtime]
         R1[container ENTRYPOINT: flashrl]
         R2[pod command: controller or rollout or reward]
-        R3[platform runtime bootstrap]
-        R4[framework distributed clients and service app builders]
+        R3[platform runtime PlatformShim]
+        R4[distributed clients plus domain service app builders]
         R5[user hooks and framework logic]
         R1 --> R2 --> R3 --> R4 --> R5
     end
@@ -106,8 +106,8 @@ flowchart TB
     subgraph ServingImage[flashrl-serving-vllm]
         S1[container ENTRYPOINT: flashrl]
         S2[pod command: serving]
-        S3[platform runtime bootstrap]
-        S4[serving service app builder]
+        S3[platform runtime PlatformShim]
+        S4[serving domain service app builder]
         S5[serving backend: huggingface or vllm]
         S1 --> S2 --> S3 --> S4 --> S5
     end
@@ -115,8 +115,8 @@ flowchart TB
     subgraph TrainingImage[flashrl-training-fsdp]
         T1[container ENTRYPOINT: flashrl]
         T2[pod command: learner]
-        T3[platform runtime bootstrap]
-        T4[learner service app builder]
+        T3[platform runtime PlatformShim]
+        T4[learner domain service app builder]
         T5[training backend: huggingface or fsdp2]
         T1 --> T2 --> T3 --> T4 --> T5
     end
@@ -130,7 +130,7 @@ flowchart TB
     end
 ```
 
-Interpretation: each image has a thin CLI/runtime entry layer on top of the real service or operator logic. The runtime images mostly bootstrap a concrete implementation and then hand off to the framework distributed clients, services, and shared HTTP helpers.
+Interpretation: each image has a thin CLI/runtime entry layer on top of the real service or operator logic. The runtime images mostly bootstrap a concrete implementation and then hand off to distributed transport clients, domain service app builders, and shared HTTP helpers.
 
 ## Execution Workflow
 
@@ -188,34 +188,37 @@ Interpretation: submitting a `FlashRLJob` does not itself run training. The oper
 Every workload pod follows the same broad pattern:
 
 1. Kubernetes starts the container with a `flashrl ...` command
-2. `flashrl.platform.runtime` bootstraps the pod-specific implementation
-3. `flashrl.framework.distributed` exposes the HTTP service surface through `create_*_service_app(...)`
+2. a `PlatformShim*` class in `flashrl.platform.runtime` bootstraps the pod-specific implementation
+3. the domain service modules expose the HTTP service surface through `create_*_service_app(...)`
 4. the hook or backend implementation does the real work
 
 In the diagrams below:
 
-- `pod contract` means `flashrl.platform.runtime.pod`
-- `platform bootstrap` means one of `flashrl.platform.runtime.controller|rollout|reward|learner|serving`
-- `framework` means `flashrl.framework.distributed` service/client code plus backend or hook code
+- `platform shim common` means `flashrl.platform.runtime.platform_shim_common`
+- `platform shim` means one of `flashrl.platform.runtime.platform_shim_controller|platform_shim_rollout|platform_shim_reward|platform_shim_learner|platform_shim_serving`
+- `framework transport` means `flashrl.framework.distributed`
+- `framework service` means the domain-owned `flashrl.framework.rollout|reward|training|serving` service modules
+
+That gives each workload the same three-layer picture: `PlatformShim*` for pod bootstrap, domain service plus distributed transport code for the RPC boundary, and hook/backend code for the actual work.
 
 ### Controller Pod
 
 The controller pod owns orchestration and training, so its runtime has both an init path and a long-running execution path.
 Kubernetes naming: `container=controller`, workload/pod prefix=`<job>-controller`.
-Platform modules: `flashrl.platform.runtime.controller` plus shared `flashrl.platform.runtime.pod`.
+Platform modules: `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` plus shared `flashrl.platform.runtime.platform_shim_common`.
 
 #### Init Workflow
 
 ```mermaid
 sequenceDiagram
     participant Container as Controller Container
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.controller
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimController
     participant Framework as flashrl.framework.distributed.http_common plus GRPOTrainer
     participant API as Kubernetes API
 
     Container->>Platform: flashrl controller
-    Platform->>Platform: create_controller_app
+    Platform->>Platform: PlatformShimController.create_app
     Platform->>Framework: install_common_routes
     Platform->>Platform: FastAPI startup hook fires
     Platform->>Platform: background thread starts
@@ -231,8 +234,8 @@ sequenceDiagram
 
 ```mermaid
 sequenceDiagram
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.controller
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimController
     participant Framework as flashrl.framework.distributed plus GRPOTrainer
     participant Rollout as rollout service
     participant Reward as reward service
@@ -255,21 +258,21 @@ sequenceDiagram
     Platform->>API: patch progress, checkpoint, weightVersion
 ```
 
-Interpretation: the controller pod is different from every other pod because it does not just expose one adapter. It installs common HTTP routes through `http_common.py`, then launches a background training loop that coordinates the other services and patches job status back into Kubernetes.
+Interpretation: the controller pod is different from every other pod because `PlatformShimController` does not just expose one adapter. It installs common HTTP routes through `http_common.py`, then launches a background training loop that coordinates the other services and patches job status back into Kubernetes.
 
 ### Rollout Pod
 
 The rollout pod is an adapter-plus-hook service: platform wires the hook and remote serving client together, while the framework app builder inside `rollout_service.py` owns the HTTP surface.
 Kubernetes naming: `container=rollout`, workload/pod prefix=`<job>-rollout`.
-Platform modules: `flashrl.platform.runtime.rollout` plus shared `flashrl.platform.runtime.pod`.
+Platform modules: `PlatformShimRollout` in `flashrl.platform.runtime.platform_shim_rollout` plus shared `flashrl.platform.runtime.platform_shim_common`.
 
 #### Init Workflow
 
 ```mermaid
 sequenceDiagram
     participant Container as Rollout Container
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.rollout
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimRollout
     participant Framework as flashrl.framework.distributed
     participant Hook as rollout hook
 
@@ -300,21 +303,21 @@ sequenceDiagram
     Framework-->>Controller: batched rollouts
 ```
 
-Interpretation: steady-state rollout execution is request-driven. The controller calls the rollout service, the framework app hands the request into `RolloutService`, and the rollout logic calls serving remotely to produce outputs.
+Interpretation: steady-state rollout execution is request-driven. The controller calls the rollout service, `PlatformShimRollout` has already wired the serving client and hook together, and the framework app hands the request into `RolloutService`.
 
 ### Reward Pod
 
 The reward pod is the simplest workflow: it boots one reward implementation and then scores batches on demand.
 Kubernetes naming: `container=reward`, workload/pod prefix=`<job>-reward`.
-Platform modules: `flashrl.platform.runtime.reward` plus shared `flashrl.platform.runtime.pod`.
+Platform modules: `PlatformShimReward` in `flashrl.platform.runtime.platform_shim_reward` plus shared `flashrl.platform.runtime.platform_shim_common`.
 
 #### Init Workflow
 
 ```mermaid
 sequenceDiagram
     participant Container as Reward Container
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.reward
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimReward
     participant Framework as flashrl.framework.distributed
     participant Hook as reward hook
 
@@ -339,21 +342,21 @@ sequenceDiagram
     Framework-->>Controller: reward response
 ```
 
-Interpretation: the reward pod is the cleanest boundary split. Platform bootstraps the reward object once, and every request after that stays on the `RewardService` plus reward implementation path.
+Interpretation: the reward pod is the cleanest boundary split. `PlatformShimReward` bootstraps the reward object once, and every request after that stays on the `RewardService` plus reward implementation path.
 
 ### Learner Pod
 
 The learner pod is backend-driven rather than hook-driven. It boots training backends and then handles optimize and checkpoint RPCs.
 Kubernetes naming: `container=learner`, workload/pod prefix=`<job>-learner`.
-Platform modules: `flashrl.platform.runtime.learner` plus shared `flashrl.platform.runtime.pod`.
+Platform modules: `PlatformShimLearner` in `flashrl.platform.runtime.platform_shim_learner` plus shared `flashrl.platform.runtime.platform_shim_common`.
 
 #### Init Workflow
 
 ```mermaid
 sequenceDiagram
     participant Container as Learner Container
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.learner
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimLearner
     participant Framework as flashrl.framework.distributed
     participant Backend as training backends
     participant Storage as shared storage
@@ -393,15 +396,15 @@ Interpretation: after startup, the learner pod is a pure RPC service around trai
 
 The serving pod is also backend-driven. It boots one serving backend, then handles generation and weight-activation requests.
 Kubernetes naming: `container=serving`, workload/pod prefix=`<job>-serving`.
-Platform modules: `flashrl.platform.runtime.serving` plus shared `flashrl.platform.runtime.pod`.
+Platform modules: `PlatformShimServing` in `flashrl.platform.runtime.platform_shim_serving` plus shared `flashrl.platform.runtime.platform_shim_common`.
 
 #### Init Workflow
 
 ```mermaid
 sequenceDiagram
     participant Container as Serving Container
-    participant PodContract as flashrl.platform.runtime.pod
-    participant Platform as flashrl.platform.runtime.serving
+    participant PodContract as flashrl.platform.runtime.platform_shim_common
+    participant Platform as PlatformShimServing
     participant Framework as flashrl.framework.distributed
     participant Backend as serving backend
     participant Storage as shared storage
@@ -434,7 +437,7 @@ sequenceDiagram
     Framework-->>Controller: activation response
 ```
 
-Interpretation: the serving pod spends most of its life handling two RPCs: grouped generation for rollout and active-weight switching for the controller. Platform code only matters during initialization; the steady-state path is `ServingService` plus serving backend.
+Interpretation: the serving pod spends most of its life handling two RPCs: grouped generation for rollout and active-weight switching for the controller. `PlatformShimServing` matters during initialization; the steady-state path is `ServingService` plus serving backend.
 
 Across all five pods, the recurring pattern is stable:
 

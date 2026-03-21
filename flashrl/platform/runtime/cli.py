@@ -4,11 +4,11 @@ from __future__ import annotations
 
 import argparse
 
-from flashrl.platform.runtime.controller import run_controller_pod
-from flashrl.platform.runtime.learner import run_learner_pod
-from flashrl.platform.runtime.reward import run_reward_pod
-from flashrl.platform.runtime.rollout import run_rollout_pod
-from flashrl.platform.runtime.serving import run_serving_pod
+from flashrl.platform.runtime.platform_shim_controller import PlatformShimController
+from flashrl.platform.runtime.platform_shim_learner import PlatformShimLearner
+from flashrl.platform.runtime.platform_shim_reward import PlatformShimReward
+from flashrl.platform.runtime.platform_shim_rollout import PlatformShimRollout
+from flashrl.platform.runtime.platform_shim_serving import PlatformShimServing
 
 
 def build_component_argument_parser() -> argparse.ArgumentParser:
@@ -27,10 +27,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = build_component_argument_parser()
     args = parser.parse_args(argv)
     dispatch = {
-        "controller": run_controller_pod,
-        "rollout": run_rollout_pod,
-        "reward": run_reward_pod,
-        "learner": run_learner_pod,
-        "serving": run_serving_pod,
+        "controller": PlatformShimController,
+        "rollout": PlatformShimRollout,
+        "reward": PlatformShimReward,
+        "learner": PlatformShimLearner,
+        "serving": PlatformShimServing,
     }
-    return int(dispatch[args.component_command](host=args.host, port=args.port))
+    return int(dispatch[args.component_command]().run(host=args.host, port=args.port))

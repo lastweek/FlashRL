@@ -16,23 +16,28 @@ from flashrl.framework.config import GrpoConfig, RolloutConfig, ServingConfig, T
 from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.distributed import (
     ActivateWeightVersionRequest,
-    LearnerService,
     OptimizeStepRequest,
-    RewardService,
-    RolloutService,
     RewardBatchRequest,
     RolloutBatchRequest,
     ServingClient,
-    ServingService,
     StatusResponse,
-    create_learner_service_app,
-    create_reward_service_app,
+)
+from flashrl.framework.reward import RewardService, create_reward_service_app
+from flashrl.framework.rollout import (
+    RolloutService,
+    build_rollout_generator,
     create_rollout_service_app,
+)
+from flashrl.framework.serving import (
+    HuggingFaceServingBackend,
+    ServingService,
     create_serving_service_app,
 )
-from flashrl.framework.rollout.base import build_rollout_generator
-from flashrl.framework.training import HuggingFaceTrainingBackend
-from flashrl.framework.serving import HuggingFaceServingBackend
+from flashrl.framework.training import (
+    HuggingFaceTrainingBackend,
+    LearnerService,
+    create_learner_service_app,
+)
 from tests.conftest import TinyActor
 
 
@@ -317,15 +322,18 @@ def test_rollout_service_reports_load_and_drains_during_inflight_requests() -> N
     assert drained_status["metadata"]["draining"] is True
 
 
-def test_distributed_package_reexports_services_clients_and_app_builders() -> None:
-    """The distributed package should expose services, clients, and app builders directly."""
-    from flashrl.framework.distributed import (
-        LearnerService as ImportedLearnerService,
-        ServingClient as ImportedServingClient,
-        create_reward_service_app as imported_create_reward_service_app,
-    )
+def test_distributed_package_reexports_transport_clients_only() -> None:
+    """The distributed package should expose transport models and remote clients only."""
+    from flashrl.framework.distributed import ServingClient as ImportedServingClient
 
     assert ImportedServingClient is ServingClient
+
+
+def test_domain_packages_reexport_services_and_app_builders() -> None:
+    """Domain packages should expose the in-process service layer directly."""
+    from flashrl.framework.reward import create_reward_service_app as imported_create_reward_service_app
+    from flashrl.framework.training import LearnerService as ImportedLearnerService
+
     assert ImportedLearnerService is LearnerService
     assert imported_create_reward_service_app is create_reward_service_app
 
@@ -343,11 +351,25 @@ def test_distributed_package_no_longer_exports_protocols_or_legacy_names() -> No
         "flashrl.framework.distributed.learner_server",
         "flashrl.framework.distributed.serving_server",
         "flashrl.framework.distributed.server_common",
+        "flashrl.framework.distributed.reward_service",
+        "flashrl.framework.distributed.rollout_service",
+        "flashrl.framework.distributed.learner_service",
+        "flashrl.framework.distributed.serving_service",
+        "flashrl.framework.distributed.remote_serving_backend",
     ):
         with pytest.raises(ModuleNotFoundError):
             importlib.import_module(module_name)
 
     for name in (
+        "RolloutService",
+        "RewardService",
+        "LearnerService",
+        "ServingService",
+        "RemoteServingBackend",
+        "create_rollout_service_app",
+        "create_reward_service_app",
+        "create_learner_service_app",
+        "create_serving_service_app",
         "LocalRolloutClient",
         "LocalRewardClient",
         "LocalLearnerClient",
@@ -365,17 +387,25 @@ def test_distributed_package_no_longer_exports_protocols_or_legacy_names() -> No
 
 
 def test_repo_imports_use_consolidated_distributed_layout() -> None:
-    """Repo Python imports should not reference the removed service or split client modules."""
+    """Repo Python imports should not keep services under the distributed package."""
     repo_root = Path(__file__).resolve().parents[1]
     legacy_paths = [
         ".".join(["flashrl", "framework", "services"]),
         ".".join(["flashrl", "framework", "distributed", "local"]),
+        ".".join(["flashrl", "framework", "distributed", "rollout_service"]),
+        ".".join(["flashrl", "framework", "distributed", "reward_service"]),
+        ".".join(["flashrl", "framework", "distributed", "learner_service"]),
+        ".".join(["flashrl", "framework", "distributed", "serving_service"]),
+        ".".join(["flashrl", "framework", "distributed", "remote_serving_backend"]),
     ]
 
     offenders: list[str] = []
     for base in (repo_root / "flashrl", repo_root / "tests"):
         for path in base.rglob("*.py"):
-            if path == Path(__file__).resolve():
+            if path in {
+                Path(__file__).resolve(),
+                repo_root / "tests/test_platform_crd.py",
+            }:
                 continue
             content = path.read_text(encoding="utf-8")
             for legacy_path in legacy_paths:

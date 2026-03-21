@@ -16,7 +16,6 @@ from flashrl.framework.data_models import (
     WeightVersionInfo,
 )
 from flashrl.framework.distributed.learner_client import LearnerClient
-from flashrl.framework.distributed.learner_service import LearnerService
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     LoadCheckpointRequest,
@@ -26,11 +25,8 @@ from flashrl.framework.distributed.models import (
     SaveCheckpointRequest,
 )
 from flashrl.framework.distributed.reward_client import RewardClient
-from flashrl.framework.distributed.reward_service import RewardService
 from flashrl.framework.distributed.rollout_client import RolloutClient
-from flashrl.framework.distributed.rollout_service import RolloutService
 from flashrl.framework.distributed.serving_client import ServingClient
-from flashrl.framework.distributed.serving_service import ServingService
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -41,6 +37,10 @@ from flashrl.framework.observability import (
     stage_timings,
     timed_call,
 )
+from flashrl.framework.reward import RewardService
+from flashrl.framework.rollout import RolloutService
+from flashrl.framework.serving import ServingService
+from flashrl.framework.training import LearnerService
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.base import BaseRolloutGenerator
 from flashrl.framework.rollout_metrics import count_llm_call_rounds, count_tool_calls

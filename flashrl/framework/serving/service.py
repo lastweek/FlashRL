@@ -1,13 +1,9 @@
-"""In-process serving service implementation and HTTP app builder."""
+"""Domain-owned serving service implementation and HTTP app builder."""
 
 from __future__ import annotations
 
-from pathlib import Path
-
 from fastapi import FastAPI
-import torch
 
-from flashrl.framework.admin import utc_now_iso
 from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.distributed.http_common import install_common_routes
 from flashrl.framework.distributed.models import (
@@ -18,18 +14,8 @@ from flashrl.framework.distributed.models import (
     GenerateGroupedResponse,
     GeneratedSamplePayload,
     StatusResponse,
-    WeightVersionRef,
 )
 from flashrl.framework.serving.base import ServingBackend
-
-
-def _resolve_weight_artifact_path(artifact_uri: str) -> Path:
-    path = Path(artifact_uri)
-    if path.is_dir():
-        candidate = path / "model_state.pt"
-        if candidate.exists():
-            return candidate
-    return path
 
 
 class ServingService:
@@ -153,24 +139,3 @@ def create_serving_service_app(service: ServingService) -> FastAPI:
         return service.activate_weight_version(request)
 
     return app
-
-
-def activate_huggingface_serving_backend_from_ref(
-    serving_backend: ServingBackend,
-    weight_version: WeightVersionRef,
-) -> WeightVersionInfo:
-    """Activate a local file-based weight artifact on a serving backend."""
-    weight_path = _resolve_weight_artifact_path(weight_version.artifact_uri)
-    state_dict = torch.load(weight_path, weights_only=False)
-    serving_backend._actor.model.load_state_dict(state_dict)  # type: ignore[attr-defined]
-    activated = weight_version.to_info(activated_at=utc_now_iso())
-    serving_backend._active_weight_version = activated
-    serving_backend._pending_weight_version = None
-    serving_backend._next_weight_version_id = max(
-        int(getattr(serving_backend, "_next_weight_version_id", 1)),
-        weight_version.version_id + 1,
-    )
-    serving_backend._last_successful_sync_at = serving_backend._active_weight_version.activated_at
-    serving_backend._sync_healthy = True
-    serving_backend._last_sync_error = None
-    return serving_backend.current_weight_version()
