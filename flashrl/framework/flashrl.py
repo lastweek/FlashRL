@@ -78,7 +78,6 @@ class FlashRL:
         checkpointing_config: CheckpointingConfig | None = None,
         admin_config: AdminConfig | None = None,
         config_path: str | Path | None = None,
-        config_profile: str | None = None,
         run_config: RunConfig | dict[str, Any] | None = None,
         dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None,
     ) -> None:
@@ -89,13 +88,12 @@ class FlashRL:
         """
         resolved_run_config = runtime_support.load_run_config(
             config_path=config_path,
-            config_profile=config_profile,
             run_config=run_config,
         )
         if resolved_run_config is not None:
             if rollout_fn is None or reward_fn is None:
                 raise ValueError(
-                    "FlashRL profile construction requires explicit rollout_fn and reward_fn."
+                    "FlashRL config-based construction requires explicit rollout_fn and reward_fn."
                 )
             if (
                 actor_config is not None
@@ -109,7 +107,7 @@ class FlashRL:
                 or admin_config is not None
             ):
                 raise ValueError(
-                    "FlashRL profile construction cannot be combined with explicit "
+                    "FlashRL config-based construction cannot be combined with explicit "
                     "actor/reference/serving/trainer/admin/checkpointing overrides."
                 )
 
@@ -119,7 +117,7 @@ class FlashRL:
                 serving_config,
                 trainer_config,
                 admin_config,
-            ) = runtime_support.build_runtime_profile(resolved_run_config)
+            ) = runtime_support.build_runtime_role_configs(resolved_run_config)
             grpo_config = resolved_run_config.grpo
             logging_config = resolved_run_config.logging
             metrics_config = resolved_run_config.metrics
@@ -262,10 +260,10 @@ class FlashRL:
         self._emit_bootstrap_console(f"  {label:<8} {component:<17} {message}")
 
     @classmethod
-    def from_yaml(cls, path: str | Path, *, profile: str | None = None) -> "FlashRL":
+    def from_yaml(cls, path: str | Path) -> "FlashRL":
         """Construct FlashRL from a YAML run config."""
         config_path = Path(path)
-        run_config = RunConfig.from_yaml(config_path, profile=profile)
+        run_config = RunConfig.from_yaml(config_path)
         if run_config.hooks is None:
             raise ValueError(
                 "FlashRL.from_yaml(...) requires hooks.rollout_fn, hooks.reward_fn, and "
@@ -1213,11 +1211,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         required=True,
         help="Path to the FlashRL YAML config file.",
     )
-    parser.add_argument(
-        "--profile",
-        default=None,
-        help="Optional config profile override.",
-    )
     return parser
 
 
@@ -1228,7 +1221,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     flashrl: FlashRL | None = None
 
     try:
-        flashrl = FlashRL.from_yaml(args.config, profile=args.profile)
+        flashrl = FlashRL.from_yaml(args.config)
         flashrl.train()
     except Exception as exc:
         print(f"FlashRL YAML run failed: {exc}", file=sys.stderr)

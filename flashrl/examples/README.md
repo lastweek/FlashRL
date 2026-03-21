@@ -6,21 +6,22 @@ Module-first commands:
 
 ```bash
 python3 -m flashrl.examples.math.train
-python3 -m flashrl.examples.math.train --profile vllm
+python3 -m flashrl.examples.math.train --config flashrl/examples/math/config-vllm.yaml
 python3 -m flashrl.examples.code_single_turn.train
 python3 -m flashrl.examples.agent_tools.run
 python3 -m flashrl.examples.agent_react.run
 python3 -m flashrl.examples.agent_dynamic_tools.run
 ```
 
-Cluster-capable training examples use one `config.yaml` with:
+Example config layout is now explicit:
 
-- `framework:` for FlashRL run semantics
-- `platform:` for Kubernetes policy and image refs
-- `profiles:` for environment-specific overrides such as `vllm` and `minikube`
+- `config.yaml` is the normal default config for that example
+- `config-vllm.yaml` is the managed local vLLM variant when the example ships one
+- cluster smoke configs live under `flashrl/platform/dev/`, not under public examples
 
-When a local example uses the managed vLLM profile, the entrypoint will try to
-auto-fill `FLASHRL_VLLM_PYTHON` when a prepared runtime is available.
+When a selected example config uses `framework.serving.backend: vllm`, the
+entrypoint will try to auto-fill `FLASHRL_VLLM_PYTHON` when a prepared runtime
+is available.
 
 Example docs:
 

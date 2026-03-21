@@ -67,14 +67,13 @@ def normalize_dataset(dataset: list[Prompt] | list[str]) -> list[Prompt]:
 def load_run_config(
     *,
     config_path: str | Path | None,
-    config_profile: str | None = None,
     run_config: RunConfig | dict[str, Any] | None,
 ) -> RunConfig | None:
-    """Normalize the optional profile input into one RunConfig object."""
+    """Normalize one optional config input into a RunConfig object."""
     if config_path is not None and run_config is not None:
         raise ValueError("Pass only one of config_path or run_config when constructing FlashRL.")
     if config_path is not None:
-        return RunConfig.from_yaml(config_path, profile=config_profile)
+        return RunConfig.from_yaml(config_path)
     if run_config is None:
         return None
     if isinstance(run_config, RunConfig):
@@ -100,10 +99,10 @@ def build_trainer_config(run_config: RunConfig) -> TrainerConfig:
     return run_config.trainer.model_copy(deep=True)
 
 
-def build_runtime_profile(
+def build_runtime_role_configs(
     run_config: RunConfig,
 ) -> tuple[TrainingConfig, TrainingConfig | None, ServingConfig, TrainerConfig, AdminConfig]:
-    """Resolve the runtime profile directly from the explicit role config."""
+    """Resolve runtime role configs directly from one explicit RunConfig."""
     return (
         run_config.actor.model_copy(deep=True),
         run_config.reference.model_copy(deep=True) if run_config.reference is not None else None,

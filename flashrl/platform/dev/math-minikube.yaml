@@ -1,14 +1,16 @@
 framework:
   actor:
-    model_name: Qwen/Qwen2.5-0.5B-Instruct
+    model_name: sshleifer/tiny-gpt2
     backend: huggingface
     num_threads: 1
+    max_length: 256
 
   serving:
-    model_name: Qwen/Qwen2.5-0.5B-Instruct
+    model_name: sshleifer/tiny-gpt2
     backend: huggingface
     num_threads: 1
-    debug_live_rollout: true
+    max_length: 256
+    debug_live_rollout: false
 
   trainer:
     learning_rate: 1.0e-5
@@ -19,9 +21,9 @@ framework:
     group_size: 2
     clip_ratio: 0.2
     kl_coefficient: 0.0
-    max_new_tokens: 2038
+    max_new_tokens: 24
     temperature: 1.0
-    top_p: 0.9
+    top_p: 0.95
     top_k: 0
     do_sample: true
 
@@ -45,56 +47,76 @@ framework:
   admin:
     admin_enabled: true
 
-  # Platform runs take math-example overrides from YAML here, not from
-  # `python3 -m flashrl.examples.math.train ...` CLI flags.
-  # Use these hook kwargs to control:
-  # - dataset_fn.kwargs.dataset
-  # - dataset_fn.kwargs.limit
-  # - dataset_fn.kwargs.training_mode
-  # - rollout_fn.kwargs.rollout_mode
-  # rollout and reward inherit `training_mode` from prompt metadata by default,
-  # so change `dataset_fn.kwargs.training_mode` once if you want the whole run
-  # to switch between the default math mode and reasoning mode.
-  # Supported rollout modes:
-  # - whitebox = agentic/traced rollout
-  # - blackbox = plain example rollout function
   hooks:
     dataset_fn:
       import: flashrl.examples.math.train:build_math_train_dataset
       kwargs:
         dataset: gsm8k
-        limit: 8
-        training_mode: math
+        limit: 2
+        training_mode: reasoning
     rollout_fn:
       import: flashrl.examples.math.train:build_math_rollout
       kwargs:
-        rollout_mode: whitebox
+        rollout_mode: blackbox
     reward_fn:
       import: flashrl.examples.math.train:build_math_reward_fn
       kwargs: {}
 
 platform:
   job:
-    name: flashrl-math-demo
-    namespace: default
+    name: flashrl-math-minikube
+    namespace: flashrl-e2e
   images:
-    runtime: flashrl-runtime:dev
-    serving: flashrl-serving-vllm:dev
-    training: flashrl-training-fsdp:dev
+    runtime: flashrl-runtime:minikube
+    serving: flashrl-serving-vllm:minikube
+    training: flashrl-training-fsdp:minikube
+    pullPolicy: IfNotPresent
+  sharedStorage:
+    enabled: true
+    mountPath: /var/lib/flashrl/shared
+    checkpointsSubPath: checkpoints
+    weightsSubPath: weights
+    claim:
+      size: 8Gi
+  controller:
+    resources:
+      requests:
+        cpu: "500m"
+        memory: 1Gi
+  learner:
+    resources:
+      requests:
+        cpu: "1000m"
+        memory: 2Gi
   serving:
     replicas:
       min: 1
       max: 1
+    resources:
+      requests:
+        cpu: "1000m"
+        memory: 2Gi
   rollout:
     replicas:
       min: 1
       max: 1
+    resources:
+      requests:
+        cpu: "500m"
+        memory: 1Gi
   reward:
     replicas:
       min: 1
       max: 1
+    resources:
+      requests:
+        cpu: "500m"
+        memory: 1Gi
   storage:
     checkpoints:
-      uriPrefix: /shared/flashrl/checkpoints
+      uriPrefix: checkpoints
     weights:
-      uriPrefix: /shared/flashrl/weights
+      uriPrefix: weights
+  checkpointing:
+    save_every_steps: 1
+    save_on_run_end: true

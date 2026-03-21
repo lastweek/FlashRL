@@ -74,9 +74,9 @@ class PlatformConfig(BaseConfig):
     observability: ObservabilitySpec = Field(default_factory=ObservabilitySpec)
 
     @classmethod
-    def from_yaml(cls, path: str | Path, profile: str | None = None) -> "PlatformConfig":
+    def from_yaml(cls, path: str | Path) -> "PlatformConfig":
         """Load one platform-only config or the platform section from a combined config."""
-        data = load_yaml_mapping(path, profile=profile)
+        data = load_yaml_mapping(path)
         if "platform" in data:
             platform = data.get("platform")
             if not isinstance(platform, dict):
@@ -88,7 +88,6 @@ class PlatformConfig(BaseConfig):
     def from_dict(cls, data: dict[str, Any]) -> "PlatformConfig":
         """Load one platform-only config or the platform section from a combined config."""
         expanded = dict(data)
-        expanded.pop("profiles", None)
         expanded = _expand_env_vars(expanded)
         if "platform" in expanded:
             platform = expanded.get("platform")
@@ -98,9 +97,9 @@ class PlatformConfig(BaseConfig):
         return cls.model_validate(expanded)
 
 
-def load_flashrl_config(path: str | Path, *, profile: str | None = None) -> FlashRLConfig:
-    """Load one combined FlashRL config file with an optional profile."""
-    return FlashRLConfig.from_yaml(path, profile=profile)
+def load_flashrl_config(path: str | Path) -> FlashRLConfig:
+    """Load one combined FlashRL config file."""
+    return FlashRLConfig.from_yaml(path)
 
 
 def _normalize_builder(binding: str | BuilderSpec | None) -> BuilderSpec | None:

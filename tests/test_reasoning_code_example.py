@@ -452,7 +452,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
     """The example CLIs should expose the intended explicit operator knobs."""
     train_help = code_basic.build_argument_parser().format_help()
     assert "--config" in train_help
-    assert "--profile" in train_help
+    assert "--profile" not in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" not in train_help
     assert "--checkpoint-out" not in train_help
@@ -464,7 +464,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
 
     eval_help = code_basic_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
-    assert "--profile" in eval_help
+    assert "--profile" not in eval_help
     assert "--eval-limit" in eval_help
     assert "--batch-size" in eval_help
     assert "--rating-min" in eval_help
@@ -486,15 +486,14 @@ def test_prepare_code_basic_environment_sets_default_vllm_runtime(
     )
 
     code_basic.prepare_reasoning_code_environment(
-        "flashrl/examples/code_single_turn/config.yaml",
-        "vllm",
+        "flashrl/examples/code_single_turn/config-vllm.yaml",
     )
 
     assert "FLASHRL_VLLM_PYTHON" in sys.modules["os"].environ
     sys.modules["os"].environ.pop("FLASHRL_VLLM_PYTHON", None)
 
 
-def test_code_basic_main_uses_profile_aware_flashrl_constructor(
+def test_code_basic_main_uses_explicit_config_flashrl_constructor(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The code example should pass config_path into FlashRL instead of parsing YAML locally."""
@@ -528,7 +527,6 @@ def test_code_basic_main_uses_profile_aware_flashrl_constructor(
     assert captured["config_path"] == "flashrl/examples/code_single_turn/config.yaml"
     assert isinstance(captured["rollout_fn"], Agent)
     assert callable(captured["reward_fn"])
-    assert captured["config_profile"] is None
     assert "checkpoint_out" not in captured
 
 

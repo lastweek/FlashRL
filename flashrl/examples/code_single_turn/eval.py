@@ -102,11 +102,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Path to the FlashRL config.yaml file.",
     )
     parser.add_argument(
-        "--profile",
-        default=None,
-        help="Optional config profile override, for example `vllm`.",
-    )
-    parser.add_argument(
         "--checkpoint",
         default=None,
         help="Optional checkpoint path to load before evaluation.",
@@ -166,7 +161,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run held-out evaluation and print compact JSON metrics."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    code_example.prepare_reasoning_code_environment(args.config, args.profile)
+    code_example.prepare_reasoning_code_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
@@ -186,7 +181,6 @@ def main(argv: list[str] | None = None) -> int:
 
         flashrl = FlashRL(
             config_path=args.config,
-            config_profile=args.profile,
             rollout_fn=rollout_agent,
             reward_fn=code_example.make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),

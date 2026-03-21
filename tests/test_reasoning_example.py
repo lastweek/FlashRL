@@ -53,6 +53,7 @@ def make_prompt(
     problem: str = "Janet has 15 apples and buys 27 more. How many apples does she have now?",
     final_answer: str = "42",
     source: str = "openai/gsm8k",
+    training_mode: str = "reasoning",
 ) -> Prompt:
     """Build one strict reasoning prompt with GSM8K-style metadata."""
     return Prompt(
@@ -64,6 +65,7 @@ def make_prompt(
             "problem": problem,
             "final_answer": final_answer,
             "verifier": "numeric_exact",
+            "training_mode": training_mode,
         },
     )
 
@@ -136,6 +138,7 @@ def test_build_math_train_dataset_loads_gsm8k_rows_into_prompt_metadata(
         "problem": "What is 15 + 27?",
         "final_answer": "42",
         "verifier": "numeric_exact",
+        "training_mode": "math",
     }
 
 
@@ -464,6 +467,36 @@ def test_math_reward_marks_truncated_outputs_invalid_for_format() -> None:
     assert reward.metadata["accuracy_pass"] is True
 
 
+def test_math_reward_infers_training_mode_from_prompt_metadata() -> None:
+    """Config-driven rewards should pick up math-vs-reasoning mode from prompt metadata."""
+    prompt = make_prompt(training_mode="math")
+    reward = reasoning_example.math_reward_fn(make_rollout(prompt, "42"))
+
+    assert reward.reward == pytest.approx(1.0)
+    assert reward.metadata["accuracy_pass"] is True
+    assert "format_pass" not in reward.metadata
+
+
+def test_build_math_rollout_infers_training_mode_from_prompt_metadata(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Config-driven rollout should infer training mode from prompt metadata when omitted."""
+    seen: dict[str, object] = {}
+
+    def fake_reasoning_rollout_fn(prompts, serving_backend, *, system_prompt=None):
+        del serving_backend
+        seen["system_prompt"] = system_prompt
+        return [make_rollout(prompts[0], "<answer>42</answer>")]
+
+    monkeypatch.setattr(reasoning_example, "reasoning_rollout_fn", fake_reasoning_rollout_fn)
+
+    rollout_fn = reasoning_example.build_math_rollout(rollout_mode="blackbox")
+    prompt = make_prompt(training_mode="reasoning")
+    rollout_fn([prompt], object())
+
+    assert seen["system_prompt"] == reasoning_example.build_math_system_prompt("reasoning")
+
+
 def test_extract_answer_block_requires_exactly_one_non_empty_block() -> None:
     """Answer parsing should reject missing, empty, and duplicate blocks."""
     assert reasoning_example._extract_answer_block("<answer>42</answer>") == "42"
@@ -561,7 +594,7 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
     """The example CLIs should expose only the intended explicit operator knobs."""
     train_help = reasoning_example.build_argument_parser().format_help()
     assert "--config" in train_help
-    assert "--profile" in train_help
+    assert "--profile" not in train_help
     assert "--dataset" in train_help
     assert "--train-limit" in train_help
     assert "--checkpoint" not in train_help
@@ -570,7 +603,7 @@ def test_reasoning_cli_help_uses_reduced_flag_surface() -> None:
 
     eval_help = reasoning_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
-    assert "--profile" in eval_help
+    assert "--profile" not in eval_help
     assert "--dataset" in eval_help
     assert "--eval-limit" in eval_help
     assert "--checkpoint" in eval_help
@@ -592,8 +625,7 @@ def test_prepare_reasoning_environment_sets_default_vllm_runtime(
     monkeypatch.setattr(reasoning_example, "find_default_vllm_python", lambda: "/tmp/fake-vllm-python")
 
     reasoning_example.prepare_reasoning_environment(
-        "flashrl/examples/math/config.yaml",
-        "vllm",
+        "flashrl/examples/math/config-vllm.yaml",
     )
 
     assert os.environ["FLASHRL_VLLM_PYTHON"] == "/tmp/fake-vllm-python"

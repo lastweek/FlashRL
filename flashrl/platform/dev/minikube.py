@@ -18,8 +18,7 @@ from flashrl.platform.config import PlatformConfig, load_flashrl_config
 
 
 REPO_ROOT = Path(__file__).resolve().parents[3]
-DEFAULT_CONFIG = REPO_ROOT / "flashrl/examples/math/config.yaml"
-DEFAULT_PROFILE = "minikube"
+DEFAULT_CONFIG = REPO_ROOT / "flashrl/platform/dev/math-minikube.yaml"
 DEFAULT_OPERATOR_NAMESPACE = "flashrl-system"
 DEFAULT_OPERATOR_IMAGE = "flashrl-operator:minikube"
 DEFAULT_TIMEOUT_SECONDS = 1800
@@ -344,7 +343,6 @@ def _delete_job(namespace: str, job_name: str) -> None:
 def run_minikube_math_e2e(
     *,
     config: str | Path = DEFAULT_CONFIG,
-    profile: str = DEFAULT_PROFILE,
     minikube_profile: str = "minikube",
     operator_namespace: str = DEFAULT_OPERATOR_NAMESPACE,
     operator_image: str = DEFAULT_OPERATOR_IMAGE,
@@ -355,9 +353,9 @@ def run_minikube_math_e2e(
 ) -> dict[str, Any]:
     """Run the math example end to end on a local minikube cluster."""
     config_path = Path(config)
-    resolved = load_flashrl_config(str(config_path), profile=profile)
+    resolved = load_flashrl_config(str(config_path))
     if resolved.platform is None:
-        raise ValueError("Minikube E2E requires `platform:` in the selected config profile.")
+        raise ValueError("Minikube E2E requires `platform:` in the selected config file.")
     platform = PlatformConfig.model_validate(resolved.platform)
     namespace = platform.job.namespace
     job_name = platform.job.name
@@ -396,8 +394,6 @@ def run_minikube_math_e2e(
             "submit",
             "--config",
             str(config_path),
-            "--profile",
-            profile,
         ]
     )
 
@@ -433,7 +429,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     """Build the minikube E2E CLI parser."""
     parser = argparse.ArgumentParser(description="Run the FlashRL minikube platform E2E.")
     parser.add_argument("--config", default=str(DEFAULT_CONFIG))
-    parser.add_argument("--profile", default=DEFAULT_PROFILE)
     parser.add_argument("--minikube-profile", default="minikube")
     parser.add_argument("--operator-namespace", default=DEFAULT_OPERATOR_NAMESPACE)
     parser.add_argument("--operator-image", default=DEFAULT_OPERATOR_IMAGE)
@@ -450,7 +445,6 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     run_minikube_math_e2e(
         config=args.config,
-        profile=args.profile,
         minikube_profile=args.minikube_profile,
         operator_namespace=args.operator_namespace,
         operator_image=args.operator_image,

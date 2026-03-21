@@ -11,11 +11,11 @@ expects the answer block to contain one fenced Python code block.
 - `eval.py`
 - `executor.py`
 - `config.yaml`
+- `config-vllm.yaml`
 
-`config.yaml` is the only config file. It contains:
+`config.yaml` is the default local Hugging Face config.
 
-- `framework:` for local FlashRL runtime and training settings
-- `profiles.vllm` for managed local vLLM
+`config-vllm.yaml` is the managed local vLLM variant for the same example.
 
 ## Local Runs
 
@@ -28,15 +28,15 @@ python3 -m flashrl.examples.code_single_turn.train
 Managed local vLLM:
 
 ```bash
-python3 -m flashrl.examples.code_single_turn.train --profile vllm
-python3 -m flashrl.examples.code_single_turn.eval --profile vllm
+python3 -m flashrl.examples.code_single_turn.train --config flashrl/examples/code_single_turn/config-vllm.yaml
+python3 -m flashrl.examples.code_single_turn.eval --config flashrl/examples/code_single_turn/config-vllm.yaml
 ```
 
 Custom execution limits:
 
 ```bash
 python3 -m flashrl.examples.code_single_turn.train \
-  --profile vllm \
+  --config flashrl/examples/code_single_turn/config-vllm.yaml \
   --run-timeout-seconds 3 \
   --train-limit 64
 ```
@@ -52,7 +52,7 @@ python3 -m flashrl.examples.code_single_turn.train \
 
 ## Notes
 
-- This example is local-first. It does not ship a documented Kubernetes profile yet.
+- This example is local-first. It does not ship a documented Kubernetes config yet.
 - It still does not support direct raw `FlashRL.from_yaml(...)` usage because the rollout and reward are constructed explicitly in code.
-- `FLASHRL_VLLM_PYTHON` is auto-filled by the example entrypoint when `--profile vllm` is selected and a prepared local runtime is found.
+- `FLASHRL_VLLM_PYTHON` is auto-filled by the example entrypoint when the selected config uses `serving.backend: vllm` and a prepared local runtime is found.
 - TensorBoard logs are written under `logs/`.

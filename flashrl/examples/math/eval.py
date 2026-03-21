@@ -94,11 +94,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         help="Path to the FlashRL config.yaml file.",
     )
     parser.add_argument(
-        "--profile",
-        default=None,
-        help="Optional config profile override, for example `vllm`.",
-    )
-    parser.add_argument(
         "--dataset",
         choices=reasoning_math_example.SUPPORTED_MATH_DATASETS,
         default=reasoning_math_example.DEFAULT_MATH_DATASET,
@@ -141,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
     """Run held-out evaluation and print compact JSON metrics."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    reasoning_math_example.prepare_reasoning_environment(args.config, args.profile)
+    reasoning_math_example.prepare_reasoning_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
@@ -165,7 +160,6 @@ def main(argv: list[str] | None = None) -> int:
 
         flashrl = FlashRL(
             config_path=args.config,
-            config_profile=args.profile,
             rollout_fn=rollout_impl,
             reward_fn=reasoning_math_example.math_reward_fn,
         )

@@ -15,6 +15,7 @@ import shutil
 import sys
 from typing import Any, Literal
 from uuid import uuid4
+import yaml
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLE_DIR.parents[3]
@@ -55,6 +56,7 @@ DEFAULT_AIME25_TRAIN_SPLIT = "test"
 DEFAULT_AIME25_EVAL_SPLIT = "test"
 DEFAULT_REASONING_CHECKPOINT_PATH = "/tmp/flashrl_reasoning_checkpoint.pt"
 DEFAULT_REASONING_EVAL_BATCH_SIZE = 8
+DEFAULT_MATH_TRAINING_MODE = "math"
 DEFAULT_MATH_ROLLOUT_MODE = "blackbox"
 SUPPORTED_MATH_ROLLOUT_MODES = ("blackbox", "whitebox")
 FINAL_ANSWER_PATTERN = re.compile(r"####\s*(.+)$", re.MULTILINE)
@@ -172,6 +174,27 @@ def _render_system_prefixed_prompt(prompt_text: str, system_prompt: str | None) 
     if not system_prompt:
         return prompt_text
     return f"System: {system_prompt}\n\nUser: {prompt_text}"
+
+
+def _resolve_math_training_mode(
+    *,
+    explicit_training_mode: str | None = None,
+    prompt_metadata: dict[str, Any] | None = None,
+    prompts: list[Prompt] | None = None,
+) -> str:
+    """Resolve math vs reasoning mode from one explicit override or prompt metadata."""
+    if explicit_training_mode:
+        return str(explicit_training_mode)
+    if prompt_metadata is not None:
+        prompt_mode = str(prompt_metadata.get("training_mode") or "").strip()
+        if prompt_mode:
+            return prompt_mode
+    if prompts is not None:
+        for prompt in prompts:
+            prompt_mode = str(prompt.metadata.get("training_mode") or "").strip()
+            if prompt_mode:
+                return prompt_mode
+    return DEFAULT_MATH_TRAINING_MODE
 
 
 def _safe_decimal_expression(text: str) -> Decimal:
@@ -417,7 +440,7 @@ def _load_aime25_split(
 def build_math_train_dataset(
     dataset: str = DEFAULT_MATH_DATASET,
     limit: int | None = None,
-    training_mode: str = "math",  # NEW
+    training_mode: str = DEFAULT_MATH_TRAINING_MODE,
 ) -> list[Prompt]:
     """Build the math training dataset for both YAML hooks and the example CLI."""
     resolved_dataset = _resolve_math_dataset(dataset)
@@ -445,6 +468,7 @@ def build_math_train_dataset(
                 "problem": row["problem"],
                 "final_answer": row["final_answer"],
                 "verifier": "numeric_exact",
+                "training_mode": training_mode,
             },
         )
         for row in rows
@@ -452,7 +476,7 @@ def build_math_train_dataset(
 def build_math_eval_dataset(
     dataset: str = DEFAULT_MATH_DATASET,
     limit: int | None = None,
-    training_mode: str = "math",  # NEW
+    training_mode: str = DEFAULT_MATH_TRAINING_MODE,
 ) -> list[Prompt]:
     """Build the held-out math evaluation dataset."""
     resolved_dataset = _resolve_math_dataset(dataset)
@@ -480,6 +504,7 @@ def build_math_eval_dataset(
                 "problem": row["problem"],
                 "final_answer": row["final_answer"],
                 "verifier": "numeric_exact",
+                "training_mode": training_mode,
             },
         )
         for row in rows
@@ -721,7 +746,11 @@ def _compute_math_score(rollout: RolloutOutput, training_mode: str = "math", deb
             flush=True
         )
     return result
-def math_reward_fn(rollout: RolloutOutput, training_mode: str = "reasoning", debug_reward: bool = False) -> RewardOutput:
+def math_reward_fn(
+    rollout: RolloutOutput,
+    training_mode: str | None = None,
+    debug_reward: bool = False,
+) -> RewardOutput:
     """Compute math reward from rollout metadata.
     Args:
         rollout: Rollout output with completion and metadata
@@ -732,16 +761,20 @@ def math_reward_fn(rollout: RolloutOutput, training_mode: str = "reasoning", deb
     In "math" mode: Only checks answer correctness (0-1.0 range)
     In "reasoning" mode: Combines 70% reasoning score + 30% math score
     """
+    resolved_training_mode = _resolve_math_training_mode(
+        explicit_training_mode=training_mode,
+        prompt_metadata=_prompt_metadata_from_rollout(rollout),
+    )
     return _compute_math_score(
         rollout,
-        training_mode=training_mode,
+        training_mode=resolved_training_mode,
         debug_reward=debug_reward,
     )
 
 
 def build_math_reward_fn(
     *,
-    training_mode: str = "reasoning",
+    training_mode: str | None = None,
     debug_reward: bool = False,
 ):
     """Build a reward callable for config-driven launches."""
@@ -804,18 +837,29 @@ def reasoning_rollout_fn(
 def build_math_rollout(
     *,
     rollout_mode: str,
-    training_mode: str,
+    training_mode: str | None = None,
     system_prompt: str | None = None,
 ):
     """Return either the example blackbox rollout or the traced whitebox rollout."""
-    if rollout_mode == "whitebox":
+    if rollout_mode == "whitebox" and training_mode is not None:
+        resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
         return build_math_whitebox_agent(
             training_mode=training_mode,
-            system_prompt=system_prompt,
+            system_prompt=resolved_system_prompt,
         )
-    resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
 
     def rollout_fn(prompts: list[Prompt], serving_backend):
+        resolved_training_mode = _resolve_math_training_mode(
+            explicit_training_mode=training_mode,
+            prompts=prompts,
+        )
+        resolved_system_prompt = system_prompt or build_math_system_prompt(resolved_training_mode)
+        if rollout_mode == "whitebox":
+            agent = build_math_whitebox_agent(
+                training_mode=resolved_training_mode,
+                system_prompt=resolved_system_prompt,
+            )
+            return agent.run_batch(prompts, serving_backend)
         return reasoning_rollout_fn(
             prompts,
             serving_backend,
@@ -842,12 +886,26 @@ def find_default_vllm_python() -> str | None:
     except Exception:
         return None
     return str(current_python)
-def prepare_reasoning_environment(config_path: str, profile: str | None = None) -> None:
+def _config_uses_vllm(config_path: str | Path) -> bool:
+    """Return whether one example config selects the vLLM serving backend."""
+    with open(config_path, encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        return False
+    framework = payload.get("framework")
+    if not isinstance(framework, dict):
+        return False
+    serving = framework.get("serving")
+    if not isinstance(serving, dict):
+        return False
+    return serving.get("backend") == "vllm"
+
+
+def prepare_reasoning_environment(config_path: str | Path) -> None:
     """Populate example-only env defaults before YAML config loading."""
-    del config_path
     if os.environ.get("FLASHRL_VLLM_PYTHON"):
         return
-    if profile != "vllm":
+    if not _config_uses_vllm(config_path):
         return
     # This keeps the example one-command friendly when the repo's dedicated vLLM
     # runtime exists, without forcing users to hardcode runtime_python by hand.
@@ -863,11 +921,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help="Path to the FlashRL config.yaml file.",
-    )
-    parser.add_argument(
-        "--profile",
-        default=None,
-        help="Optional config profile override, for example `vllm`.",
     )
     parser.add_argument(
         "--dataset",
@@ -901,10 +954,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
     )
     return parser
 def main(argv: list[str] | None = None) -> int:
-    """Run the math example from the selected FlashRL profile."""
+    """Run the math example from the selected FlashRL config file."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    prepare_reasoning_environment(args.config, args.profile)
+    prepare_reasoning_environment(args.config)
     flashrl: FlashRL | None = None
     try:
         dataset = build_math_train_dataset(
@@ -923,7 +976,6 @@ def main(argv: list[str] | None = None) -> int:
             return math_reward_fn(rollout, training_mode=args.training_mode, debug_reward=args.debug_reward)
         flashrl = FlashRL(
             config_path=args.config,
-            config_profile=args.profile,
             rollout_fn=rollout_impl,
             reward_fn=reward_fn_with_mode,
         )
@@ -935,7 +987,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(
-            "If you're offline or have network issues, use a local model in the YAML profile "
+            "If you're offline or have network issues, use a local model in the selected YAML config "
             "and make sure Hugging Face dataset access is available.",
             file=sys.stderr,
         )

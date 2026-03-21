@@ -774,7 +774,7 @@ def write_yaml_run_config(
     return config_path
 
 
-def write_profile_run_config(
+def write_explicit_run_config(
     tmp_path: Path,
     *,
     log_dir: Path,
@@ -788,8 +788,8 @@ def write_profile_run_config(
     serving_backend: str = "huggingface",
     runtime_python: str | None = None,
 ) -> Path:
-    """Write a temporary hook-less profile config for constructor-based tests."""
-    config_path = tmp_path / "profile.yaml"
+    """Write a temporary hook-less config for constructor-based tests."""
+    config_path = tmp_path / "run-config.yaml"
     if tensorboard_enabled is None:
         tensorboard_enabled = metrics_enabled
 
@@ -1361,15 +1361,15 @@ def test_flashrl_from_yaml_loads_hooks_and_supports_dataset_loader(
     assert trainer._run_logger.run_dir.exists()
 
 
-def test_flashrl_profile_constructor_loads_hookless_config_path(
+def test_flashrl_explicit_config_constructor_loads_hookless_config_path(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """FlashRL(config_path=...) should load a hook-less profile and train on an explicit dataset."""
+    """FlashRL(config_path=...) should load a hook-less config and train on an explicit dataset."""
     patch_backends(monkeypatch)
-    config_path = write_profile_run_config(
+    config_path = write_explicit_run_config(
         tmp_path,
-        log_dir=tmp_path / "profile-logs",
+        log_dir=tmp_path / "explicit-config-logs",
         common_dtype="float16",
         serving_num_threads=3,
         training_num_threads=5,
@@ -1377,7 +1377,7 @@ def test_flashrl_profile_constructor_loads_hookless_config_path(
 
     trainer = FlashRL(
         config_path=config_path,
-        rollout_fn=make_rollout_fn(response_suffix="profile", repeat=2),
+        rollout_fn=make_rollout_fn(response_suffix="explicit-config", repeat=2),
         reward_fn=reward_fn,
     )
     trainer.train(["prompt 0", "prompt 1"])
@@ -1392,11 +1392,11 @@ def test_flashrl_profile_constructor_loads_hookless_config_path(
     assert trainer._run_logger.run_dir.exists()
 
 
-def test_flashrl_profile_constructor_accepts_run_config_dict_and_expands_env_vars(
+def test_flashrl_explicit_config_constructor_accepts_run_config_dict_and_expands_env_vars(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """The profile constructor should also accept a dict and expand env vars."""
+    """The explicit-config constructor should also accept a dict and expand env vars."""
     patch_backends(monkeypatch)
     monkeypatch.setenv("FLASHRL_TEST_RUNTIME_PYTHON", "/tmp/fake-vllm-python")
     run_config = {
@@ -1447,13 +1447,13 @@ def test_flashrl_profile_constructor_accepts_run_config_dict_and_expands_env_var
     assert trainer.serving_config.num_replicas == 2
 
 
-def test_flashrl_profile_constructor_rejects_mixed_low_level_overrides(
+def test_flashrl_explicit_config_constructor_rejects_mixed_low_level_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Profile mode should fail fast when mixed with low-level model/config overrides."""
+    """Config-path mode should fail fast when mixed with low-level model/config overrides."""
     patch_backends(monkeypatch)
-    config_path = write_profile_run_config(
+    config_path = write_explicit_run_config(
         tmp_path,
         log_dir=tmp_path / "mixed-logs",
     )
@@ -1467,13 +1467,13 @@ def test_flashrl_profile_constructor_rejects_mixed_low_level_overrides(
         )
 
 
-def test_flashrl_profile_constructor_rejects_scalar_training_overrides(
+def test_flashrl_explicit_config_constructor_rejects_scalar_training_overrides(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Profile mode should also reject low-level scalar overrides like batch_size."""
+    """Config-path mode should also reject low-level scalar overrides like batch_size."""
     patch_backends(monkeypatch)
-    config_path = write_profile_run_config(
+    config_path = write_explicit_run_config(
         tmp_path,
         log_dir=tmp_path / "mixed-scalars-logs",
     )
@@ -1491,9 +1491,9 @@ def test_flashrl_from_yaml_requires_hooks_for_hook_driven_runs(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """FlashRL.from_yaml should reject hook-less profiles with a clear error."""
+    """FlashRL.from_yaml should reject hook-less explicit configs with a clear error."""
     patch_backends(monkeypatch)
-    config_path = write_profile_run_config(
+    config_path = write_explicit_run_config(
         tmp_path,
         log_dir=tmp_path / "hookless-logs",
     )
@@ -2041,7 +2041,10 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
     assert any(abs(loss) > 1e-6 for loss in losses)
     assert any(
         candidate["reward"]["accuracy_pass"] is not None
-        and candidate["reward"]["format_pass"] is not None
+        and (
+            "format_pass" not in candidate["reward"]
+            or candidate["reward"]["format_pass"] is not None
+        )
         and candidate["reward"]["pass_rate"] is not None
         and candidate["output"]["finish_reason"] is not None
         and candidate["output"]["avg_log_prob_per_token"] is not None
@@ -2096,7 +2099,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "python3 -m flashrl.examples.math.train" in root_docs
     assert "kubectl apply -f flashrl/platform/k8s/namespace.yaml" in root_docs
     assert "python3 -m flashrl platform render" in root_docs
-    assert "--profile minikube" in root_docs
+    assert "--profile" not in root_docs
     assert "Deployment" in Path("flashrl/platform/k8s/operator.yaml").read_text(encoding="utf-8")
     assert "TensorBoard is the default path" in docs
     assert "./dev.sh metrics up" in docs
@@ -2106,29 +2109,42 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "tensorboard --logdir logs" in docs
     assert "python3 -m flashrl.examples.math.train" in reasoning_docs
     assert "python3 -m flashrl.examples.math.eval" in reasoning_docs
-    assert "--profile vllm" in reasoning_docs
+    assert "--profile" not in reasoning_docs
     assert "config.yaml" in reasoning_docs
+    assert "config-vllm.yaml" in reasoning_docs
     assert "flashrl-job.yaml" in reasoning_docs
     assert "--dataset" in reasoning_docs
     assert "--train-limit" in reasoning_docs
     assert "--rollout-mode whitebox" in reasoning_docs
+    assert "Platform runs are config-driven" in reasoning_docs
+    assert "hooks.rollout_fn.kwargs.rollout_mode" in reasoning_docs
+    assert "rollout_mode: whitebox" in reasoning_docs
+    assert "dataset_fn.kwargs.training_mode" in reasoning_docs
+    assert "rollout and reward inherit it from prompt metadata by default" in reasoning_docs
     assert "python3 -m flashrl.examples.code_single_turn.train" in code_basic_docs
     assert "python3 -m flashrl.examples.code_single_turn.eval" in code_basic_docs
     assert "strict R1-style Codeforces prototype" in code_basic_docs
-    assert "--profile vllm" in code_basic_docs
+    assert "--profile" not in code_basic_docs
     assert "--run-timeout-seconds" in code_basic_docs
     assert "config.yaml" in code_basic_docs
+    assert "config-vllm.yaml" in code_basic_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
     assert "./dev.sh metrics reset" in docs
     assert "FLASHRL_VLLM_PYTHON" in docs
-    assert "python3 -m flashrl.examples.math.train --profile vllm" in root_docs
+    assert "python3 -m flashrl.examples.math.train --config flashrl/examples/math/config-vllm.yaml" in root_docs
     assert "flashrl.examples.math.train:build_math_train_dataset" in Path(
         "flashrl/examples/math/config.yaml"
     ).read_text(encoding="utf-8")
+    assert Path("flashrl/examples/math/config-vllm.yaml").exists()
+    assert Path("flashrl/examples/code_single_turn/config-vllm.yaml").exists()
+    assert Path("flashrl/platform/dev/math-minikube.yaml").exists()
 
     example_yaml = Path("flashrl/examples/math/config.yaml").read_text(
+        encoding="utf-8"
+    )
+    example_vllm_yaml = Path("flashrl/examples/math/config-vllm.yaml").read_text(
         encoding="utf-8"
     )
     code_example_yaml = Path(
@@ -2136,17 +2152,33 @@ def test_observability_stack_files_and_docs_exist() -> None:
     ).read_text(
         encoding="utf-8"
     )
+    code_example_vllm_yaml = Path(
+        "flashrl/examples/code_single_turn/config-vllm.yaml"
+    ).read_text(
+        encoding="utf-8"
+    )
+    minikube_yaml = Path("flashrl/platform/dev/math-minikube.yaml").read_text(
+        encoding="utf-8"
+    )
     pyproject = Path("pyproject.toml").read_text(encoding="utf-8")
     assert "framework:" in example_yaml
     assert "platform:" in example_yaml
-    assert "profiles:" in example_yaml
+    assert "profiles:" not in example_yaml
     assert "Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
-    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in example_yaml
-    assert "flashrl-runtime:minikube" in example_yaml
+    assert "Platform runs take math-example overrides from YAML here" in example_yaml
+    assert "rollout and reward inherit `training_mode` from prompt metadata by default" in example_yaml
+    assert "whitebox = agentic/traced rollout" in example_yaml
+    assert "blackbox = plain example rollout function" in example_yaml
+    assert "rollout_mode: whitebox" in example_yaml
+    assert "training_mode: math" in example_yaml
+    assert example_yaml.count("training_mode:") == 1
+    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in example_vllm_yaml
     assert "framework:" in code_example_yaml
-    assert "profiles:" in code_example_yaml
+    assert "profiles:" not in code_example_yaml
     assert "Qwen/Qwen2.5-Coder-0.5B" in code_example_yaml
-    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in code_example_yaml
+    assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in code_example_vllm_yaml
+    assert "flashrl-runtime:minikube" in minikube_yaml
+    assert "flashrl-e2e" in minikube_yaml
     assert 'requires-python = ">=3.10"' in pyproject
     assert '"tensorboard>=2.14.0"' in pyproject
     assert '[project.optional-dependencies]' in pyproject

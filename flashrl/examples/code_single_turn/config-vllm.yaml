@@ -6,9 +6,11 @@ framework:
 
   serving:
     model_name: Qwen/Qwen2.5-Coder-0.5B
-    backend: huggingface
+    backend: vllm
+    runtime_python: ${FLASHRL_VLLM_PYTHON}
+    num_replicas: 1
     num_threads: 1
-    debug_live_rollout: true
+    debug_live_rollout: false
 
   trainer:
     learning_rate: 1.0e-5
@@ -19,7 +21,7 @@ framework:
     group_size: 2
     clip_ratio: 0.2
     kl_coefficient: 0.0
-    max_new_tokens: 384
+    max_new_tokens: 1024
     temperature: 1.0
     top_p: 0.9
     top_k: 0

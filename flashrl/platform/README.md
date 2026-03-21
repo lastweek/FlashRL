@@ -4,10 +4,9 @@ FlashRL platform mode is raw-Kubernetes first.
 
 The primary workflow is:
 
-1. build images locally
-2. install the operator from committed YAML
-3. render one `FlashRLJob`
-4. apply it with `kubectl`
+1. build and push the FlashRL platform images
+2. render and apply one `FlashRLJob` from an explicit config file
+3. clean the FlashRL operator stack and jobs when done
 
 If you want the system picture before the code map, start here:
 
@@ -52,7 +51,66 @@ If you want the system picture before the code map, start here:
 - `dev/minikube.py`
   The local minikube E2E helper used by the opt-in smoke path.
 
-## Build Images
+## Raw Bash Workflow
+
+The repo now ships three direct bash scripts for a raw Kubernetes-first run:
+
+1. build and push the four platform images
+2. install the operator and run one job from `--config`
+3. clean up the FlashRL install and all FlashRL jobs
+
+Build images and write one image env file:
+
+```bash
+IMAGE_REGISTRY=ghcr.io/me/flashrl-dev \
+  bash scripts/build_platform_images.sh
+```
+
+If you are running on a local cluster, the build script also supports a no-registry local mode:
+
+```bash
+IMAGE_MODE=local LOCAL_CLUSTER_TYPE=minikube LOCAL_CLUSTER_PROFILE=minikube \
+  bash scripts/build_platform_images.sh
+```
+
+```bash
+IMAGE_MODE=local LOCAL_CLUSTER_TYPE=kind LOCAL_CLUSTER_NAME=kind \
+  bash scripts/build_platform_images.sh
+```
+
+```bash
+IMAGE_MODE=local LOCAL_CLUSTER_TYPE=docker-desktop \
+  bash scripts/build_platform_images.sh
+```
+
+Run one job from any combined config:
+
+```bash
+bash scripts/run_platform_job.sh \
+  --config flashrl/examples/math/config.yaml \
+  --image-env-file logs/platform-images/<tag>/flashrl-images.env
+```
+
+Example-specific knobs such as math dataset, train limit, training mode, and
+rollout mode are not forwarded from `train.py` CLI flags. For platform runs,
+set them in the selected config file under `framework.hooks.*.kwargs`.
+
+Clean the cluster-side FlashRL install and jobs:
+
+```bash
+bash scripts/cleanup_platform.sh
+```
+
+The launch script is raw:
+
+- it calls `python3 -m flashrl platform render`
+- it patches image refs from `--image-env-file`
+- it installs the committed CRD/RBAC/operator manifests with `kubectl`
+- it applies the rendered `FlashRLJob` with `kubectl`
+- it waits for `status.finishedAt`
+- it validates local-mode image env files against the current kubectl context
+
+## Manual Image Build
 
 ```bash
 docker build -f docker/operator.Dockerfile -t flashrl-operator:dev .
@@ -82,22 +140,25 @@ What this does:
 
 The runtime images are not started yet. They are only created after you apply a
 `FlashRLJob`. The rendered job YAML carries the runtime image refs from the
-selected config profile under `platform.images`.
+selected config file under `platform.images`.
 
 ## Render A Job
 
-The repo examples now use one `config.yaml` with:
+The public math example uses one combined config file:
 
-- `framework:` for FlashRL semantics
-- `platform:` for Kubernetes policy
-- `profiles:` for overrides such as `vllm` and `minikube`
+- `flashrl/examples/math/config.yaml` for the normal default config
+- `flashrl/platform/dev/math-minikube.yaml` for the local minikube smoke path
+
+In the public math config, platform-facing example behavior comes from
+`framework.hooks.*.kwargs`. That includes dataset choice, data limit, training
+mode, and rollout mode. The default config now uses `rollout_mode: whitebox`;
+change that field back to `blackbox` if you want the plain example rollout.
 
 Render one job:
 
 ```bash
 python3 -m flashrl platform render \
   --config flashrl/examples/math/config.yaml \
-  --profile minikube \
   --output flashrl-job.yaml
 ```
 
@@ -106,16 +167,16 @@ python3 -m flashrl platform render \
 ```bash
 kubectl apply -f flashrl-job.yaml
 kubectl get flashrljobs
-kubectl describe flashrljob flashrl-math-minikube
-kubectl logs -l flashrl.dev/job=flashrl-math-minikube
+kubectl describe flashrljob flashrl-math-demo -n default
+kubectl logs -n default -l flashrl.dev/job=flashrl-math-demo
 ```
 
 Convenience helpers still exist:
 
 ```bash
-python3 -m flashrl platform status flashrl-math-minikube --namespace flashrl-e2e
-python3 -m flashrl platform describe flashrl-math-minikube --namespace flashrl-e2e
-python3 -m flashrl platform cancel flashrl-math-minikube --namespace flashrl-e2e
+python3 -m flashrl platform status flashrl-math-demo --namespace default
+python3 -m flashrl platform describe flashrl-math-demo --namespace default
+python3 -m flashrl platform cancel flashrl-math-demo --namespace default
 ```
 
 ## Minikube Smoke Run
@@ -128,6 +189,6 @@ That helper:
 
 - builds the local images into minikube
 - installs the CRD and operator from `flashrl/platform/k8s/`
-- renders the math example with `--profile minikube`
+- renders the dev-only smoke config at `flashrl/platform/dev/math-minikube.yaml`
 - submits the job
 - waits for at least one completed training step

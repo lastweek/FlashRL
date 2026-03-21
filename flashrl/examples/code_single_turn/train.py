@@ -10,6 +10,7 @@ import re
 import shutil
 import sys
 from typing import Any, Callable
+import yaml
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLE_DIR.parents[3]
@@ -745,12 +746,26 @@ def find_default_vllm_python() -> str | None:
     return str(current_python)
 
 
-def prepare_reasoning_code_environment(config_path: str, profile: str | None = None) -> None:
-    """Populate example-only env defaults before profile loading."""
-    del config_path
+def _config_uses_vllm(config_path: str | Path) -> bool:
+    """Return whether one example config selects the vLLM serving backend."""
+    with open(config_path, encoding="utf-8") as handle:
+        payload = yaml.safe_load(handle) or {}
+    if not isinstance(payload, dict):
+        return False
+    framework = payload.get("framework")
+    if not isinstance(framework, dict):
+        return False
+    serving = framework.get("serving")
+    if not isinstance(serving, dict):
+        return False
+    return serving.get("backend") == "vllm"
+
+
+def prepare_reasoning_code_environment(config_path: str | Path) -> None:
+    """Populate example-only env defaults before config loading."""
     if os.environ.get("FLASHRL_VLLM_PYTHON"):
         return
-    if profile != "vllm":
+    if not _config_uses_vllm(config_path):
         return
 
     runtime_python = find_default_vllm_python()
@@ -770,11 +785,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
         "--config",
         default=str(DEFAULT_CONFIG_PATH),
         help="Path to the FlashRL config.yaml file.",
-    )
-    parser.add_argument(
-        "--profile",
-        default=None,
-        help="Optional config profile override, for example `vllm`.",
     )
     parser.add_argument(
         "--train-limit",
@@ -828,10 +838,10 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run the Codeforces reasoning-code example from the selected profile."""
+    """Run the Codeforces reasoning-code example from the selected config file."""
     parser = build_argument_parser()
     args = parser.parse_args(argv)
-    prepare_reasoning_code_environment(args.config, args.profile)
+    prepare_reasoning_code_environment(args.config)
 
     flashrl: FlashRL | None = None
     try:
@@ -844,7 +854,6 @@ def main(argv: list[str] | None = None) -> int:
         )
         flashrl = FlashRL(
             config_path=args.config,
-            config_profile=args.profile,
             rollout_fn=build_code_agent(),
             reward_fn=make_code_reward_fn(
                 run_timeout_seconds=float(args.run_timeout_seconds),

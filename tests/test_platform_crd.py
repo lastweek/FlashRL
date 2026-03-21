@@ -67,10 +67,16 @@ def _job_payload() -> dict[str, object]:
     }
 
 
-def _write_combined_config(tmp_path: Path) -> Path:
-    config_path = tmp_path / "config.yaml"
+def _write_combined_config(
+    tmp_path: Path,
+    *,
+    file_name: str = "config.yaml",
+    job_name: str = "demo-job",
+    namespace: str = "flashrl",
+) -> Path:
+    config_path = tmp_path / file_name
     config_path.write_text(
-        """
+        f"""
 framework:
   actor:
     model_name: fake/model
@@ -93,8 +99,8 @@ framework:
       import: tests.platform_hooks:build_dataset
 platform:
   job:
-    name: demo-job
-    namespace: flashrl
+    name: {job_name}
+    namespace: {namespace}
   images:
     runtime: ghcr.io/flashrl/flashrl-runtime:sha-deadbeef
     serving: ghcr.io/flashrl/flashrl-serving-vllm:sha-deadbeef
@@ -124,12 +130,6 @@ platform:
       uriPrefix: checkpoints
     weights:
       uriPrefix: weights
-profiles:
-  minikube:
-    platform:
-      job:
-        name: demo-job-minikube
-        namespace: flashrl-e2e
 """,
         encoding="utf-8",
     )
@@ -293,6 +293,49 @@ def test_platform_readme_matches_simplified_runtime_layout() -> None:
     assert "runtime/pod.py" not in content
     assert "runtime/platform_shim_controller.py" in content
     assert "runtime/platform_shim_common.py" in content
+    assert "scripts/build_platform_images.sh" in content
+    assert "scripts/run_platform_job.sh" in content
+    assert "scripts/cleanup_platform.sh" in content
+    assert "--image-env-file" in content
+    assert "--profile" not in content
+    assert "profiles:" not in content
+    assert "IMAGE_MODE=local" in content
+    assert "LOCAL_CLUSTER_TYPE=minikube" in content
+    assert "LOCAL_CLUSTER_TYPE=kind" in content
+    assert "LOCAL_CLUSTER_TYPE=docker-desktop" in content
+    assert "flashrl/platform/dev/math-minikube.yaml" in content
+
+
+def test_platform_bash_scripts_parse_cleanly() -> None:
+    """The raw platform bash scripts should at least pass shell syntax checks."""
+    root = Path(__file__).resolve().parents[1]
+    scripts = [
+        root / "scripts/build_platform_images.sh",
+        root / "scripts/run_platform_job.sh",
+        root / "scripts/cleanup_platform.sh",
+    ]
+    for script in scripts:
+        assert script.exists()
+        subprocess.run(["bash", "-n", str(script)], check=True)
+
+
+def test_platform_run_and_cleanup_scripts_log_commands_readably() -> None:
+    """The run and cleanup scripts should keep curated command logging helpers."""
+    root = Path(__file__).resolve().parents[1]
+    run_script = (root / "scripts/run_platform_job.sh").read_text(encoding="utf-8")
+    cleanup_script = (root / "scripts/cleanup_platform.sh").read_text(encoding="utf-8")
+
+    for content in (run_script, cleanup_script):
+        assert "log_info() {" in content
+        assert "log_cmd() {" in content
+        assert "run_cmd() {" in content
+        assert "[cmd]" in content
+        assert "[info]" in content
+
+    assert "capture_cmd() {" in run_script
+    assert "run_labeled_cmd() {" in run_script
+    assert "run_cmd_stdout_to_file() {" in run_script
+    assert "run_cmd_all_to_file() {" in run_script
 
 
 def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
@@ -548,9 +591,14 @@ def test_flashrl_platform_render_cli_builds_job_from_single_config(
     assert "userCode:" in output
 
 
-def test_flashrl_platform_render_cli_supports_profiles_and_output_file(tmp_path: Path) -> None:
-    """Render should accept one config plus one optional profile and file output."""
-    config_path = _write_combined_config(tmp_path)
+def test_flashrl_platform_render_cli_supports_output_file(tmp_path: Path) -> None:
+    """Render should accept one explicit config file and one explicit output path."""
+    config_path = _write_combined_config(
+        tmp_path,
+        file_name="config.e2e.yaml",
+        job_name="demo-job-e2e",
+        namespace="flashrl-e2e",
+    )
     output_path = tmp_path / "job.yaml"
 
     exit_code = platform_main(
@@ -559,8 +607,6 @@ def test_flashrl_platform_render_cli_supports_profiles_and_output_file(tmp_path:
             "render",
             "--config",
             str(config_path),
-            "--profile",
-            "minikube",
             "--output",
             str(output_path),
         ]
@@ -568,20 +614,40 @@ def test_flashrl_platform_render_cli_supports_profiles_and_output_file(tmp_path:
 
     assert exit_code == 0
     rendered = output_path.read_text(encoding="utf-8")
-    assert "name: demo-job-minikube" in rendered
+    assert "name: demo-job-e2e" in rendered
     assert "namespace: flashrl-e2e" in rendered
     assert "kind: FlashRLJob" in rendered
 
 
-def test_flashrl_config_profiles_merge_platform_overrides(tmp_path: Path) -> None:
-    """The combined config loader should deep-merge the selected profile."""
-    config_path = _write_combined_config(tmp_path)
-    merged = FlashRLConfig.from_yaml(config_path, profile="minikube")
+def test_flashrl_config_rejects_legacy_profiles_section(tmp_path: Path) -> None:
+    """Top-level legacy profiles should fail with a direct migration error."""
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(
+        """
+framework:
+  actor:
+    model_name: fake/model
+    backend: huggingface
+  serving:
+    model_name: fake/model
+    backend: huggingface
+  trainer:
+    batch_size: 4
+    max_epochs: 1
+  grpo:
+    group_size: 2
+    kl_coefficient: 0.0
+profiles:
+  minikube:
+    framework:
+      trainer:
+        batch_size: 2
+""",
+        encoding="utf-8",
+    )
 
-    assert merged.framework.actor.model_name == "fake/model"
-    assert merged.platform is not None
-    assert merged.platform["job"]["name"] == "demo-job-minikube"
-    assert merged.platform["job"]["namespace"] == "flashrl-e2e"
+    with pytest.raises(ValueError, match="Top-level `profiles` is no longer supported"):
+        FlashRLConfig.from_yaml(config_path)
 
 
 def test_flashrl_platform_render_requires_platform_section(tmp_path: Path) -> None:

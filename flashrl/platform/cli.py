@@ -20,8 +20,8 @@ def _load_job_file(path: str | Path) -> FlashRLJob:
     return FlashRLJob.model_validate(payload)
 
 
-def _load_job_from_config(*, config: str, profile: str | None) -> FlashRLJob:
-    resolved = load_flashrl_config(config, profile=profile)
+def _load_job_from_config(*, config: str) -> FlashRLJob:
+    resolved = load_flashrl_config(config)
     if resolved.platform is None:
         raise ValueError("`flashrl platform render` requires a top-level `platform:` section.")
     return build_flashrl_job(
@@ -44,7 +44,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
 
     render = platform_subparsers.add_parser("render", help="Render one FlashRLJob from one config file")
     render.add_argument("--config", required=True, help="Path to one FlashRL config.yaml file.")
-    render.add_argument("--profile", default=None, help="Optional config profile to apply.")
     render.add_argument("--output", default=None, help="Optional path to write rendered YAML.")
     render.add_argument(
         "--children",
@@ -55,7 +54,6 @@ def build_argument_parser() -> argparse.ArgumentParser:
     submit = platform_subparsers.add_parser("submit", help="Submit one FlashRLJob")
     submit.add_argument("--file", help="Path to a FlashRLJob YAML file.")
     submit.add_argument("--config", help="Path to one FlashRL config.yaml file.")
-    submit.add_argument("--profile", default=None, help="Optional config profile to apply.")
     submit.add_argument("--namespace", default=None)
     submit.add_argument(
         "--render-only",
@@ -96,7 +94,6 @@ def main(argv: list[str] | None = None) -> int:
     if args.platform_command == "render":
         job = _load_job_from_config(
             config=str(args.config),
-            profile=getattr(args, "profile", None),
         )
         if args.children:
             payload = json.dumps(render_job_resources(job), indent=2)
@@ -114,7 +111,6 @@ def main(argv: list[str] | None = None) -> int:
         elif getattr(args, "config", None):
             job = _load_job_from_config(
                 config=str(args.config),
-                profile=getattr(args, "profile", None),
             )
         else:
             raise ValueError("Pass either --file or --config.")

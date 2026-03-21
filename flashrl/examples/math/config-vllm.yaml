@@ -1,14 +1,15 @@
 framework:
   actor:
-    model_name: Qwen/Qwen2.5-Coder-0.5B
+    model_name: Qwen/Qwen2.5-0.5B
     backend: huggingface
     num_threads: 1
 
   serving:
-    model_name: Qwen/Qwen2.5-Coder-0.5B
-    backend: huggingface
-    num_threads: 1
-    debug_live_rollout: true
+    model_name: Qwen/Qwen2.5-0.5B
+    backend: vllm
+    runtime_python: ${FLASHRL_VLLM_PYTHON}
+    num_replicas: 1
+    debug_live_rollout: false
 
   trainer:
     learning_rate: 1.0e-5
@@ -19,7 +20,7 @@ framework:
     group_size: 2
     clip_ratio: 0.2
     kl_coefficient: 0.0
-    max_new_tokens: 384
+    max_new_tokens: 1024
     temperature: 1.0
     top_p: 0.9
     top_k: 0
@@ -44,3 +45,18 @@ framework:
 
   admin:
     admin_enabled: true
+
+  hooks:
+    dataset_fn:
+      import: flashrl.examples.math.train:build_math_train_dataset
+      kwargs:
+        dataset: gsm8k
+        limit: 8
+        training_mode: reasoning
+    rollout_fn:
+      import: flashrl.examples.math.train:build_math_rollout
+      kwargs:
+        rollout_mode: blackbox
+    reward_fn:
+      import: flashrl.examples.math.train:build_math_reward_fn
+      kwargs: {}

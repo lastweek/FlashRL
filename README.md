@@ -3,7 +3,7 @@
 FlashRL is a learning-first RL project for LLM post-training. The repo now has
 two primary workflows:
 
-- local runs from one example `config.yaml`
+- local runs from explicit example config files
 - Kubernetes runs by rendering one `FlashRLJob` and applying it with `kubectl`
 
 ## Install
@@ -24,16 +24,16 @@ Math example:
 
 ```bash
 python3 -m flashrl.examples.math.train
-python3 -m flashrl.examples.math.train --profile vllm
-python3 -m flashrl.examples.math.eval --profile vllm
+python3 -m flashrl.examples.math.train --config flashrl/examples/math/config-vllm.yaml
+python3 -m flashrl.examples.math.eval --config flashrl/examples/math/config-vllm.yaml
 ```
 
 Code example:
 
 ```bash
 python3 -m flashrl.examples.code_single_turn.train
-python3 -m flashrl.examples.code_single_turn.train --profile vllm
-python3 -m flashrl.examples.code_single_turn.eval --profile vllm
+python3 -m flashrl.examples.code_single_turn.train --config flashrl/examples/code_single_turn/config-vllm.yaml
+python3 -m flashrl.examples.code_single_turn.eval --config flashrl/examples/code_single_turn/config-vllm.yaml
 ```
 
 Example docs:
@@ -77,7 +77,6 @@ Render one job:
 ```bash
 python3 -m flashrl platform render \
   --config flashrl/examples/math/config.yaml \
-  --profile minikube \
   --output flashrl-job.yaml
 ```
 
@@ -86,8 +85,8 @@ Apply and inspect it:
 ```bash
 kubectl apply -f flashrl-job.yaml
 kubectl get flashrljobs
-kubectl describe flashrljob flashrl-math-minikube
-kubectl logs -l flashrl.dev/job=flashrl-math-minikube
+kubectl describe flashrljob flashrl-math-demo -n default
+kubectl logs -n default -l flashrl.dev/job=flashrl-math-demo
 ```
 
 Operator lifecycle:
