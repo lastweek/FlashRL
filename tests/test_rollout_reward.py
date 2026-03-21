@@ -184,9 +184,9 @@ def test_agent_rollout_generator_generate_grouped_is_prompt_major_and_validates_
     ]
     assert [rollout.text for rollout in rollouts] == [
         "generated::prompt 0::0",
-        "generated::prompt 0::2",
+        "generated::prompt 0::1",
+        "generated::prompt 1::0",
         "generated::prompt 1::1",
-        "generated::prompt 1::3",
     ]
     assert prompt_indices == [0, 0, 1, 1]
     assert candidate_indices == [0, 1, 0, 1]

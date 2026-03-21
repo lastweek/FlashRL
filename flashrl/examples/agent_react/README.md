@@ -3,6 +3,12 @@
 This example shows how to build a reusable ReAct recipe directly in example
 code without relying on any public preset API.
 
+Positioning:
+
+- this is an optional recipe/reference example
+- it is not part of the primary agent learning ladder
+- use it when you specifically want a ReAct parsing pattern in plain Python
+
 It demonstrates:
 
 - `Agent(run_fn=...)`

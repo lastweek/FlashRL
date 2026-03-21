@@ -73,6 +73,24 @@ class AssistantTurn(BaseModel):
     response_token_logprobs: list[float]
 
 
+class AgentTraceEvent(BaseModel):
+    """One structured non-trainable harness trace event."""
+
+    event_type: str
+    step_index: int | None = None
+    prompt_index: int | None = None
+    candidate_index: int | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class AgentTrace(BaseModel):
+    """Structured harness trace kept alongside the replayable conversation."""
+
+    events: list[AgentTraceEvent] = Field(default_factory=list)
+    subagents: list[dict[str, Any]] = Field(default_factory=list)
+    metadata: dict[str, Any] = Field(default_factory=dict)
+
+
 class RolloutOutput(BaseModel):
     """Output from rollout generation."""
 
@@ -83,6 +101,7 @@ class RolloutOutput(BaseModel):
     response_token_logprobs: list[float]
     assistant_turns: list[AssistantTurn] = Field(default_factory=list)
     conversation: Conversation
+    agent_trace: AgentTrace = Field(default_factory=AgentTrace)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 

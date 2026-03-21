@@ -180,9 +180,17 @@ def test_framework_agent_toolbox_exports_expected_primitives(tmp_path: Path) -> 
         assert agent.Agent.__name__ == "Agent"
         assert agent.AgentSample.__name__ == "AgentSample"
         assert agent.AgentState.__name__ == "AgentState"
+        assert agent.SessionContext.__name__ == "SessionContext"
         assert agent.BaseContextManager.__name__ == "BaseContextManager"
+        assert agent.CompactionManager.__name__ == "CompactionManager"
+        assert agent.CompactionPolicy.__name__ == "CompactionPolicy"
         assert agent.WindowedContextManager.__name__ == "WindowedContextManager"
+        assert agent.SkillManager.__name__ == "SkillManager"
+        assert agent.SubagentManager.__name__ == "SubagentManager"
+        assert agent.AgentToolExecutor.__name__ == "AgentToolExecutor"
         assert agent.Tool.__name__ == "Tool"
+        assert agent.ToolProfile.__name__ == "ToolProfile"
+        assert agent.ToolRegistry.__name__ == "ToolRegistry"
         assert agent.SubprocessToolRuntime.__name__ == "SubprocessToolRuntime"
         assert tools_shim.Tool is agent.Tool
         assert tools_shim.SubprocessToolRuntime is agent.SubprocessToolRuntime

@@ -1,0 +1,66 @@
+framework:
+  actor:
+    model_name: Qwen/Qwen2.5-0.5B
+    backend: huggingface
+    num_threads: 1
+
+  serving:
+    model_name: Qwen/Qwen2.5-0.5B
+    backend: vllm
+    runtime_python: ${FLASHRL_VLLM_PYTHON}
+    num_replicas: 1
+    debug_live_rollout: false
+
+  trainer:
+    learning_rate: 1.0e-5
+    batch_size: 2
+    max_epochs: 1
+
+  grpo:
+    group_size: 2
+    clip_ratio: 0.2
+    kl_coefficient: 0.0
+    max_new_tokens: 192
+    temperature: 0.8
+    top_p: 0.95
+    top_k: 0
+    do_sample: true
+
+  logging:
+    console: true
+    file: true
+    console_mode: compact
+
+  metrics:
+    enabled: true
+    tensorboard:
+      enabled: true
+    pushgateway:
+      enabled: false
+      url: http://localhost:9091
+      job_name: flashrl
+
+  checkpointing:
+    save_on_run_end: true
+
+  admin:
+    admin_enabled: true
+
+example:
+  dataset:
+    train_limit: 4
+    eval_limit: 2
+  harness:
+    tool_profile: default
+    enable_skills: true
+    enable_compaction: true
+    enable_subagents: true
+    scheduler_mode: dynamic
+    max_steps: 6
+    max_parallel_calls: 4
+    compaction_trigger_message_count: 10
+    compaction_preserve_recent_messages: 5
+    subagent_max_parallel: 2
+    subagent_max_per_parent_turn: 2
+    subagent_timeout_seconds: 10.0
+    pinned_skills: []

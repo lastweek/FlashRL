@@ -3,6 +3,12 @@
 This is a small whitebox example built directly from the core `Agent`
 building blocks.
 
+Role in the ladder:
+
+- start here for the basic `Agent` loop
+- use it when you want the smallest end-to-end example with fixed tools
+- do not use it as the reference for dynamic tool gating, skills, compaction, or subagents
+
 It demonstrates:
 
 - an explicit custom `run_fn(agent)`

@@ -2,6 +2,10 @@
 
 `flashrl.framework.agent` is the public toolbox for building whitebox agents.
 
+It provides generic building blocks. The assembled reference system lives in
+`flashrl.examples.agent_harness`, and the controlled comparison workflow lives
+in `flashrl.examples.agent_harness_ablation`.
+
 The mental model is:
 
 - `Agent` is both the rollout you pass to `FlashRL(..., rollout_fn=...)`
@@ -9,7 +13,9 @@ The mental model is:
 - FlashRL training routes `Agent` directly, while `agent([...], backend)` remains a manual convenience
 - system messages carry the agent policy and response contract
 - `Tool` and `SubprocessToolRuntime` are optional tool-execution building blocks
-- `WindowedContextManager` is an optional context-management helper
+- `ToolRegistry`, `ToolProfile`, and `AgentToolExecutor` support serious tool surfaces
+- `SkillManager`, `CompactionManager`, and `SubagentManager` support richer harnesses
+- `WindowedContextManager` remains the simplest context helper
 
 Typical usage:
 
@@ -30,7 +36,12 @@ assistant turn.
 
 The examples under `flashrl.examples` show this progression:
 
-- `flashrl.examples.agent_tools`: smallest custom loop
-- `flashrl.examples.agent_react`: reusable ReAct recipe built in normal example code
-- `flashrl.examples.agent_dynamic_tools`: dynamic tool gating plus context management
-- `flashrl.examples.math`: training-integrated whitebox rollout
+1. `flashrl.examples.agent_tools`: learn the smallest custom `Agent` loop with fixed tools
+2. `flashrl.examples.agent_dynamic_tools`: add dynamic tool gating and context management
+3. `flashrl.examples.agent_harness`: inspect the assembled reference agent harness
+4. `flashrl.examples.agent_harness_ablation`: compare harness variants systematically
+
+Additional examples:
+
+- `flashrl.examples.agent_react`: optional ReAct recipe/reference example outside the primary ladder
+- `flashrl.examples.math`: training-integrated whitebox rollout example

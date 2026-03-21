@@ -2,21 +2,29 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import dataclass, field
+import threading
 from typing import Any, Callable, Sequence
-from uuid import uuid4
 
 from flashrl.framework.agent.context import BaseContextManager
-from flashrl.framework.agent.tools import SubprocessToolRuntime, Tool
+from flashrl.framework.agent.session import SessionContext
+from flashrl.framework.agent.tools import (
+    AgentToolExecutor,
+    SubprocessToolRuntime,
+    Tool,
+    ToolProfile,
+    ToolRegistry,
+)
 from flashrl.framework.data_models import (
+    AgentTrace,
+    AgentTraceEvent,
     AssistantTurn,
     Conversation,
     Message,
     Prompt,
     RolloutOutput,
     ToolCall,
-    ToolResult,
 )
 
 
@@ -27,12 +35,24 @@ class AgentState:
     prompt: Prompt
     conversation: Conversation
     metadata: dict[str, Any] = field(default_factory=dict)
+    session_context: SessionContext | None = None
+    agent_trace: AgentTrace = field(default_factory=AgentTrace)
     assistant_turns: list[AssistantTurn] = field(default_factory=list)
     done: bool = False
     stop_reason: str | None = None
     final_text: str = ""
     last_assistant_text: str = ""
     last_sample: AgentSample | None = None
+
+    def __post_init__(self) -> None:
+        if self.session_context is None:
+            self.session_context = SessionContext(
+                conversation=self.conversation,
+                metadata=self.metadata,
+            )
+        else:
+            self.session_context.conversation = self.conversation
+            self.session_context.metadata = self.metadata
 
 
 @dataclass(frozen=True)
@@ -61,12 +81,157 @@ class AgentSample:
         )
 
 
-_ToolSource = Sequence[Tool] | Callable[[AgentState], Sequence[Tool]] | None
-_RunFn = Callable[["Agent"], Any]
+ResolvedToolSource = Sequence[Tool] | ToolRegistry
+ToolSource = ResolvedToolSource | Callable[[AgentState], ResolvedToolSource] | None
+RunFn = Callable[["Agent"], Any]
 
 
 class _AgentStop(RuntimeError):
     """Internal control-flow signal used to stop one live agent run."""
+
+
+@dataclass
+class _GroupedGenerationRequest:
+    """One pending generation request waiting for the grouped scheduler."""
+
+    runtime: "Agent"
+    prompt_text: str
+    step_index: int
+    prompt_index: int
+    candidate_index: int
+    future: Future[AgentSample] = field(default_factory=Future)
+
+
+class _GroupedAgentScheduler:
+    """Cooperative ready-trajectory scheduler for grouped whitebox rollouts."""
+
+    def __init__(
+        self,
+        *,
+        serving_backend: Any,
+        group_size: int,
+        active_runtime_count: int,
+    ) -> None:
+        self.serving_backend = serving_backend
+        self.group_size = group_size
+        self._active_runtime_count = active_runtime_count
+        self._pending_requests: list[_GroupedGenerationRequest] = []
+        self._condition = threading.Condition()
+        self._error: BaseException | None = None
+
+    def submit(
+        self,
+        runtime: "Agent",
+        *,
+        prompt_text: str,
+        step_index: int,
+    ) -> AgentSample:
+        if runtime.state.session_context.prompt_index is None:
+            raise RuntimeError("Grouped agent runtime is missing prompt_index.")
+        if runtime.state.session_context.candidate_index is None:
+            raise RuntimeError("Grouped agent runtime is missing candidate_index.")
+        request = _GroupedGenerationRequest(
+            runtime=runtime,
+            prompt_text=prompt_text,
+            step_index=step_index,
+            prompt_index=runtime.state.session_context.prompt_index,
+            candidate_index=runtime.state.session_context.candidate_index,
+        )
+        with self._condition:
+            if self._error is not None:
+                raise RuntimeError("Grouped scheduler has already failed.") from self._error
+            self._pending_requests.append(request)
+            self._condition.notify_all()
+        return request.future.result()
+
+    def mark_runtime_finished(self, error: BaseException | None = None) -> None:
+        with self._condition:
+            if error is not None and self._error is None:
+                self._error = error
+            self._active_runtime_count -= 1
+            self._condition.notify_all()
+
+    def run(self) -> None:
+        while True:
+            batch = self._wait_for_batch()
+            if not batch:
+                break
+            self._dispatch_batch(batch)
+        if self._error is not None:
+            raise RuntimeError("Grouped agent scheduling failed.") from self._error
+
+    def _wait_for_batch(self) -> list[_GroupedGenerationRequest]:
+        with self._condition:
+            while not self._pending_requests and self._active_runtime_count > 0 and self._error is None:
+                self._condition.wait()
+            if self._error is not None:
+                pending = list(self._pending_requests)
+                self._pending_requests.clear()
+                for request in pending:
+                    if not request.future.done():
+                        request.future.set_exception(
+                            RuntimeError("Grouped scheduler aborted because another trajectory failed.")
+                        )
+                return []
+            if not self._pending_requests and self._active_runtime_count == 0:
+                return []
+            self._condition.wait(timeout=0.01)
+            batch = list(self._pending_requests)
+            self._pending_requests.clear()
+            return batch
+
+    def _dispatch_batch(self, batch: list[_GroupedGenerationRequest]) -> None:
+        remaining = list(batch)
+        grouped_requests: list[tuple[int, list[_GroupedGenerationRequest]]] = []
+        by_prompt: dict[int, list[_GroupedGenerationRequest]] = {}
+        for request in batch:
+            if request.step_index != 0:
+                continue
+            by_prompt.setdefault(request.prompt_index, []).append(request)
+        for prompt_index, requests in by_prompt.items():
+            if len(requests) != self.group_size:
+                continue
+            prompt_texts = {request.prompt_text for request in requests}
+            if len(prompt_texts) != 1:
+                continue
+            grouped_requests.append((prompt_index, sorted(requests, key=lambda item: item.candidate_index)))
+            remaining = [request for request in remaining if request.prompt_index != prompt_index]
+
+        try:
+            if grouped_requests:
+                grouped_prompts = [requests[0].prompt_text for _, requests in grouped_requests]
+                grouped_samples = self.serving_backend.generate_grouped(grouped_prompts, self.group_size)
+                for (_, requests), prompt_samples in zip(grouped_requests, grouped_samples, strict=True):
+                    for request, sample in zip(requests, prompt_samples, strict=True):
+                        agent_sample = AgentSample.from_backend_sample(sample)
+                        request.runtime.record_trace_event(
+                            "scheduler_batch",
+                            payload={
+                                "mode": "grouped_step0",
+                                "batch_size": len(grouped_prompts),
+                                "group_size": self.group_size,
+                            },
+                        )
+                        request.future.set_result(agent_sample)
+
+            if remaining:
+                prompts = [request.prompt_text for request in remaining]
+                samples = self.serving_backend.generate_batch(prompts)
+                for request, sample in zip(remaining, samples, strict=True):
+                    agent_sample = AgentSample.from_backend_sample(sample)
+                    request.runtime.record_trace_event(
+                        "scheduler_batch",
+                        payload={
+                            "mode": "dynamic_batch",
+                            "batch_size": len(remaining),
+                        },
+                    )
+                    request.future.set_result(agent_sample)
+        except BaseException as exc:
+            self._error = exc
+            for request in batch:
+                if not request.future.done():
+                    request.future.set_exception(exc)
 
 
 class Agent:
@@ -79,13 +244,14 @@ class Agent:
 
     def __init__(
         self,
-        run_fn: _RunFn,
+        run_fn: RunFn,
         *,
-        tools: _ToolSource = None,
+        tools: ToolSource = None,
         context_manager: BaseContextManager | None = None,
         max_steps: int,
         runtime: SubprocessToolRuntime | None = None,
         max_parallel_calls: int = 4,
+        tool_executor: AgentToolExecutor | None = None,
     ) -> None:
         if max_steps < 1:
             raise ValueError("max_steps must be >= 1.")
@@ -97,7 +263,13 @@ class Agent:
         self.max_steps = max_steps
         self.runtime = runtime or SubprocessToolRuntime()
         self.max_parallel_calls = max_parallel_calls
-        if tools is not None and not callable(tools):
+        self.tool_executor = tool_executor or AgentToolExecutor(
+            runtime=self.runtime,
+            max_parallel_calls=max_parallel_calls,
+        )
+        if isinstance(tools, ToolRegistry):
+            pass
+        elif tools is not None and not callable(tools):
             self._validate_unique_tools(list(tools))
         self._is_runtime = False
         self._serving_backend: Any | None = None
@@ -105,15 +277,19 @@ class Agent:
         self._generation_count = 0
         self._pending_sample: AgentSample | None = None
         self._last_available_tool_names: list[str] = []
+        self._scheduler: _GroupedAgentScheduler | None = None
 
     @classmethod
     def _create_runtime(
         cls,
-        blueprint: Agent,
+        blueprint: "Agent",
         *,
         prompt: Prompt,
         serving_backend: Any,
-    ) -> Agent:
+        prompt_index: int | None = None,
+        candidate_index: int | None = None,
+        scheduler: _GroupedAgentScheduler | None = None,
+    ) -> "Agent":
         runtime = cls.__new__(cls)
         runtime.run_fn = blueprint.run_fn
         runtime.tools = blueprint.tools
@@ -121,15 +297,26 @@ class Agent:
         runtime.max_steps = blueprint.max_steps
         runtime.runtime = blueprint.runtime
         runtime.max_parallel_calls = blueprint.max_parallel_calls
+        runtime.tool_executor = blueprint.tool_executor
         runtime._is_runtime = True
         runtime._serving_backend = serving_backend
+        conversation = Conversation(messages=[Message(role="user", content=prompt.text)])
+        metadata: dict[str, Any] = {}
         runtime._state = AgentState(
             prompt=prompt,
-            conversation=Conversation(messages=[Message(role="user", content=prompt.text)]),
+            conversation=conversation,
+            metadata=metadata,
+            session_context=SessionContext(
+                conversation=conversation,
+                metadata=metadata,
+                prompt_index=prompt_index,
+                candidate_index=candidate_index,
+            ),
         )
         runtime._generation_count = 0
         runtime._pending_sample = None
         runtime._last_available_tool_names = []
+        runtime._scheduler = scheduler
         return runtime
 
     @property
@@ -138,6 +325,16 @@ class Agent:
         self._ensure_runtime_context("state")
         assert self._state is not None
         return self._state
+
+    @property
+    def session(self) -> SessionContext:
+        """Return the current structured session context."""
+        return self.state.session_context
+
+    @property
+    def agent_trace(self) -> AgentTrace:
+        """Return the current structured agent trace."""
+        return self.state.agent_trace
 
     @property
     def prompt(self) -> Prompt:
@@ -176,33 +373,75 @@ class Agent:
         """Run the traced agent loop once per prompt."""
         self._ensure_blueprint_context("run_batch")
         rollouts: list[RolloutOutput] = []
-        for prompt in prompts:
-            agent = self._create_runtime(
+        for prompt_index, prompt in enumerate(prompts):
+            runtime = self._create_runtime(
                 self,
                 prompt=prompt,
                 serving_backend=serving_backend,
+                prompt_index=prompt_index,
+                candidate_index=0,
             )
-            try:
-                self.run_fn(agent)
-            except _AgentStop:
-                pass
-
-            if agent._pending_sample is not None:
-                raise RuntimeError(
-                    "Agent run returned with an unrecorded sample. "
-                    "Call agent.record_generation(sample, ...) before finishing or returning."
-                )
-
-            state = agent.state
-            if state.stop_reason == "max_steps":
-                state.final_text = str(state.last_assistant_text)
-                state.done = True
-            elif not state.done:
-                state.final_text = str(state.last_assistant_text)
-                state.stop_reason = "run_returned"
-                state.done = True
-            rollouts.append(self._build_rollout_output(state))
+            self._run_runtime(runtime)
+            rollouts.append(self._build_rollout_output(runtime.state))
         return rollouts
+
+    def run_grouped(
+        self,
+        prompts: list[Prompt],
+        serving_backend: Any,
+        group_size: int,
+    ) -> tuple[list[Prompt], list[RolloutOutput], list[int], list[int]]:
+        """Run grouped whitebox rollouts with dynamic ready-trajectory batching."""
+        self._ensure_blueprint_context("run_grouped")
+        if group_size < 1:
+            raise ValueError("group_size must be >= 1.")
+        scheduler = _GroupedAgentScheduler(
+            serving_backend=serving_backend,
+            group_size=group_size,
+            active_runtime_count=len(prompts) * group_size,
+        )
+        runtimes: list[Agent] = []
+        threads: list[threading.Thread] = []
+        for prompt_index, prompt in enumerate(prompts):
+            for candidate_index in range(group_size):
+                runtime = self._create_runtime(
+                    self,
+                    prompt=prompt,
+                    serving_backend=serving_backend,
+                    prompt_index=prompt_index,
+                    candidate_index=candidate_index,
+                    scheduler=scheduler,
+                )
+                runtimes.append(runtime)
+                thread = threading.Thread(
+                    target=self._run_runtime_thread,
+                    args=(runtime, scheduler),
+                    daemon=True,
+                )
+                threads.append(thread)
+                thread.start()
+
+        scheduler.run()
+        for thread in threads:
+            thread.join()
+
+        flat_prompts: list[Prompt] = []
+        flat_rollouts: list[RolloutOutput] = []
+        prompt_indices: list[int] = []
+        candidate_indices: list[int] = []
+        for prompt_index, prompt in enumerate(prompts):
+            matching = [
+                runtime
+                for runtime in runtimes
+                if runtime.session.prompt_index == prompt_index
+            ]
+            matching.sort(key=lambda runtime: runtime.session.candidate_index or 0)
+            for runtime in matching:
+                flat_prompts.append(prompt)
+                flat_rollouts.append(self._build_rollout_output(runtime.state))
+                prompt_indices.append(prompt_index)
+                candidate_indices.append(runtime.session.candidate_index or 0)
+        return flat_prompts, flat_rollouts, prompt_indices, candidate_indices
 
     def available_tools(self) -> list[Tool]:
         """Resolve the current step-local tool set and record it for the trace."""
@@ -252,13 +491,21 @@ class Agent:
         if self._serving_backend is None:
             raise RuntimeError("Agent.generate() is only available inside run_fn(agent).")
 
-        samples = self._serving_backend.generate_batch([str(prompt)])
-        if len(samples) != 1:
-            raise ValueError(
-                "Agent.generate expected exactly one backend sample "
-                f"(got {len(samples)})."
+        if self._scheduler is not None:
+            sample = self._scheduler.submit(
+                self,
+                prompt_text=str(prompt),
+                step_index=self._generation_count,
             )
-        sample = AgentSample.from_backend_sample(samples[0])
+        else:
+            samples = self._serving_backend.generate_batch([str(prompt)])
+            if len(samples) != 1:
+                raise ValueError(
+                    "Agent.generate expected exactly one backend sample "
+                    f"(got {len(samples)})."
+                )
+            sample = AgentSample.from_backend_sample(samples[0])
+
         self._pending_sample = sample
         self._generation_count += 1
         return sample
@@ -303,31 +550,16 @@ class Agent:
         tool_calls: list[ToolCall],
         *,
         tools: Sequence[Tool] | None = None,
-    ) -> list[tuple[ToolCall, ToolResult]]:
+        executor: AgentToolExecutor | None = None,
+    ) -> list[tuple[ToolCall, Any]]:
         """Execute tools safely, record tool messages, and preserve declared order."""
         self._ensure_not_finished("run_tools")
         self._ensure_no_pending("run_tools")
         resolved_tools = list(tools) if tools is not None else self.available_tools()
-        self._validate_unique_tools(list(resolved_tools))
         if tools is not None:
             self._last_available_tool_names = [tool.name for tool in resolved_tools]
-        available_tool_map = self._build_tool_map(list(resolved_tools))
-        tool_results = self._execute_tool_calls(
-            tool_calls,
-            available_tool_map=available_tool_map,
-            prompt=self.state.prompt,
-        )
-        for tool_call, tool_result in tool_results:
-            tool_metadata = {
-                **dict(tool_result.metadata),
-                "tool_id": tool_call.tool_id,
-                "tool_name": tool_call.name,
-                "error": bool(tool_result.error),
-            }
-            if self._last_available_tool_names:
-                tool_metadata.setdefault("available_tool_names", list(self._last_available_tool_names))
-            self._append_message("tool", tool_result.content, metadata=tool_metadata)
-        return tool_results
+        active_executor = executor or self.tool_executor
+        return active_executor.execute(self, tool_calls, tools=resolved_tools)
 
     def add_message(
         self,
@@ -361,6 +593,24 @@ class Agent:
         self.state.final_text = str(text if text is not None else self.state.last_assistant_text)
         self.state.stop_reason = str(stop_reason)
         self.state.done = True
+
+    def record_trace_event(
+        self,
+        event_type: str,
+        *,
+        payload: dict[str, Any] | None = None,
+    ) -> None:
+        """Append one structured non-trainable trace event."""
+        self._ensure_runtime_context("record_trace_event")
+        self.state.agent_trace.events.append(
+            AgentTraceEvent(
+                event_type=str(event_type),
+                step_index=len(self.state.assistant_turns),
+                prompt_index=self.session.prompt_index,
+                candidate_index=self.session.candidate_index,
+                payload=dict(payload or {}),
+            )
+        )
 
     def _build_context_messages(self) -> list[Message]:
         self._ensure_runtime_context("build_prompt")
@@ -456,12 +706,15 @@ class Agent:
 
     def _resolve_tools(self, state: AgentState) -> list[Tool]:
         """Resolve the tool set visible to the current step."""
-        if self.tools is None:
+        source = self.tools
+        if source is None:
             return []
-        if callable(self.tools):
-            resolved_tools = list(self.tools(state))
-        else:
-            resolved_tools = list(self.tools)
+        if callable(source):
+            source = source(state)
+        if isinstance(source, ToolRegistry):
+            resolved_profile = str(state.session_context.tool_profile or ToolProfile.DEFAULT.value)
+            return source.resolve(state=state, profile=resolved_profile)
+        resolved_tools = list(source)
         self._validate_unique_tools(resolved_tools)
         return resolved_tools
 
@@ -472,10 +725,6 @@ class Agent:
             if tool.name in tool_names:
                 raise ValueError(f"Duplicate tool name: {tool.name}")
             tool_names.add(tool.name)
-
-    def _build_tool_map(self, tools: list[Tool]) -> dict[str, Tool]:
-        """Build one name-indexed tool map for the current step."""
-        return {tool.name: tool for tool in tools}
 
     def _record_visible_tools(
         self,
@@ -495,66 +744,52 @@ class Agent:
             state.conversation.metadata["visible_tools_by_step"] = conversation_visible_tools
         conversation_visible_tools.append(list(available_tool_names))
 
-    def _execute_tool_calls(
+        self.record_trace_event(
+            "tool_visibility",
+            payload={"tool_names": list(available_tool_names)},
+        )
+
+    def _run_runtime(self, runtime: "Agent") -> None:
+        try:
+            self.run_fn(runtime)
+        except _AgentStop:
+            pass
+
+        if runtime._pending_sample is not None:
+            raise RuntimeError(
+                "Agent run returned with an unrecorded sample. "
+                "Call agent.record_generation(sample, ...) before finishing or returning."
+            )
+
+        self._finalize_state(runtime.state)
+
+    def _run_runtime_thread(
         self,
-        tool_calls: list[ToolCall],
-        *,
-        available_tool_map: dict[str, Tool],
-        prompt: Prompt,
-    ) -> list[tuple[ToolCall, ToolResult]]:
-        """Execute one assistant step worth of tool calls."""
-        if not tool_calls:
-            return []
-        if len(tool_calls) > self.max_parallel_calls:
-            message = (
-                "Too many parallel tool calls requested "
-                f"(max {self.max_parallel_calls}, got {len(tool_calls)})."
-            )
-            return [
-                (
-                    ToolCall(name="parallel_limit", arguments={}, tool_id=uuid4().hex),
-                    ToolResult(
-                        content=message,
-                        error=True,
-                        metadata={"status": "parallel_limit"},
-                    ),
-                )
-            ]
+        runtime: "Agent",
+        scheduler: _GroupedAgentScheduler,
+    ) -> None:
+        error: BaseException | None = None
+        try:
+            self._run_runtime(runtime)
+        except BaseException as exc:
+            error = exc
+        finally:
+            scheduler.mark_runtime_finished(error)
 
-        def run_tool_call(tool_call: ToolCall) -> tuple[ToolCall, ToolResult]:
-            tool = available_tool_map.get(tool_call.name)
-            if tool is None:
-                return (
-                    tool_call,
-                    ToolResult(
-                        content=f"Tool not available on this step: {tool_call.name}",
-                        error=True,
-                        metadata={"status": "tool_unavailable"},
-                    ),
-                )
-            return (
-                tool_call,
-                self.runtime.execute(tool, arguments=tool_call.arguments, prompt=prompt),
-            )
-
-        with ThreadPoolExecutor(
-            max_workers=min(len(tool_calls), self.max_parallel_calls)
-        ) as executor:
-            return list(executor.map(run_tool_call, tool_calls))
+    def _finalize_state(self, state: AgentState) -> None:
+        if state.stop_reason == "max_steps":
+            state.final_text = str(state.last_assistant_text)
+            state.done = True
+        elif not state.done:
+            state.final_text = str(state.last_assistant_text)
+            state.stop_reason = "run_returned"
+            state.done = True
 
     def _build_rollout_output(self, state: AgentState) -> RolloutOutput:
         """Convert one finished state into the rollout shape expected by FlashRL."""
         last_sample = state.last_sample
-        final_prompt_token_ids = (
-            list(last_sample.prompt_token_ids)
-            if last_sample is not None
-            else []
-        )
-        final_response_token_ids = (
-            list(last_sample.response_token_ids)
-            if last_sample is not None
-            else []
-        )
+        final_prompt_token_ids = list(last_sample.prompt_token_ids) if last_sample is not None else []
+        final_response_token_ids = list(last_sample.response_token_ids) if last_sample is not None else []
         final_response_logprobs = (
             list(last_sample.response_token_logprobs)
             if last_sample is not None
@@ -568,6 +803,8 @@ class Agent:
             "prompt_metadata": dict(state.prompt.metadata),
             "stop_reason": state.stop_reason,
             "assistant_turn_count": len(state.assistant_turns),
+            "prompt_index": state.session_context.prompt_index,
+            "candidate_index": state.session_context.candidate_index,
         }
         return RolloutOutput(
             text=str(state.final_text),
@@ -577,5 +814,7 @@ class Agent:
             response_token_logprobs=final_response_logprobs,
             assistant_turns=list(state.assistant_turns),
             conversation=state.conversation,
+            agent_trace=state.agent_trace,
             metadata=rollout_metadata,
         )
+

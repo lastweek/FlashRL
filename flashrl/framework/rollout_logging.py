@@ -324,6 +324,9 @@ def build_rollout_record(
         response_text = str(getattr(rollout, "text", ""))
         prompt_token_count = len(getattr(rollout, "prompt_token_ids", []))
         response_token_count = len(getattr(rollout, "response_token_ids", []))
+        agent_trace = clone_json_mapping(
+            serialize_for_json(getattr(rollout, "agent_trace", {}))
+        )
 
         rollout_metadata = clone_json_mapping(
             serialize_for_json(getattr(rollout, "metadata", {}))
@@ -401,6 +404,7 @@ def build_rollout_record(
                         "metadata": remaining_reward_metadata,
                     }
                 ),
+                "agent_trace": compact_mapping(agent_trace),
                 }
             )
 

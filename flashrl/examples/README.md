@@ -2,15 +2,50 @@
 
 The canonical example surface is `flashrl.examples`.
 
-Module-first commands:
+## Primary Agent Ladder
+
+Start with these four examples in order:
+
+| Example | Teaches | Use it when | Intentionally not covered |
+| --- | --- | --- | --- |
+| `agent_tools` | Basic `Agent` loop, fixed tools, traced assistant/tool messages | You want the smallest end-to-end whitebox agent example | Dynamic tool gating, advanced managers, assembled harness behavior |
+| `agent_dynamic_tools` | Dynamic `tools(state)` gating and context control | You understand the basic loop and need step-local tool visibility | Skills, compaction, subagents, study orchestration |
+| `agent_harness` | A serious coding-oriented reference harness assembled from framework primitives | You want a usable reference system rather than another toy loop | Harness comparison workflow |
+| `agent_harness_ablation` | Controlled variant comparison for the reference harness | You want to compare harness configurations under one training/eval workflow | New agent-building primitives or another assembled harness |
+
+Optional recipe example:
+
+- `agent_react`: a ReAct-style parsing recipe in normal example code. Keep it as reference material, not part of the primary learning path.
+
+Other examples:
+
+- `math`: training-integrated whitebox rollout example
+- `code_single_turn`: single-turn code reasoning baseline
+- `mock_checkpointing`: checkpointing and runtime behavior smoke example
+
+## Module-First Commands
+
+Primary ladder:
+
+```bash
+python3 -m flashrl.examples.agent_tools.run
+python3 -m flashrl.examples.agent_dynamic_tools.run
+python3 -m flashrl.examples.agent_harness.train
+python3 -m flashrl.examples.agent_harness_ablation.train
+```
+
+Optional recipe:
+
+```bash
+python3 -m flashrl.examples.agent_react.run
+```
+
+Other examples:
 
 ```bash
 python3 -m flashrl.examples.math.train
 python3 -m flashrl.examples.math.train --config flashrl/examples/math/config-vllm.yaml
 python3 -m flashrl.examples.code_single_turn.train
-python3 -m flashrl.examples.agent_tools.run
-python3 -m flashrl.examples.agent_react.run
-python3 -m flashrl.examples.agent_dynamic_tools.run
 ```
 
 Example config layout is now explicit:
@@ -25,6 +60,11 @@ is available.
 
 Example docs:
 
+- [agent_tools/README.md](agent_tools/README.md)
+- [agent_dynamic_tools/README.md](agent_dynamic_tools/README.md)
+- [agent_harness/README.md](agent_harness/README.md)
+- [agent_harness_ablation/README.md](agent_harness_ablation/README.md)
+- [agent_react/README.md](agent_react/README.md)
 - [math/README.md](math/README.md)
 - [code_single_turn/README.md](code_single_turn/README.md)
 - [mock_checkpointing/README.md](mock_checkpointing/README.md)

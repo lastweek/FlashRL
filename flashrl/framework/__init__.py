@@ -24,6 +24,8 @@ from flashrl.framework.config import (
     TrainingConfig,
 )
 from flashrl.framework.data_models import (
+    AgentTrace,
+    AgentTraceEvent,
     AssistantTurn,
     Conversation,
     LearnerBatch,
@@ -115,6 +117,8 @@ __all__ = [
     "Prompt",
     "Message",
     "Conversation",
+    "AgentTraceEvent",
+    "AgentTrace",
     "AssistantTurn",
     "LearnerBatch",
     "ToolCall",
