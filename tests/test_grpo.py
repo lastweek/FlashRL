@@ -12,7 +12,7 @@ import torch
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
-from flashrl.framework.config import ServingConfig, TrainerConfig, TrainingConfig
+from flashrl.framework.config import ControllerConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
     LearnerBatch,
@@ -24,9 +24,9 @@ from flashrl.framework.data_models import (
 )
 from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.function import FunctionRolloutGenerator
-from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
-from flashrl.framework.trainer.grpo.grpo_helpers import compute_advantages, prompt_batch_size
-from flashrl.framework.trainer.grpo.loss_variants import assemble_grpo_loss
+from flashrl.framework.controller.grpo.controller import GRPOController
+from flashrl.framework.controller.grpo.grpo_helpers import compute_advantages, prompt_batch_size
+from flashrl.framework.controller.grpo.loss_variants import assemble_grpo_loss
 from flashrl.framework.data_models import LearnerBatch
 from tests.conftest import (
     TinyReferenceModel,
@@ -60,7 +60,7 @@ math_reward_fn = reasoning_math.math_reward_fn
 render_math_prompt = reasoning_math.render_math_prompt
 
 
-def build_trainer(
+def build_controller(
     *,
     batch_size: int = 4,
     group_size: int = 2,
@@ -70,8 +70,8 @@ def build_trainer(
     serving_backend=None,
     seed: int = 42,
     shuffle_each_epoch: bool = False,
-) -> GRPOTrainer:
-    """Build a small offline GRPO trainer for algorithm tests."""
+) -> GRPOController:
+    """Build a small offline GRPO controller for algorithm tests."""
     training_backend = TinyTrainingBackend(
         learning_rate=1e-2,
         group_size=group_size,
@@ -83,8 +83,8 @@ def build_trainer(
         config=SimpleNamespace(),
     )
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
-    return GRPOTrainer(
-        config=TrainerConfig(
+    return GRPOController(
+        config=ControllerConfig(
             batch_size=batch_size,
             max_epochs=1,
             seed=seed,
@@ -114,7 +114,7 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
         prompt_batches.append([prompt.text for prompt in prompts])
         return rollout_impl(prompts, serving_backend)
 
-    trainer = build_trainer(batch_size=4, group_size=2, rollout_fn=rollout_fn)
+    trainer = build_controller(batch_size=4, group_size=2, rollout_fn=rollout_fn)
     dataset = [Prompt(text=f"prompt {index}") for index in range(5)]
 
     trainer.train(dataset)
@@ -131,7 +131,7 @@ def test_grpo_batch_size_means_total_sampled_completions_per_step() -> None:
 
 
 def test_grpo_shuffles_dataset_each_epoch_when_enabled() -> None:
-    """Trainer should reshuffle prompt order deterministically from the configured seed."""
+    """Controller should reshuffle prompt order deterministically from the configured seed."""
     prompt_batches: list[list[str]] = []
     rollout_impl = make_rollout_fn(response_suffix="shuffle", repeat=1)
 
@@ -139,7 +139,7 @@ def test_grpo_shuffles_dataset_each_epoch_when_enabled() -> None:
         prompt_batches.append([prompt.text for prompt in prompts])
         return rollout_impl(prompts, serving_backend)
 
-    trainer = build_trainer(
+    trainer = build_controller(
         batch_size=4,
         group_size=2,
         rollout_fn=rollout_fn,
@@ -165,7 +165,7 @@ def test_grpo_shuffles_dataset_each_epoch_when_enabled() -> None:
 
 def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
     """Advantage normalization should be done independently for each prompt group."""
-    trainer = build_trainer(batch_size=4, group_size=2)
+    trainer = build_controller(batch_size=4, group_size=2)
 
     advantages = compute_advantages(
         [
@@ -183,7 +183,7 @@ def test_grpo_advantages_are_normalized_within_each_prompt_group() -> None:
 
 def test_grpo_compute_advantages_rejects_mismatched_group_shape() -> None:
     """Reward count must match prompt_count * group_size for grouped GRPO."""
-    trainer = build_trainer(batch_size=4, group_size=2)
+    trainer = build_controller(batch_size=4, group_size=2)
 
     with pytest.raises(ValueError, match="prompt_count \\* group_size"):
         compute_advantages(
@@ -213,8 +213,8 @@ def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None
         config=SimpleNamespace(),
     )
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
-    trainer = GRPOTrainer(
-        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
+    trainer = GRPOController(
+        config=ControllerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, clip_ratio=0.2, kl_coefficient=0.0),
         actor_backend=training_backend,
         reference_backend=None,
@@ -240,7 +240,7 @@ def test_grpo_controller_builds_learner_batch_before_training_optimize() -> None
 def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
     """Prompt-token-only logit changes should not affect the response-only GRPO loss."""
     reference = TinyReferenceModel()
-    trainer = build_trainer(batch_size=2, group_size=2, kl_coefficient=0.3, reference=reference)
+    trainer = build_controller(batch_size=2, group_size=2, kl_coefficient=0.3, reference=reference)
 
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     grouped_rollouts = make_rollout_fn(response_suffix="loss", repeat=2)(
@@ -331,7 +331,7 @@ def test_grpo_assemble_loss_uses_response_only_grpo_terms() -> None:
 
 def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
     """Stored rollout log-probs should line up exactly with each sampled response length."""
-    trainer = build_trainer(batch_size=2, group_size=2)
+    trainer = build_controller(batch_size=2, group_size=2)
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     grouped_rollouts = make_rollout_fn(response_suffix="align", repeat=2)(
         prompts,
@@ -384,7 +384,7 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
 
 def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
     """Flat rewards with beta=0 should collapse to zero policy and total loss."""
-    trainer = build_trainer(batch_size=2, group_size=2, kl_coefficient=0.0)
+    trainer = build_controller(batch_size=2, group_size=2, kl_coefficient=0.0)
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     rollouts = make_rollout_fn(response_suffix="zero", repeat=2)(
         prompts,
@@ -425,7 +425,7 @@ def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:
 
 def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
     """The example reward should separate GRPO candidates within one prompt group."""
-    trainer = build_trainer(batch_size=4, group_size=4)
+    trainer = build_controller(batch_size=4, group_size=4)
     prompt = Prompt(
         text=render_math_prompt("What is 15 + 27?"),
         metadata={
@@ -476,7 +476,7 @@ def test_reasoning_example_rewards_create_non_zero_group_advantages() -> None:
 
 def test_grpo_prepare_inputs_reuses_rollout_token_ids_without_tokenizer_calls() -> None:
     """Input preparation should use rollout token ids directly and avoid tokenizer calls."""
-    trainer = build_trainer(batch_size=4, group_size=2)
+    trainer = build_controller(batch_size=4, group_size=2)
     prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
     _, rollouts, _, _ = trainer.rollout_generator.generate_grouped(prompts, group_size=2)
     actor = trainer.training_backend.actor
@@ -596,7 +596,7 @@ def test_grpo_installs_and_clears_serving_debug_context_per_step() -> None:
             return None
 
     serving_backend = DebugServingBackend()
-    trainer = build_trainer(
+    trainer = build_controller(
         batch_size=2,
         group_size=2,
         serving_backend=serving_backend,
@@ -631,7 +631,7 @@ def test_function_rollout_generator_stamps_one_weight_version_on_all_outputs() -
 
 def test_grpo_rejects_mixed_rollout_weight_versions_in_one_batch() -> None:
     """One learner batch must not mix rollout candidates from different serving versions."""
-    trainer = build_trainer(batch_size=2, group_size=2)
+    trainer = build_controller(batch_size=2, group_size=2)
     conversation = Conversation(
         messages=[
             Message(role="user", content="prompt"),
@@ -685,7 +685,7 @@ def test_flashrl_rejects_batch_size_not_divisible_by_group_size(tmp_path) -> Non
         FlashRL(
             actor_config=TrainingConfig(model_name="fake/model"),
             serving_config=ServingConfig(model_name="fake/model"),
-            trainer_config=TrainerConfig(batch_size=3, max_epochs=1),
+            controller_config=ControllerConfig(batch_size=3, max_epochs=1),
             grpo_config=GrpoConfig(group_size=2),
             rollout_fn=make_rollout_fn(response_suffix="invalid", repeat=1),
             reward_fn=reward_fn,

@@ -28,7 +28,7 @@ def _job_payload() -> dict[str, object]:
             "framework": {
                 "actor": {"model_name": "fake/model", "backend": "huggingface"},
                 "serving": {"model_name": "fake/model", "backend": "huggingface"},
-                "trainer": {"batch_size": 4, "max_epochs": 1},
+                "controller": {"batch_size": 4, "max_epochs": 1},
                 "grpo": {"group_size": 2, "kl_coefficient": 0.0},
             },
             "dataset": {"type": "hook"},
@@ -51,7 +51,7 @@ def _job_payload() -> dict[str, object]:
 
 
 def test_run_controller_constructs_remote_clients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The controller runtime should instantiate GRPOTrainer with remote clients."""
+    """The controller runtime should instantiate GRPOController with remote clients."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     captured: dict[str, object] = {}
@@ -97,7 +97,7 @@ def test_run_controller_constructs_remote_clients(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(controller_module, "LearnerClient", _StubClient)
     monkeypatch.setattr(controller_module, "ServingClient", _StubClient)
     monkeypatch.setattr(controller_module, "FlashRLJobStatusWriter", _StubStatusWriter)
-    monkeypatch.setattr(controller_module, "GRPOTrainer", _StubTrainer)
+    monkeypatch.setattr(controller_module, "GRPOController", _StubTrainer)
     monkeypatch.setattr(controller_module, "load_controller_dataset", lambda job: [])
 
     controller_module.run_controller(job_path)
@@ -188,7 +188,7 @@ def test_run_controller_uses_static_runtime_spec_and_live_status(
     monkeypatch.setattr(controller_module, "LearnerClient", _StubClient)
     monkeypatch.setattr(controller_module, "ServingClient", _StubClient)
     monkeypatch.setattr(controller_module, "FlashRLJobStatusWriter", _StubStatusWriter)
-    monkeypatch.setattr(controller_module, "GRPOTrainer", _StubTrainer)
+    monkeypatch.setattr(controller_module, "GRPOController", _StubTrainer)
     monkeypatch.setattr(controller_module, "load_controller_dataset", _capture_dataset)
 
     controller_module.run_controller(job_path)

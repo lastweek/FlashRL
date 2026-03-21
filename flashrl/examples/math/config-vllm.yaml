@@ -11,7 +11,7 @@ framework:
     num_replicas: 1
     debug_live_rollout: false
 
-  trainer:
+  controller:
     learning_rate: 1.0e-5
     batch_size: 2
     max_epochs: 1

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from flashrl.framework.config import GrpoConfig
-from flashrl.framework.trainer.grpo.loss_variants import assemble_grpo_loss
+from flashrl.framework.controller.grpo.loss_variants import assemble_grpo_loss
 
 
 def create_test_data(batch_size=2, seq_len=10, vocab_size=100):

@@ -393,7 +393,7 @@ def _job_payload() -> dict[str, object]:
             "framework": {
                 "actor": {"model_name": "fake/model", "backend": "fsdp2", "dp_size": 2},
                 "serving": {"model_name": "fake/model", "backend": "huggingface"},
-                "trainer": {"batch_size": 4, "max_epochs": 1},
+                "controller": {"batch_size": 4, "max_epochs": 1},
                 "grpo": {"group_size": 2, "kl_coefficient": 0.0},
             },
             "dataset": {"type": "hook"},

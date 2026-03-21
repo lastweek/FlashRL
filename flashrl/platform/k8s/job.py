@@ -11,11 +11,11 @@ from flashrl.framework.config import BuilderSpec
 from flashrl.framework.config import (
     AdminConfig,
     CheckpointingConfig,
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 
@@ -218,7 +218,7 @@ class FrameworkSpec(BaseModel):
     actor: TrainingConfig
     reference: TrainingConfig | None = None
     serving: ServingConfig
-    trainer: TrainerConfig
+    controller: ControllerConfig
     grpo: GrpoConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)

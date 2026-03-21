@@ -1,4 +1,4 @@
-"""GRPO (Group Relative Policy Optimization) trainer."""
+"""GRPO (Group Relative Policy Optimization) controller."""
 
 from __future__ import annotations
 
@@ -7,7 +7,7 @@ from typing import TYPE_CHECKING, Any, Callable
 
 import torch
 
-from flashrl.framework.config import GrpoConfig, TrainerConfig
+from flashrl.framework.config import ControllerConfig, GrpoConfig
 from flashrl.framework.data_models import (
     LearnerBatch,
     Prompt,
@@ -46,7 +46,7 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.base import BaseRolloutGenerator
 from flashrl.framework.rollout_metrics import count_llm_call_rounds, count_tool_calls
 from flashrl.framework.training import OptimizationResult
-from flashrl.framework.trainer.grpo.grpo_helpers import (
+from flashrl.framework.controller.grpo.grpo_helpers import (
     STAGE_ORDER,
     StepContext,
     accumulate_totals,
@@ -65,12 +65,12 @@ if TYPE_CHECKING:
     from flashrl.framework.training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend
 
 
-class GRPOTrainer:
-    """GRPO trainer implementation with detailed step logging."""
+class GRPOController:
+    """GRPO controller implementation with detailed step logging."""
 
     def __init__(
         self,
-        config: TrainerConfig,
+        config: ControllerConfig,
         grpo_config: GrpoConfig,
         actor_backend: "ActorTrainingBackend | None",
         reference_backend: "ReferenceTrainingBackend | None",
@@ -86,7 +86,7 @@ class GRPOTrainer:
         serving: ServingService | ServingClient | None = None,
         reference_configured: bool | None = None,
     ) -> None:
-        """Initialize GRPO trainer."""
+        """Initialize GRPO controller."""
         self.config = config
         self.run_logger = run_logger
         self.metrics_sink = metrics_sink
@@ -130,7 +130,7 @@ class GRPOTrainer:
         self.run_logger = run_logger
 
     def reset_state(self) -> None:
-        """Reset per-run trainer state."""
+        """Reset per-run controller state."""
         self.current_epoch = 0
         self.total_steps = 0
         self._active_step_context = None
@@ -801,7 +801,7 @@ class GRPOTrainer:
         return controller_state, checkpoint_metadata
 
     def read_checkpoint_metadata(self, path: str) -> dict[str, Any] | None:
-        """Return checkpoint metadata without mutating trainer state."""
+        """Return checkpoint metadata without mutating controller state."""
         checkpoint = torch.load(path, weights_only=False)
         checkpoint_metadata = checkpoint.get("checkpoint_metadata")
         if isinstance(checkpoint_metadata, dict):

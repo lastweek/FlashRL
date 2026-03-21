@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from flashrl.framework.config import GrpoConfig
-from flashrl.framework.trainer.grpo.loss_variants import _apply_clipping
+from flashrl.framework.controller.grpo.loss_variants import _apply_clipping
 
 
 class TestSymmetricClipping:

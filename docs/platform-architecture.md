@@ -66,7 +66,7 @@ That means there is no separate controller image. Controller, rollout, and rewar
 
 | Pod | Platform software in the pod | What platform adds | Framework software used | User hook or backend |
 | --- | --- | --- | --- | --- |
-| controller | `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop, and open the shared framework run logger/metrics lifecycle under a job-scoped log root | `flashrl.framework.train_runtime`, `RunLogger`, metrics sinks, `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
+| controller | `PlatformShimController` in `flashrl.platform.runtime.platform_shim_controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop, and open the shared framework run logger/metrics lifecycle under a job-scoped log root | `flashrl.framework.train_runtime`, `RunLogger`, metrics sinks, `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOController`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
 | rollout | `PlatformShimRollout` in `flashrl.platform.runtime.platform_shim_rollout` | Load mounted job, instantiate rollout hook, create remote serving client, wire rollout generator into the rollout service | `ServingClient` from `flashrl.framework.distributed`, `RemoteServingBackend` from `flashrl.framework.serving`, `build_rollout_generator`, `RolloutService`, `create_rollout_service_app` from `flashrl.framework.rollout` | `userCode.rollout` |
 | reward | `PlatformShimReward` in `flashrl.platform.runtime.platform_shim_reward` | Load mounted job and instantiate the reward hook, then wire it into the reward service | `UserDefinedReward`, `RewardService`, `create_reward_service_app` from `flashrl.framework.reward` | `userCode.reward` |
 | learner | `PlatformShimLearner` in `flashrl.platform.runtime.platform_shim_learner` | Load mounted job, create actor/reference backends, resolve shared storage paths, publish learner artifacts | `create_training_backend`, `LearnerService`, `create_learner_service_app` from `flashrl.framework.training` | training backends from framework config |
@@ -226,7 +226,7 @@ sequenceDiagram
     participant Container as Controller Container
     participant PodContract as flashrl.platform.runtime.platform_shim_common
     participant Platform as PlatformShimController
-    participant Framework as flashrl.framework.distributed.http_common plus GRPOTrainer
+    participant Framework as flashrl.framework.distributed.http_common plus GRPOController
     participant API as Kubernetes API
 
     Container->>Platform: flashrl controller
@@ -239,7 +239,7 @@ sequenceDiagram
     Platform->>Platform: merge mounted spec with live status
     Platform->>PodContract: service_url_for(rollout/reward/learner/serving)
     Platform->>Framework: build RolloutClient / RewardClient / LearnerClient / ServingClient
-    Platform->>Framework: construct GRPOTrainer
+    Platform->>Framework: construct GRPOController
 ```
 
 #### Execution Workflow
@@ -248,7 +248,7 @@ sequenceDiagram
 sequenceDiagram
     participant PodContract as flashrl.platform.runtime.platform_shim_common
     participant Platform as PlatformShimController
-    participant Framework as flashrl.framework.distributed plus GRPOTrainer
+    participant Framework as flashrl.framework.distributed plus GRPOController
     participant Rollout as rollout service
     participant Reward as reward service
     participant Learner as learner service
@@ -257,7 +257,7 @@ sequenceDiagram
     participant API as Kubernetes API
 
     Platform->>Platform: load dataset
-    Platform->>Framework: GRPOTrainer.train(...)
+    Platform->>Framework: GRPOController.train(...)
     Framework->>Rollout: rollout requests
     Rollout-->>Framework: rollout batches
     Framework->>Reward: reward requests
@@ -504,7 +504,7 @@ The key startup sequence is:
 3. the operator renders and applies the child workloads
 4. Kubernetes starts the controller pod
 5. the controller pod runs `flashrl controller`
-6. the controller runtime loads the mounted `FlashRLJob`, builds HTTP clients to rollout, reward, learner, and serving, then calls into the GRPO trainer
+6. the controller runtime loads the mounted `FlashRLJob`, builds HTTP clients to rollout, reward, learner, and serving, then calls into the GRPO controller
 
 So:
 

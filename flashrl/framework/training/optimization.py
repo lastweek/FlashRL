@@ -14,7 +14,7 @@ import torch.nn.functional as F
 from flashrl.framework.data_models import LearnerBatch
 from flashrl.framework.memory import capture_memory_snapshot, memory_pressure_tags
 from flashrl.framework.observability import StageResult, timed_call
-from flashrl.framework.trainer.grpo.loss_variants import (
+from flashrl.framework.controller.grpo.loss_variants import (
     LossAssemblyResult,
     assemble_grpo_loss,
 )

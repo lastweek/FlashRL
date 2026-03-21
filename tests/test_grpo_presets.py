@@ -3,7 +3,7 @@
 import pytest
 
 from flashrl.framework.config import GrpoConfig
-from flashrl.framework.trainer.grpo.loss_variants import resolve_loss_preset
+from flashrl.framework.controller.grpo.loss_variants import resolve_loss_preset
 
 
 class TestPresetResolution:

@@ -31,7 +31,7 @@ from flashrl.framework.train_runtime import (
     open_run_logger as open_shared_run_logger,
     start_run_metrics,
 )
-from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
+from flashrl.framework.controller.grpo.controller import GRPOController
 from flashrl.platform.k8s.job import (
     DatasetSpec,
     FlashRLJob,
@@ -175,13 +175,13 @@ def _status_writer_append_event(
         )
 
 
-def _attach_run_logger(trainer: Any, run_logger: Any | None) -> None:
-    attach = getattr(trainer, "attach_run_logger", None)
+def _attach_run_logger(controller: Any, run_logger: Any | None) -> None:
+    attach = getattr(controller, "attach_run_logger", None)
     if callable(attach):
         attach(run_logger)
         return
     try:
-        setattr(trainer, "run_logger", run_logger)
+        setattr(controller, "run_logger", run_logger)
     except Exception:
         pass
 
@@ -357,8 +357,8 @@ def run_controller(
     ]
     bootstrap_events: list[dict[str, Any]] = []
 
-    trainer = GRPOTrainer(
-        config=job.spec.framework.trainer,
+    controller = GRPOController(
+        config=job.spec.framework.controller,
         grpo_config=job.spec.framework.grpo,
         actor_backend=None,
         reference_backend=None,
@@ -373,7 +373,7 @@ def run_controller(
         on_step_complete=lambda info: _on_step_complete(
             info=info,
             job=job,
-            trainer=trainer,
+            controller=controller,
             checkpoint_manager=checkpoint_manager,
             lifecycle_totals=lifecycle_totals,
             serving=serving,
@@ -395,7 +395,7 @@ def run_controller(
     if resume_target is not None:
         started_at = time.perf_counter()
         checkpoint_metadata = None
-        load_checkpoint_with_metadata = getattr(trainer, "load_checkpoint_with_metadata", None)
+        load_checkpoint_with_metadata = getattr(controller, "load_checkpoint_with_metadata", None)
         if callable(load_checkpoint_with_metadata):
             controller_state, checkpoint_metadata = load_checkpoint_with_metadata(resume_target)
             managed_resume = checkpoint_manager.build_restored_checkpoint(
@@ -403,10 +403,10 @@ def run_controller(
                 checkpoint_metadata=checkpoint_metadata,
             )
         else:
-            trainer.load_checkpoint(resume_target)
+            controller.load_checkpoint(resume_target)
             controller_state = {
-                "epoch": getattr(trainer, "current_epoch", 0),
-                "total_steps": getattr(trainer, "total_steps", 0),
+                "epoch": getattr(controller, "current_epoch", 0),
+                "total_steps": getattr(controller, "total_steps", 0),
             }
         managed_resume_load_seconds = time.perf_counter() - started_at
         restored_run_lifecycle_totals = (
@@ -441,7 +441,7 @@ def run_controller(
 
     run_state = build_train_run_state(
         dataset,
-        trainer_config=job.spec.framework.trainer,
+        controller_config=job.spec.framework.controller,
         grpo_config=job.spec.framework.grpo,
     )
     lifecycle_totals = _merge_float_mappings(
@@ -454,7 +454,7 @@ def run_controller(
         actor_config=job.spec.framework.actor,
         reference_config=job.spec.framework.reference,
         serving_config=job.spec.framework.serving,
-        trainer_config=job.spec.framework.trainer,
+        controller_config=job.spec.framework.controller,
         grpo_config=job.spec.framework.grpo,
         run_state=run_state,
         actor_device="remote",
@@ -465,18 +465,18 @@ def run_controller(
         bootstrap_events=bootstrap_events,
         managed_resume=managed_resume,
         managed_resume_load_seconds=managed_resume_load_seconds,
-        resumed_epoch=trainer.current_epoch + 1,
-        resumed_step=trainer.total_steps,
+        resumed_epoch=controller.current_epoch + 1,
+        resumed_step=controller.total_steps,
     )
-    _attach_run_logger(trainer, run_logger)
+    _attach_run_logger(controller, run_logger)
     start_run_metrics(metrics_sink, run_logger=run_logger)
     status_writer.patch_status(
         {
             "startedAt": job.status.startedAt or utc_now_iso(),
             "progress": {
-                "currentEpoch": trainer.current_epoch + (1 if trainer.total_steps > 0 else 0),
-                "currentStep": trainer.total_steps,
-                "lastCompletedStep": trainer.total_steps,
+                "currentEpoch": controller.current_epoch + (1 if controller.total_steps > 0 else 0),
+                "currentStep": controller.total_steps,
+                "lastCompletedStep": controller.total_steps,
             },
             "logRoot": str(resolved_log_root),
             "activeControllerRunDir": str(run_logger.run_dir),
@@ -500,11 +500,11 @@ def run_controller(
     training_loop_started_at = time.perf_counter()
     final_status = "completed"
     try:
-        trainer.train(dataset)
+        controller.train(dataset)
         lifecycle_totals["training_loop_seconds"] = time.perf_counter() - training_loop_started_at
         _save_final_checkpoint_if_enabled(
             job=job,
-            trainer=trainer,
+            controller=controller,
             checkpoint_manager=checkpoint_manager,
             lifecycle_totals=lifecycle_totals,
             status_writer=status_writer,
@@ -522,8 +522,8 @@ def run_controller(
         if not bool(getattr(exc, "_flashrl_logged", False)):
             context: dict[str, Any] = {
                 "stage": "platform_controller",
-                "step": trainer.total_steps,
-                "epoch": trainer.current_epoch + 1,
+                "step": controller.total_steps,
+                "epoch": controller.current_epoch + 1,
             }
             learner_stage = getattr(exc, "stage_name", None)
             if learner_stage is not None:
@@ -546,12 +546,12 @@ def run_controller(
         status_writer.patch_status({"finishedAt": utc_now_iso(), "lastError": str(exc)})
         raise
     finally:
-        _attach_run_logger(trainer, None)
+        _attach_run_logger(controller, None)
         finish_run_observers(
             run_logger=run_logger,
             metrics_sink=metrics_sink,
             status=final_status,
-            total_steps=trainer.total_steps,
+            total_steps=controller.total_steps,
             lifecycle_totals=lifecycle_totals,
         )
 
@@ -578,7 +578,7 @@ def _merge_float_mappings(*mappings: dict[str, Any]) -> dict[str, float]:
 
 def _build_checkpoint_metadata(
     *,
-    trainer: GRPOTrainer,
+    controller: GRPOController,
     run_dir: Path,
     run_id: str,
     run_index: int,
@@ -594,50 +594,50 @@ def _build_checkpoint_metadata(
         "run_logger_state": dict(run_logger_state),
         "lifecycle_totals": dict(lifecycle_totals),
         "controller_state": {
-            "epoch": trainer.current_epoch,
-            "total_steps": trainer.total_steps,
+            "epoch": controller.current_epoch,
+            "total_steps": controller.total_steps,
         },
     }
 
 
-def _save_trainer_checkpoint(
-    trainer: GRPOTrainer,
+def _save_controller_checkpoint(
+    controller: GRPOController,
     path: str,
     *,
     checkpoint_metadata: dict[str, Any],
 ) -> None:
     try:
-        trainer.save_checkpoint(path, checkpoint_metadata=checkpoint_metadata)
+        controller.save_checkpoint(path, checkpoint_metadata=checkpoint_metadata)
     except TypeError:
-        trainer.save_checkpoint(path)
+        controller.save_checkpoint(path)
 
 
 def _save_final_checkpoint_if_enabled(
     *,
     job: FlashRLJob,
-    trainer: GRPOTrainer,
+    controller: GRPOController,
     checkpoint_manager: CheckpointManager,
     lifecycle_totals: dict[str, float],
     status_writer: FlashRLJobStatusWriter,
 ) -> None:
-    if not job.spec.checkpointing.save_on_run_end or trainer.run_logger is None:
+    if not job.spec.checkpointing.save_on_run_end or controller.run_logger is None:
         return
     checkpoint_path = (
         Path(job.spec.checkpointing.final_path)
         if job.spec.checkpointing.final_path is not None
-        else checkpoint_manager.final_checkpoint_path(run_dir=trainer.run_logger.run_dir)
+        else checkpoint_manager.final_checkpoint_path(run_dir=controller.run_logger.run_dir)
     )
     checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
     started_at = time.perf_counter()
-    _save_trainer_checkpoint(
-        trainer,
+    _save_controller_checkpoint(
+        controller,
         str(checkpoint_path),
         checkpoint_metadata=_build_checkpoint_metadata(
-            trainer=trainer,
-            run_dir=trainer.run_logger.run_dir,
-            run_id=trainer.run_logger.run_id,
-            run_index=trainer.run_logger.run_index,
-            run_logger_state=trainer.run_logger.export_state(),
+            controller=controller,
+            run_dir=controller.run_logger.run_dir,
+            run_id=controller.run_logger.run_id,
+            run_index=controller.run_logger.run_index,
+            run_logger_state=controller.run_logger.export_state(),
             lifecycle_totals=lifecycle_totals,
         ),
     )
@@ -645,22 +645,22 @@ def _save_final_checkpoint_if_enabled(
     lifecycle_totals["checkpoint_save_seconds"] = (
         lifecycle_totals.get("checkpoint_save_seconds", 0.0) + duration_seconds
     )
-    trainer.run_logger.log_checkpoint(
+    controller.run_logger.log_checkpoint(
         "save",
         str(checkpoint_path),
-        epoch=trainer.current_epoch + 1,
-        step=trainer.total_steps,
+        epoch=controller.current_epoch + 1,
+        step=controller.total_steps,
         duration_seconds=duration_seconds,
         trigger="final",
     )
     checkpoint_manager.write_latest_manifest(
-        run_dir=trainer.run_logger.run_dir,
+        run_dir=controller.run_logger.run_dir,
         checkpoint_path=checkpoint_path,
-        epoch=trainer.current_epoch + 1,
-        step=trainer.total_steps,
+        epoch=controller.current_epoch + 1,
+        step=controller.total_steps,
         trigger="final",
-        run_id=trainer.run_logger.run_id,
-        run_index=trainer.run_logger.run_index,
+        run_id=controller.run_logger.run_id,
+        run_index=controller.run_logger.run_index,
     )
     status_writer.patch_status(
         {
@@ -683,7 +683,7 @@ def _on_step_complete(
     *,
     info: dict[str, Any],
     job: FlashRLJob,
-    trainer: GRPOTrainer,
+    controller: GRPOController,
     checkpoint_manager: CheckpointManager,
     lifecycle_totals: dict[str, float],
     serving: ServingClient,
@@ -699,10 +699,10 @@ def _on_step_complete(
             "lastCompletedStep": step,
         },
         "activeControllerRunDir": (
-            str(trainer.run_logger.run_dir) if trainer.run_logger is not None else None
+            str(controller.run_logger.run_dir) if controller.run_logger is not None else None
         ),
         "activeControllerRunId": (
-            trainer.run_logger.run_id if trainer.run_logger is not None else None
+            controller.run_logger.run_id if controller.run_logger is not None else None
         ),
     }
     try:
@@ -721,23 +721,23 @@ def _on_step_complete(
         save_every_steps is not None
         and step > 0
         and step % int(save_every_steps) == 0
-        and trainer.run_logger is not None
+        and controller.run_logger is not None
     ):
         checkpoint_path = checkpoint_manager.interval_checkpoint_path(
-            run_dir=trainer.run_logger.run_dir,
+            run_dir=controller.run_logger.run_dir,
             step=step,
         )
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
         started_at = time.perf_counter()
-        _save_trainer_checkpoint(
-            trainer,
+        _save_controller_checkpoint(
+            controller,
             str(checkpoint_path),
             checkpoint_metadata=_build_checkpoint_metadata(
-                trainer=trainer,
-                run_dir=trainer.run_logger.run_dir,
-                run_id=trainer.run_logger.run_id,
-                run_index=trainer.run_logger.run_index,
-                run_logger_state=trainer.run_logger.export_state(),
+                controller=controller,
+                run_dir=controller.run_logger.run_dir,
+                run_id=controller.run_logger.run_id,
+                run_index=controller.run_logger.run_index,
+                run_logger_state=controller.run_logger.export_state(),
                 lifecycle_totals=lifecycle_totals,
             ),
         )
@@ -745,22 +745,22 @@ def _on_step_complete(
         lifecycle_totals["checkpoint_save_seconds"] = (
             lifecycle_totals.get("checkpoint_save_seconds", 0.0) + duration_seconds
         )
-        trainer.run_logger.log_checkpoint(
+        controller.run_logger.log_checkpoint(
             "save",
             str(checkpoint_path),
-            epoch=trainer.current_epoch + 1,
-            step=trainer.total_steps,
+            epoch=controller.current_epoch + 1,
+            step=controller.total_steps,
             duration_seconds=duration_seconds,
             trigger="interval",
         )
         checkpoint_manager.write_latest_manifest(
-            run_dir=trainer.run_logger.run_dir,
+            run_dir=controller.run_logger.run_dir,
             checkpoint_path=checkpoint_path,
-            epoch=trainer.current_epoch + 1,
-            step=trainer.total_steps,
+            epoch=controller.current_epoch + 1,
+            step=controller.total_steps,
             trigger="interval",
-            run_id=trainer.run_logger.run_id,
-            run_index=trainer.run_logger.run_index,
+            run_id=controller.run_logger.run_id,
+            run_index=controller.run_logger.run_index,
         )
         patch["checkpoint"] = {
             "latestUri": str(checkpoint_path),

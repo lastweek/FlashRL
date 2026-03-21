@@ -107,8 +107,8 @@ def _extract_framework_mapping(data: dict[str, Any]) -> dict[str, Any]:
     return data
 
 
-class TrainerConfig(BaseConfig):
-    """Configuration for the trainer."""
+class ControllerConfig(BaseConfig):
+    """Configuration for the controller."""
 
     learning_rate: float = 1e-5
     batch_size: int = 32
@@ -259,7 +259,7 @@ class GrpoConfig(BaseConfig):
         the result to avoid repeated computation during training.
         """
         if self.resolved_config_cache is None:
-            from flashrl.framework.trainer.grpo.loss_variants import resolve_loss_preset
+            from flashrl.framework.controller.grpo.loss_variants import resolve_loss_preset
 
             self.resolved_config_cache = resolve_loss_preset(self)
         return self.resolved_config_cache
@@ -362,7 +362,7 @@ class RunConfig(BaseConfig):
     actor: TrainingConfig
     reference: TrainingConfig | None = None
     serving: ServingConfig
-    trainer: TrainerConfig
+    controller: ControllerConfig
     grpo: GrpoConfig
     logging: LoggingConfig = Field(default_factory=LoggingConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)

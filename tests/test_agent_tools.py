@@ -19,7 +19,7 @@ from flashrl.framework.agent import (
     Tool,
     WindowedContextManager,
 )
-from flashrl.framework.config import GrpoConfig, TrainerConfig
+from flashrl.framework.config import ControllerConfig, GrpoConfig
 from flashrl.framework.data_models import (
     AssistantTurn,
     Conversation,
@@ -34,7 +34,7 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.run_logger import RunLogger
 from flashrl.framework.tools import SubprocessToolRuntime as ShimToolRuntime
 from flashrl.framework.tools import Tool as ShimTool
-from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
+from flashrl.framework.controller.grpo.controller import GRPOController
 from tests.conftest import TinyServingBackend, TinyTrainingBackend, reward_fn
 
 
@@ -132,13 +132,13 @@ def load_script_module(module_name: str, relative_path: str):
     return module
 
 
-def build_trainer() -> GRPOTrainer:
-    """Build one minimal trainer for learner-batch expansion tests."""
+def build_controller() -> GRPOController:
+    """Build one minimal controller for learner-batch expansion tests."""
     training_backend = TinyTrainingBackend(learning_rate=1e-2, group_size=2)
     serving_backend = TinyServingBackend()
     reward = UserDefinedReward(reward_fn=reward_fn, config=SimpleNamespace())
-    return GRPOTrainer(
-        config=TrainerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
+    return GRPOController(
+        config=ControllerConfig(batch_size=4, max_epochs=1, shuffle_each_epoch=False),
         grpo_config=GrpoConfig(group_size=2, clip_ratio=0.2, kl_coefficient=0.0),
         actor_backend=training_backend,
         reference_backend=None,
@@ -508,7 +508,7 @@ def test_context_manager_observe_hook_and_windowed_context() -> None:
 
 def test_learner_batch_expands_whitebox_assistant_turns() -> None:
     """Learner-batch construction should flatten assistant turns and repeat advantages."""
-    trainer = build_trainer()
+    trainer = build_controller()
     rollout = RolloutOutput(
         text="<answer>42</answer>",
         log_prob=-0.2,

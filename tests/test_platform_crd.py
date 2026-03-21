@@ -29,7 +29,7 @@ def _job_payload() -> dict[str, object]:
             "framework": {
                 "actor": {"model_name": "fake/model", "backend": "huggingface"},
                 "serving": {"model_name": "fake/model", "backend": "huggingface"},
-                "trainer": {"batch_size": 4, "max_epochs": 1},
+                "controller": {"batch_size": 4, "max_epochs": 1},
                 "grpo": {"group_size": 2, "kl_coefficient": 0.0},
             },
             "dataset": {"type": "hook"},
@@ -85,7 +85,7 @@ framework:
   serving:
     model_name: fake/model
     backend: huggingface
-  trainer:
+  controller:
     batch_size: 4
     max_epochs: 1
   grpo:
@@ -462,7 +462,7 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     assert "flashrl.framework.reward" in content
     assert "flashrl.framework.training" in content
     assert "flashrl.framework.serving" in content
-    assert "GRPOTrainer" in content
+    assert "GRPOController" in content
     assert "/v1/rollout-batches" in content
     assert "/v1/reward-batches" in content
     assert "/v1/optimize-steps" in content
@@ -589,7 +589,7 @@ spec:
     serving:
       model_name: fake/model
       backend: huggingface
-    trainer:
+    controller:
       batch_size: 4
       max_epochs: 1
     grpo:
@@ -694,7 +694,7 @@ framework:
   serving:
     model_name: fake/model
     backend: huggingface
-  trainer:
+  controller:
     batch_size: 4
     max_epochs: 1
   grpo:
@@ -703,7 +703,7 @@ framework:
 profiles:
   minikube:
     framework:
-      trainer:
+      controller:
         batch_size: 2
 """,
         encoding="utf-8",
@@ -725,7 +725,7 @@ framework:
   serving:
     model_name: fake/model
     backend: huggingface
-  trainer:
+  controller:
     batch_size: 4
     max_epochs: 1
   grpo:

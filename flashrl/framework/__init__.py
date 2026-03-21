@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, Any
 from flashrl.framework.config import (
     AdminConfig,
     CheckpointingConfig,
+    ControllerConfig,
     FSDP2Config,
     GrpoConfig,
     HookConfig,
@@ -20,7 +21,6 @@ from flashrl.framework.config import (
     RunConfig,
     ServingConfig,
     TensorBoardMetricsConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.data_models import (
@@ -98,7 +98,7 @@ __all__ = [
     "AdminConfig",
     "CheckpointingConfig",
     "GrpoConfig",
-    "TrainerConfig",
+    "ControllerConfig",
     "ModelConfig",
     "TrainingConfig",
     "ServingConfig",

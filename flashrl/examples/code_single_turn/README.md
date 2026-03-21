@@ -56,3 +56,4 @@ python3 -m flashrl.examples.code_single_turn.train \
 - It still does not support direct raw `FlashRL.from_yaml(...)` usage because the rollout and reward are constructed explicitly in code.
 - `FLASHRL_VLLM_PYTHON` is auto-filled by the example entrypoint when the selected config uses `serving.backend: vllm` and a prepared local runtime is found.
 - TensorBoard logs are written under `logs/`.
+- Training writes generated code and reward artifacts under `logs/<run-id>/generated_code/` by default. Use `--log-dir /absolute/path` to write them elsewhere.

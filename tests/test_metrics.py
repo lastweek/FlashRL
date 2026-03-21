@@ -29,7 +29,7 @@ from flashrl.framework import (
     PushgatewayMetricsConfig,
     TensorBoardMetricsConfig,
 )
-from flashrl.framework.config import AdminConfig, ServingConfig, TrainerConfig, TrainingConfig
+from flashrl.framework.config import AdminConfig, ControllerConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import (
     Conversation,
     Message,
@@ -526,7 +526,7 @@ def build_flashrl(
     actor_config: TrainingConfig | None = None,
     reference_config: TrainingConfig | None = None,
     serving_config: ServingConfig | None = None,
-    trainer_config: TrainerConfig | None = None,
+    controller_config: ControllerConfig | None = None,
     grpo_config: GrpoConfig | None = None,
     logging_config: LoggingConfig | None = None,
     metrics_config: MetricsConfig | None = None,
@@ -537,7 +537,7 @@ def build_flashrl(
         actor_config=actor_config or TrainingConfig(model_name="fake/model", device="cpu"),
         reference_config=reference_config,
         serving_config=serving_config or ServingConfig(model_name="fake/model", device="cpu"),
-        trainer_config=trainer_config or TrainerConfig(batch_size=2, max_epochs=1),
+        controller_config=controller_config or ControllerConfig(batch_size=2, max_epochs=1),
         grpo_config=grpo_config or GrpoConfig(group_size=2),
         rollout_fn=rollout_callback,
         reward_fn=reward_callback,
@@ -729,7 +729,7 @@ def write_yaml_run_config(
             {
                 "actor": actor_section,
                 "serving": serving_section,
-                "trainer": {
+                "controller": {
                     "learning_rate": 1.0e-5,
                     "batch_size": 2,
                     "max_epochs": 1,
@@ -819,7 +819,7 @@ def write_explicit_run_config(
             {
                 "actor": actor_section,
                 "serving": serving_section,
-                "trainer": {
+                "controller": {
                     "learning_rate": 1.0e-5,
                     "batch_size": 2,
                     "max_epochs": 1,
@@ -1194,7 +1194,7 @@ def test_flashrl_pushgateway_metrics_process_lifetime_across_runs(
         tmp_path,
         rollout_callback=make_rollout_fn(response_suffix="metrics", repeat=4),
         reward_callback=reward_fn,
-        trainer_config=TrainerConfig(batch_size=4, max_epochs=1),
+        controller_config=ControllerConfig(batch_size=4, max_epochs=1),
         logging_config=LoggingConfig(
             log_dir=tmp_path,
             console=False,
@@ -1382,7 +1382,7 @@ def test_flashrl_rejects_batch_size_not_divisible_by_group_size(
             tmp_path,
             rollout_callback=make_rollout_fn(response_suffix="invalid", repeat=2),
             reward_callback=reward_fn,
-            trainer_config=TrainerConfig(batch_size=3, max_epochs=1),
+            controller_config=ControllerConfig(batch_size=3, max_epochs=1),
             grpo_config=GrpoConfig(group_size=2),
             logging_config=LoggingConfig(
                 log_dir=tmp_path,
@@ -1472,7 +1472,7 @@ def test_flashrl_explicit_config_constructor_accepts_run_config_dict_and_expands
             "num_threads": 3,
             "debug_live_rollout": False,
         },
-        "trainer": {
+        "controller": {
             "batch_size": 2,
             "max_epochs": 1,
         },
@@ -1542,7 +1542,7 @@ def test_flashrl_explicit_config_constructor_rejects_scalar_training_overrides(
             config_path=config_path,
             rollout_fn=make_rollout_fn(response_suffix="mixed-scalars", repeat=2),
             reward_fn=reward_fn,
-            trainer_config=TrainerConfig(batch_size=8, max_epochs=1),
+            controller_config=ControllerConfig(batch_size=8, max_epochs=1),
         )
 
 
@@ -1610,7 +1610,7 @@ def test_flashrl_from_yaml_section_overrides_beat_common_defaults(
                     "dtype": "float32",
                     "num_threads": 3,
                 },
-                "trainer": {
+                "controller": {
                     "batch_size": 2,
                     "max_epochs": 1,
                 },
@@ -1676,7 +1676,7 @@ def test_flashrl_from_yaml_reference_backend_uses_resolved_training_config(
               model_name: fake/model
               device: reference-device
               num_threads: 5
-            trainer:
+            controller:
               batch_size: 2
               max_epochs: 1
             serving:
@@ -1726,7 +1726,7 @@ def test_flashrl_from_yaml_requires_model_name_after_common_and_section_merge(
             f"""
             actor:
               device: cpu
-            trainer:
+            controller:
               batch_size: 2
               max_epochs: 1
             serving:
@@ -1761,7 +1761,7 @@ def test_flashrl_from_yaml_rejects_loop_fields_under_common(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Actor config should reject trainer-only fields."""
+    """Actor config should reject controller-only fields."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1772,7 +1772,7 @@ def test_flashrl_from_yaml_rejects_loop_fields_under_common(
             actor:
               model_name: fake/model
               batch_size: 4
-            trainer:
+            controller:
               batch_size: 2
               max_epochs: 1
             serving:
@@ -1807,7 +1807,7 @@ def test_flashrl_from_yaml_rejects_num_threads_under_common(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """Trainer config should reject model-only fields such as num_threads."""
+    """Controller config should reject model-only fields such as num_threads."""
     patch_backends(monkeypatch)
     hook_module = create_yaml_hook_module(tmp_path)
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -1818,7 +1818,7 @@ def test_flashrl_from_yaml_rejects_num_threads_under_common(
             actor:
               model_name: fake/model
               num_threads: 2
-            trainer:
+            controller:
               batch_size: 2
               max_epochs: 1
               num_threads: 4
@@ -2068,8 +2068,8 @@ def test_reasoning_example_yaml_runs_with_fake_backends(
         trainer.metrics_config.pushgateway,
         model_name=trainer.actor_config.model_name,
     )
-    assert trainer._trainer is not None
-    trainer._trainer.metrics_sink = trainer._metrics_sink
+    assert trainer._controller is not None
+    trainer._controller.metrics_sink = trainer._metrics_sink
 
     trainer.train(dataset)
 

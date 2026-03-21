@@ -18,11 +18,11 @@ import yaml
 import flashrl.framework.flashrl as flashrl_module
 import flashrl.framework.serving.huggingface as huggingface_module
 from flashrl.framework.config import (
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.data_models import (
@@ -332,7 +332,7 @@ def build_flashrl(
     return FlashRL(
         actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
         serving_config=serving_config or ServingConfig(model_name="fake/model", device="cpu"),
-        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        controller_config=ControllerConfig(batch_size=2, max_epochs=1),
         grpo_config=GrpoConfig(group_size=2),
         rollout_fn=build_rollout_fn,
         reward_fn=reward_callback,
@@ -1187,7 +1187,7 @@ def test_flashrl_from_yaml_parses_vllm_serving_fields(
                     "num_replicas": 2,
                     "vllm_args": ["--max-num-seqs=32", "--enable-prefix-caching"],
                 },
-                "trainer": {"batch_size": 2, "max_epochs": 1},
+                "controller": {"batch_size": 2, "max_epochs": 1},
                 "grpo": {"group_size": 2, "clip_ratio": 0.2, "kl_coefficient": 0.0},
                 "logging": {"log_dir": str(tmp_path / "logs"), "console": False, "file": True},
                 "metrics": {"enabled": False},
@@ -1247,7 +1247,7 @@ def test_flashrl_from_yaml_requires_present_runtime_python_env_var(
                     "backend": "vllm",
                     "runtime_python": "${FLASHRL_VLLM_PYTHON}",
                 },
-                "trainer": {"batch_size": 2, "max_epochs": 1},
+                "controller": {"batch_size": 2, "max_epochs": 1},
                 "grpo": {"group_size": 2, "clip_ratio": 0.2, "kl_coefficient": 0.0},
                 "logging": {"log_dir": str(tmp_path / "logs"), "console": False, "file": True},
                 "metrics": {"enabled": False},

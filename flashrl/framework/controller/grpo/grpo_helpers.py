@@ -1,4 +1,4 @@
-"""GRPO-specific helpers for training step orchestration."""
+"""GRPO-specific helpers for controller step orchestration."""
 
 from __future__ import annotations
 

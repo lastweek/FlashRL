@@ -179,7 +179,7 @@ def build_flashrl_job(
                 else None
             ),
             "serving": run_config.serving.model_dump(mode="json"),
-            "trainer": run_config.trainer.model_dump(mode="json"),
+            "controller": run_config.controller.model_dump(mode="json"),
             "grpo": run_config.grpo.model_dump(mode="json"),
             "logging": run_config.logging.model_dump(mode="json"),
             "metrics": run_config.metrics.model_dump(mode="json"),

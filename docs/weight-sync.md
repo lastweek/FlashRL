@@ -399,17 +399,17 @@ The weight synchronization workflow integrates into the GRPO training loop as fo
 
 ```mermaid
 sequenceDiagram
-    participant Trainer as GRPOTrainer
+    participant Controller as GRPOController
     participant Actor as ActorTrainingBackend
     participant Serving as ServingBackend
     participant Rollout as RolloutGenerator
     participant Learner as LearnerService
 
-    Note over Trainer: Training Step Begins
-    Trainer->>Rollout: Generate rollouts with current weights
-    Rollout-->>Trainer: Rollouts (with weight_version metadata)
+    Note over Controller: Training Step Begins
+    Controller->>Rollout: Generate rollouts with current weights
+    Rollout-->>Controller: Rollouts (with weight_version metadata)
 
-    Trainer->>Learner: optimize_step(learner_batch)
+    Controller->>Learner: optimize_step(learner_batch)
     Note over Learner: Actor Forward + Backward
     Learner->>Actor: backward_step(loss)
     Actor->>Actor: optimizer.step()
@@ -424,20 +424,20 @@ sequenceDiagram
     Serving-->>Actor: WeightVersionInfo
 
     Serving-->>Learner: weight_version
-    Learner-->>Trainer: OptimizeStepResponse (with weight_version)
+    Learner-->>Controller: OptimizeStepResponse (with weight_version)
 
-    Trainer->>Serving: activate_weight_version(version_ref)
+    Controller->>Serving: activate_weight_version(version_ref)
     Note over Serving: Update active version
-    Serving-->>Trainer: ActiveWeightVersion
+    Serving-->>Controller: ActiveWeightVersion
 
-    Note over Trainer: Step complete, serving using new weights
+    Note over Controller: Step complete, serving using new weights
 ```
 
-### Integration with GRPOTrainer
+### Integration with GRPOController
 
-**Location**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/trainer/grpo/trainer.py`
+**Location**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/controller/grpo/controller.py`
 
-The trainer orchestrates weight synchronization through the `_optimize_batch` method (lines 526-601):
+The controller orchestrates weight synchronization through the `_optimize_batch` method (lines 526-601):
 
 ```python
 def _optimize_batch(
@@ -1210,7 +1210,7 @@ except Exception as exc:
 - **vLLM Serving**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/serving/vllm/backend.py`
 - **Checkpoint Manager**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/checkpointing.py`
 - **Data Models**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/data_models.py`
-- **GRPO Trainer**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/trainer/grpo/trainer.py`
+- **GRPO Controller**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/controller/grpo/controller.py`
 - **Distributed Models**: `/Volumes/CaseSensitive/FlashRL/flashrl/framework/distributed/models.py`
 
 ### Related Documentation

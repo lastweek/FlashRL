@@ -9,10 +9,10 @@ from typing import Any
 
 from flashrl.framework.checkpointing import RestoredCheckpoint
 from flashrl.framework.config import (
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.data_models import Prompt
@@ -35,18 +35,18 @@ class TrainRunState:
 def build_train_run_state(
     dataset: list[Prompt],
     *,
-    trainer_config: TrainerConfig,
+    controller_config: ControllerConfig,
     grpo_config: GrpoConfig,
 ) -> TrainRunState:
     """Compute the shared per-run dataset/step metadata once."""
-    prompts_per_step = trainer_config.batch_size // grpo_config.group_size
+    prompts_per_step = controller_config.batch_size // grpo_config.group_size
     steps_per_epoch = math.ceil(len(dataset) / prompts_per_step) if dataset else 0
     return TrainRunState(
         dataset=dataset,
         dataset_size=len(dataset),
         prompts_per_step=prompts_per_step,
         steps_per_epoch=steps_per_epoch,
-        total_planned_steps=steps_per_epoch * trainer_config.max_epochs,
+        total_planned_steps=steps_per_epoch * controller_config.max_epochs,
     )
 
 
@@ -57,7 +57,7 @@ def open_run_logger(
     actor_config: TrainingConfig,
     reference_config: TrainingConfig | None,
     serving_config: ServingConfig,
-    trainer_config: TrainerConfig,
+    controller_config: ControllerConfig,
     grpo_config: GrpoConfig,
     run_state: TrainRunState,
     actor_device: str,
@@ -75,8 +75,8 @@ def open_run_logger(
     """Open or resume the shared per-run logger for local or platform mode."""
     run_open_kwargs = {
         "dataset_size": run_state.dataset_size,
-        "batch_size": trainer_config.batch_size,
-        "max_epochs": trainer_config.max_epochs,
+        "batch_size": controller_config.batch_size,
+        "max_epochs": controller_config.max_epochs,
         "total_batches": run_state.total_planned_steps,
         "device": actor_config.device or "auto",
         "dtype": actor_config.dtype,

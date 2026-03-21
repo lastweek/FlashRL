@@ -23,13 +23,13 @@ from .checkpointing import (
 from .config import (
     AdminConfig,
     CheckpointingConfig,
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     RewardConfig,
     RunConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from .data_models import Prompt, RewardOutput, RolloutOutput, WeightVersionInfo
@@ -48,14 +48,14 @@ from .train_runtime import (
     start_run_metrics,
 )
 from .training import ActorTrainingBackend, ReferenceTrainingBackend, TrainingBackend, create_training_backend
-from .trainer.grpo.trainer import GRPOTrainer
+from .controller.grpo.controller import GRPOController
 
 if TYPE_CHECKING:
     from .agent import Agent
 
 
 class FlashRL:
-    """Unified FlashRL trainer with a simple RL training API."""
+    """Unified FlashRL controller with a simple RL training API."""
 
     def __init__(
         self,
@@ -63,7 +63,7 @@ class FlashRL:
         actor_config: TrainingConfig | None = None,
         reference_config: TrainingConfig | None = None,
         serving_config: ServingConfig | None = None,
-        trainer_config: TrainerConfig | None = None,
+        controller_config: ControllerConfig | None = None,
         grpo_config: GrpoConfig | None = None,
         rollout_fn: Callable[[list[Prompt], ServingBackend], list[RolloutOutput]] | Agent | None = None,
         reward_fn: Callable[[RolloutOutput], RewardOutput] | None = None,
@@ -75,7 +75,7 @@ class FlashRL:
         run_config: RunConfig | dict[str, Any] | None = None,
         dataset_loader: Callable[[], list[Prompt] | list[str]] | None = None,
     ) -> None:
-        """Initialize FlashRL trainer.
+        """Initialize FlashRL controller.
 
         The runtime keeps separate actor, optional reference, and serving model
         copies with explicit role assignment.
@@ -93,7 +93,7 @@ class FlashRL:
                 actor_config is not None
                 or reference_config is not None
                 or serving_config is not None
-                or trainer_config is not None
+                or controller_config is not None
                 or grpo_config is not None
                 or logging_config is not None
                 or metrics_config is not None
@@ -102,14 +102,14 @@ class FlashRL:
             ):
                 raise ValueError(
                     "FlashRL config-based construction cannot be combined with explicit "
-                    "actor/reference/serving/trainer/admin/checkpointing overrides."
+                    "actor/reference/serving/controller/admin/checkpointing overrides."
                 )
 
             (
                 actor_config,
                 reference_config,
                 serving_config,
-                trainer_config,
+                controller_config,
                 admin_config,
             ) = runtime_support.build_runtime_role_configs(resolved_run_config)
             grpo_config = resolved_run_config.grpo
@@ -125,9 +125,9 @@ class FlashRL:
             raise ValueError(
                 "FlashRL(...) requires serving_config unless config_path or run_config is provided."
             )
-        if trainer_config is None:
+        if controller_config is None:
             raise ValueError(
-                "FlashRL(...) requires trainer_config unless config_path or run_config is provided."
+                "FlashRL(...) requires controller_config unless config_path or run_config is provided."
             )
         if grpo_config is None:
             raise ValueError(
@@ -151,12 +151,12 @@ class FlashRL:
         self.actor_config = actor_config
         self.reference_config = reference_config
         self.serving_config = serving_config
-        self.trainer_config = trainer_config
+        self.controller_config = controller_config
         self.grpo_config = grpo_config
-        if self.trainer_config.batch_size % self.grpo_config.group_size != 0:
+        if self.controller_config.batch_size % self.grpo_config.group_size != 0:
             raise ValueError(
-                "trainer.batch_size must be divisible by grpo.group_size "
-                f"(got batch_size={self.trainer_config.batch_size}, "
+                "controller.batch_size must be divisible by grpo.group_size "
+                f"(got batch_size={self.controller_config.batch_size}, "
                 f"group_size={self.grpo_config.group_size})."
             )
         self.rollout_config = runtime_support.build_rollout_config(self.grpo_config)
@@ -170,7 +170,7 @@ class FlashRL:
         self._serving_backend: ServingBackend | None = None
         self._rollout_generator: BaseRolloutGenerator | None = None
         self._reward: UserDefinedReward | None = None
-        self._trainer: GRPOTrainer | None = None
+        self._controller: GRPOController | None = None
         self._run_logger: RunLogger | None = None
         self._metrics_sink: MetricsSink | None = None
         self._run_lifecycle_totals: dict[str, float] = {}
@@ -200,13 +200,13 @@ class FlashRL:
 
     def _apply_random_seed(self) -> None:
         """Apply the configured host-process RNG seed."""
-        random.seed(self.trainer_config.seed)
+        random.seed(self.controller_config.seed)
         try:
             import torch
 
-            torch.manual_seed(self.trainer_config.seed)
+            torch.manual_seed(self.controller_config.seed)
             if torch.cuda.is_available():
-                torch.cuda.manual_seed_all(self.trainer_config.seed)
+                torch.cuda.manual_seed_all(self.controller_config.seed)
         except Exception:
             return None
 
@@ -294,7 +294,7 @@ class FlashRL:
         )
         self._actor_backend = create_training_backend(
             self.actor_config,
-            learning_rate=self.trainer_config.learning_rate,
+            learning_rate=self.controller_config.learning_rate,
             role="actor",
         )
         for event in self._actor_backend.startup_events:
@@ -402,8 +402,8 @@ class FlashRL:
             config=self.reward_config,
         )
 
-        self._trainer = GRPOTrainer(
-            config=self.trainer_config,
+        self._controller = GRPOController(
+            config=self.controller_config,
             grpo_config=self.grpo_config,
             actor_backend=self._actor_backend,
             reference_backend=self._reference_backend,
@@ -412,7 +412,7 @@ class FlashRL:
             rollout_generator=self._rollout_generator,
             run_logger=None,
             metrics_sink=self._metrics_sink,
-            on_step_complete=self._on_trainer_step_complete,
+            on_step_complete=self._on_controller_step_complete,
         )
         self._initialize_admin()
         self._runtime_bootstrap_totals["startup_total_seconds"] = startup_total_seconds
@@ -686,17 +686,17 @@ class FlashRL:
 
     def _admin_current_epoch(self) -> int:
         """Return the user-facing epoch number for the runtime object."""
-        if self._trainer is None:
+        if self._controller is None:
             return 0
-        if self._trainer.total_steps == 0 and self._runtime_phase == "Ready":
+        if self._controller.total_steps == 0 and self._runtime_phase == "Ready":
             return 0
-        return self._trainer.current_epoch + 1
+        return self._controller.current_epoch + 1
 
     def _admin_current_step(self) -> int:
         """Return the current training step for the runtime object."""
-        if self._trainer is None:
+        if self._controller is None:
             return 0
-        return self._trainer.total_steps
+        return self._controller.total_steps
 
     def _learner_backends(self) -> list[TrainingBackend]:
         """Return the initialized learner backends in stable actor/reference order."""
@@ -767,7 +767,7 @@ class FlashRL:
         if dataset is None:
             if self._dataset_loader is None:
                 raise ValueError(
-                    "FlashRL.train() requires a dataset unless the trainer was created with "
+                    "FlashRL.train() requires a dataset unless the controller was created with "
                     "a configured dataset_loader."
                 )
             dataset = self._dataset_loader()
@@ -801,7 +801,7 @@ class FlashRL:
         """Compute the per-run dataset and step metadata once."""
         return build_train_run_state(
             dataset,
-            trainer_config=self.trainer_config,
+            controller_config=self.controller_config,
             grpo_config=self.grpo_config,
         )
 
@@ -816,7 +816,7 @@ class FlashRL:
             actor_config=self.actor_config,
             reference_config=self.reference_config,
             serving_config=self.serving_config,
-            trainer_config=self.trainer_config,
+            controller_config=self.controller_config,
             grpo_config=self.grpo_config,
             run_state=run_state,
             actor_device=str(self._actor_backend.device),
@@ -829,24 +829,24 @@ class FlashRL:
             bootstrap_events=self._runtime_bootstrap_events,
             managed_resume=self._managed_resume,
             managed_resume_load_seconds=self._managed_resume_load_seconds,
-            resumed_epoch=self._trainer.current_epoch + 1,
-            resumed_step=self._trainer.total_steps,
+            resumed_epoch=self._controller.current_epoch + 1,
+            resumed_step=self._controller.total_steps,
             serving_log_dir_setter=set_log_dir,
         )
         self._run_logger = run_logger
         run_state.run_logger = run_logger
         return run_logger
 
-    def _prepare_trainer_for_run(self, run_logger: RunLogger) -> None:
-        """Apply resume/reset behavior and attach the run logger to the trainer."""
-        assert self._trainer is not None
+    def _prepare_controller_for_run(self, run_logger: RunLogger) -> None:
+        """Apply resume/reset behavior and attach the run logger to the controller."""
+        assert self._controller is not None
         if not self._resume_from_checkpoint:
-            self._trainer.reset_state()
-        self._trainer.attach_run_logger(run_logger)
+            self._controller.reset_state()
+        self._controller.attach_run_logger(run_logger)
 
     def _prepare_managed_resume(self) -> RestoredCheckpoint | None:
         """Load one configured managed checkpoint before opening the run logger."""
-        assert self._trainer is not None
+        assert self._controller is not None
         assert self._actor_backend is not None
         checkpoint_path = self._checkpoint_manager.resolve_resume_path()
         if checkpoint_path is None:
@@ -861,7 +861,7 @@ class FlashRL:
             for backend in self._learner_backends():
                 backend.barrier()
             try:
-                return self._trainer.load_checkpoint_with_metadata(str(checkpoint_path))
+                return self._controller.load_checkpoint_with_metadata(str(checkpoint_path))
             finally:
                 for backend in reversed(self._learner_backends()):
                     backend.barrier()
@@ -917,12 +917,12 @@ class FlashRL:
                         ),
                     }
                 }
-        assert self._trainer is not None
+        assert self._controller is not None
         return {
             "schema_version": CHECKPOINT_SCHEMA_VERSION,
             "trigger": trigger,
-            "saved_epoch": self._trainer.current_epoch,
-            "saved_step": self._trainer.total_steps,
+            "saved_epoch": self._controller.current_epoch,
+            "saved_step": self._controller.total_steps,
             "lifecycle_totals": dict(self._run_lifecycle_totals),
             "run": run_metadata,
             "run_logger_state": run_logger_state,
@@ -937,7 +937,7 @@ class FlashRL:
         update_latest: bool,
     ) -> float:
         """Save one checkpoint, optionally updating the managed latest manifest."""
-        assert self._trainer is not None
+        assert self._controller is not None
         assert self._actor_backend is not None
         checkpoint_path = Path(path)
         checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
@@ -948,7 +948,7 @@ class FlashRL:
                 backend.barrier()
             try:
                 if self._actor_backend.is_primary:
-                    self._trainer.save_checkpoint(
+                    self._controller.save_checkpoint(
                         str(temp_path),
                         checkpoint_metadata=self._build_checkpoint_metadata(trigger=trigger),
                     )
@@ -967,8 +967,8 @@ class FlashRL:
             self._run_logger.log_checkpoint(
                 "save",
                 str(checkpoint_path),
-                epoch=self._trainer.current_epoch + 1,
-                step=self._trainer.total_steps,
+                epoch=self._controller.current_epoch + 1,
+                step=self._controller.total_steps,
                 duration_seconds=duration_seconds,
                 trigger=trigger,
             )
@@ -976,15 +976,15 @@ class FlashRL:
                 self._checkpoint_manager.write_latest_manifest(
                     run_dir=self._run_logger.run_dir,
                     checkpoint_path=checkpoint_path,
-                    epoch=self._trainer.current_epoch + 1,
-                    step=self._trainer.total_steps,
+                    epoch=self._controller.current_epoch + 1,
+                    step=self._controller.total_steps,
                     trigger=trigger,
                     run_id=self._run_logger.run_id,
                     run_index=self._run_logger.run_index,
                 )
         return duration_seconds
 
-    def _on_trainer_step_complete(self, step_context: dict[str, Any]) -> None:
+    def _on_controller_step_complete(self, step_context: dict[str, Any]) -> None:
         """Persist managed interval checkpoints after completed training steps."""
         if self._run_logger is None:
             return
@@ -1019,22 +1019,22 @@ class FlashRL:
         start_run_metrics(self._metrics_sink, run_logger=run_logger)
 
     def _execute_training_loop(self, dataset: list[Prompt]) -> None:
-        """Mark the runtime as training and delegate to the trainer."""
-        assert self._trainer is not None
+        """Mark the runtime as training and delegate to the controller."""
+        assert self._controller is not None
         self._last_runtime_error = None
         self._runtime_phase = "Training"
-        self._trainer.train(dataset)
+        self._controller.train(dataset)
 
     def _handle_train_failure(self, exc: BaseException) -> None:
         """Preserve the current runtime and logging failure behavior."""
-        assert self._trainer is not None
+        assert self._controller is not None
         self._runtime_phase = (
             "Interrupted"
             if isinstance(exc, (KeyboardInterrupt, SystemExit))
             else "Failed"
         )
         self._last_runtime_error = f"{type(exc).__name__}: {exc}"
-        active_context = self._trainer.active_step_context
+        active_context = self._controller.active_step_context
         if self._run_logger is not None:
             if not bool(getattr(exc, "_flashrl_logged", False)):
                 context: dict[str, Any] = {
@@ -1042,12 +1042,12 @@ class FlashRL:
                     "step": (
                         active_context.step
                         if active_context is not None
-                        else self._trainer.total_steps
+                        else self._controller.total_steps
                     ),
                     "epoch": (
                         active_context.epoch
                         if active_context is not None
-                        else self._trainer.current_epoch + 1
+                        else self._controller.current_epoch + 1
                     ),
                 }
                 learner_stage = getattr(exc, "stage_name", None)
@@ -1065,7 +1065,7 @@ class FlashRL:
 
     def _finalize_train_run(self, *, status: str, started_at: float) -> None:
         """Finalize metrics, logger state, and lifecycle totals for one run."""
-        assert self._trainer is not None
+        assert self._controller is not None
         final_status = status
         self._run_lifecycle_totals["training_loop_seconds"] = time.perf_counter() - started_at
         try:
@@ -1081,7 +1081,7 @@ class FlashRL:
             self._handle_train_failure(exc)
             raise
         finally:
-            self._trainer.attach_run_logger(None)
+            self._controller.attach_run_logger(None)
             self._resume_from_checkpoint = False
             self._managed_resume = None
             self._managed_resume_load_seconds = 0.0
@@ -1090,7 +1090,7 @@ class FlashRL:
                 run_logger=self._run_logger,
                 metrics_sink=self._metrics_sink,
                 status=final_status,
-                total_steps=self._trainer.total_steps,
+                total_steps=self._controller.total_steps,
                 lifecycle_totals=self._run_lifecycle_totals,
             )
 
@@ -1101,8 +1101,8 @@ class FlashRL:
         self._reset_run_lifecycle_totals()
         run_logger = self._open_run_logger(run_state)
         status = "completed"
-        assert self._trainer is not None
-        self._prepare_trainer_for_run(run_logger)
+        assert self._controller is not None
+        self._prepare_controller_for_run(run_logger)
         self._start_run_metrics(run_logger)
         training_loop_started_at = time.perf_counter()
         try:
@@ -1124,14 +1124,14 @@ class FlashRL:
 
     def load_checkpoint(self, path: str) -> None:
         """Load model checkpoint."""
-        assert self._trainer is not None
+        assert self._controller is not None
         assert self._actor_backend is not None
 
         def load_manual_checkpoint() -> None:
             for backend in self._learner_backends():
                 backend.barrier()
             try:
-                self._trainer.load_checkpoint(path)
+                self._controller.load_checkpoint(path)
             finally:
                 for backend in reversed(self._learner_backends()):
                     backend.barrier()
@@ -1146,8 +1146,8 @@ class FlashRL:
             self._run_logger.log_checkpoint(
                 "load",
                 path,
-                epoch=self._trainer.current_epoch + 1,
-                step=self._trainer.total_steps,
+                epoch=self._controller.current_epoch + 1,
+                step=self._controller.total_steps,
                 duration_seconds=duration_seconds,
                 trigger="manual",
             )

@@ -12,11 +12,11 @@ import pytest
 
 import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework.config import (
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.flashrl import FlashRL
@@ -69,7 +69,7 @@ def test_viewer_renders_live_runtime_and_run_history_workspaces(
     trainer = FlashRL(
         actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
         serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
-        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        controller_config=ControllerConfig(batch_size=2, max_epochs=1),
         grpo_config=GrpoConfig(group_size=2),
         rollout_fn=build_rollout_fn,
         reward_fn=reward_fn,

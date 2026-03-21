@@ -98,6 +98,32 @@ def make_rollout(
     )
 
 
+def configure_passing_code_execution(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    task_id: str,
+) -> None:
+    """Configure one task payload and a passing executor stub."""
+    code_basic.CODEFORCES_EXECUTION_PAYLOADS[task_id] = {
+        "official_tests": [{"input": "", "output": "42\n"}],
+        "checker_code": None,
+        "time_limit_seconds": 1.0,
+        "memory_limit_mb": 256,
+    }
+    monkeypatch.setattr(
+        code_basic.executor,
+        "run_python_solution",
+        lambda code, **kwargs: code_basic_executor.ExecutionResult(
+            passed_tests=1 if "print(42)" in code else 0,
+            total_tests=1,
+            pass_rate=1.0 if "print(42)" in code else 0.0,
+            execution_seconds=0.1,
+            failure_reason=None if "print(42)" in code else "wrong_answer",
+            checker_used=False,
+        ),
+    )
+
+
 def test_render_code_prompt_enforces_strict_contract() -> None:
     """The code example should keep the same visible strict output contract."""
     prompt = code_basic.render_code_prompt("Solve X.", training_mode="reasoning-code")
@@ -396,6 +422,136 @@ def test_score_code_rollout_marks_truncation_invalid_for_format(
     assert "truncated=yes" in output
 
 
+def test_make_code_reward_fn_writes_training_logs_under_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Training should place generated code logs under the active run directory."""
+    run_dir = tmp_path / "run-1"
+    monkeypatch.chdir(tmp_path)
+    prompt = make_prompt(task_id="codeforces-train-run-dir", training_mode="reasoning-code")
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+        run_dir_resolver=lambda: run_dir,
+    )
+
+    reward = reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+        )
+    )
+
+    logged_files = list((run_dir / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))
+    assert reward.reward == pytest.approx(1.1)
+    assert len(logged_files) == 1
+    assert not (tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).exists()
+
+
+def test_make_code_reward_fn_resolves_relative_override_under_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Relative log-dir overrides should stay inside the active run directory."""
+    run_dir = tmp_path / "run-1"
+    prompt = make_prompt(task_id="codeforces-train-relative-log-dir", training_mode="reasoning-code")
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+        log_dir="custom-output",
+        run_dir_resolver=lambda: run_dir,
+    )
+
+    reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+        )
+    )
+
+    assert len(list((run_dir / "custom-output").glob("*.txt"))) == 1
+    assert not (tmp_path / "custom-output").exists()
+
+
+def test_make_code_reward_fn_keeps_absolute_override_outside_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Absolute log-dir overrides should bypass the per-run directory."""
+    run_dir = tmp_path / "run-1"
+    absolute_log_dir = tmp_path / "absolute-output"
+    prompt = make_prompt(task_id="codeforces-train-absolute-log-dir", training_mode="reasoning-code")
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+        log_dir=absolute_log_dir,
+        run_dir_resolver=lambda: run_dir,
+    )
+
+    reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+        )
+    )
+
+    assert len(list(absolute_log_dir.glob("*.txt"))) == 1
+    assert not (run_dir / absolute_log_dir.name).exists()
+
+
+def test_make_code_reward_fn_preserves_cwd_default_without_run_dir_resolver(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Eval-style usage should keep the cwd-relative generated_code default."""
+    monkeypatch.chdir(tmp_path)
+    prompt = make_prompt(task_id="codeforces-test-cwd-default", training_mode="reasoning-code")
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+    )
+
+    reward_fn(
+        make_rollout(
+            prompt,
+            "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+        )
+    )
+
+    assert len(list((tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))) == 1
+
+
+def test_make_code_reward_fn_rejects_missing_run_dir_when_resolver_is_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Training-style resolution should fail clearly when the run dir is unavailable."""
+    prompt = make_prompt(task_id="codeforces-train-missing-run-dir", training_mode="reasoning-code")
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+        run_dir_resolver=lambda: None,
+    )
+
+    with pytest.raises(RuntimeError, match="run directory is not available yet"):
+        reward_fn(
+            make_rollout(
+                prompt,
+                "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+            )
+        )
+
+
 def test_run_python_solution_handles_success_and_checker_path() -> None:
     """The executor should support direct stdout matches and optional checkers."""
     direct = code_basic_executor.run_python_solution(
@@ -461,6 +617,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
     assert "--run-timeout-seconds" in train_help
     assert "--memory-limit-mb" in train_help
     assert "--max-tests-per-problem" in train_help
+    assert "--log-dir" in train_help
 
     eval_help = code_basic_eval.build_argument_parser().format_help()
     assert "--config" in eval_help
@@ -528,6 +685,44 @@ def test_code_basic_main_uses_explicit_config_flashrl_constructor(
     assert isinstance(captured["rollout_fn"], Agent)
     assert callable(captured["reward_fn"])
     assert "checkpoint_out" not in captured
+
+
+def test_code_basic_main_reward_fn_resolves_active_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The training entrypoint should wire reward logging through the active run directory."""
+    run_dir = tmp_path / "run-123"
+    captured: dict[str, object] = {}
+    prompt = make_prompt(task_id="codeforces-train-main-run-dir", training_mode="reasoning-code")
+    rollout = make_rollout(
+        prompt,
+        "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+    )
+
+    class FakeFlashRL:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self._run_logger = None
+
+        def train(self, dataset) -> None:
+            captured["dataset"] = dataset
+            self._run_logger = SimpleNamespace(run_dir=run_dir)
+            reward_fn = captured["reward_fn"]
+            assert callable(reward_fn)
+            reward_fn(rollout)
+
+        def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(code_basic, "FlashRL", FakeFlashRL)
+    monkeypatch.setattr(code_basic, "build_code_train_dataset", lambda **kwargs: [prompt])
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+
+    exit_code = code_basic.main(["--config", "flashrl/examples/code_single_turn/config.yaml"])
+
+    assert exit_code == 0
+    assert len(list((run_dir / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))) == 1
 
 
 def test_code_basic_modules_hold_the_actual_logic() -> None:

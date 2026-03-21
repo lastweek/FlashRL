@@ -4,7 +4,7 @@ import pytest
 import torch
 
 from flashrl.framework.config import GrpoConfig
-from flashrl.framework.trainer.grpo.loss_variants import (
+from flashrl.framework.controller.grpo.loss_variants import (
     _compute_off_policy_sequence_masking,
     _apply_importance_gating,
     _apply_icepop_token_gate,

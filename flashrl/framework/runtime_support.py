@@ -9,11 +9,11 @@ from typing import Any
 from flashrl.framework.config import (
     AdminConfig,
     BuilderSpec,
+    ControllerConfig,
     GrpoConfig,
     RolloutConfig,
     RunConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.data_models import Prompt
@@ -94,20 +94,20 @@ def build_rollout_config(grpo_config: GrpoConfig) -> RolloutConfig:
     )
 
 
-def build_trainer_config(run_config: RunConfig) -> TrainerConfig:
-    """Extract trainer loop settings from one top-level RunConfig."""
-    return run_config.trainer.model_copy(deep=True)
+def build_controller_config(run_config: RunConfig) -> ControllerConfig:
+    """Extract controller loop settings from one top-level RunConfig."""
+    return run_config.controller.model_copy(deep=True)
 
 
 def build_runtime_role_configs(
     run_config: RunConfig,
-) -> tuple[TrainingConfig, TrainingConfig | None, ServingConfig, TrainerConfig, AdminConfig]:
+) -> tuple[TrainingConfig, TrainingConfig | None, ServingConfig, ControllerConfig, AdminConfig]:
     """Resolve runtime role configs directly from one explicit RunConfig."""
     return (
         run_config.actor.model_copy(deep=True),
         run_config.reference.model_copy(deep=True) if run_config.reference is not None else None,
         run_config.serving.model_copy(deep=True),
-        build_trainer_config(run_config),
+        build_controller_config(run_config),
         run_config.admin.model_copy(deep=True),
     )
 

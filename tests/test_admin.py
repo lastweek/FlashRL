@@ -16,11 +16,11 @@ import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework.admin import AdminRegistry, build_admin_object, create_admin_app
 from flashrl.framework.config import (
     AdminConfig,
+    ControllerConfig,
     GrpoConfig,
     LoggingConfig,
     MetricsConfig,
     ServingConfig,
-    TrainerConfig,
     TrainingConfig,
 )
 from flashrl.framework.data_models import Conversation, Message, Prompt, RewardOutput, RolloutOutput
@@ -360,11 +360,11 @@ def _patch_backends(monkeypatch: pytest.MonkeyPatch) -> None:
     )
 
 
-def _build_trainer(tmp_path: Path, *, reward_callback=reward_fn) -> FlashRL:
+def _build_controller(tmp_path: Path, *, reward_callback=reward_fn) -> FlashRL:
     return FlashRL(
         actor_config=TrainingConfig(model_name="fake/model", device="cpu"),
         serving_config=ServingConfig(model_name="fake/model", backend="vllm"),
-        trainer_config=TrainerConfig(batch_size=2, max_epochs=1),
+        controller_config=ControllerConfig(batch_size=2, max_epochs=1),
         grpo_config=GrpoConfig(group_size=2),
         rollout_fn=build_rollout_fn,
         reward_fn=reward_callback,
@@ -379,7 +379,7 @@ def test_flashrl_admin_server_exposes_runtime_backend_and_vllm_objects(
 ) -> None:
     """FlashRL should expose live runtime and VLLM admin objects over HTTP."""
     _patch_backends(monkeypatch)
-    trainer = _build_trainer(tmp_path)
+    trainer = _build_controller(tmp_path)
     assert trainer.admin_base_url is not None
 
     try:
@@ -422,7 +422,7 @@ def test_flashrl_admin_server_keeps_failed_state_visible_until_close(
 ) -> None:
     """Training failures should remain visible through the admin API until close."""
     _patch_backends(monkeypatch)
-    trainer = _build_trainer(tmp_path, reward_callback=failing_reward_fn)
+    trainer = _build_controller(tmp_path, reward_callback=failing_reward_fn)
     assert trainer.admin_base_url is not None
 
     with pytest.raises(ValueError, match="reward failure"):

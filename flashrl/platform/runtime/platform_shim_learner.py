@@ -32,7 +32,7 @@ class PlatformShimLearner(PlatformShim):
         actor_backend = create_training_backend(
             job.spec.framework.actor.model_copy(deep=True),
             role="actor",
-            learning_rate=job.spec.framework.trainer.learning_rate,
+            learning_rate=job.spec.framework.controller.learning_rate,
         )
         reference_backend = (
             create_training_backend(
