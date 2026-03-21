@@ -1,4 +1,4 @@
-"""Tests for the platform controller/runtime entrypoints."""
+"""Tests for the platform controller and explicit pod-runtime entrypoints."""
 
 from __future__ import annotations
 
@@ -7,7 +7,13 @@ from pathlib import Path
 
 import pytest
 
+import flashrl.__main__ as root_cli_module
+import flashrl.platform.runtime.cli as runtime_cli_module
 import flashrl.platform.runtime.controller as controller_module
+import flashrl.platform.runtime.learner as learner_runtime_module
+import flashrl.platform.runtime.reward as reward_runtime_module
+import flashrl.platform.runtime.rollout as rollout_runtime_module
+import flashrl.platform.runtime.serving as serving_runtime_module
 
 
 pytestmark = pytest.mark.unit
@@ -44,8 +50,8 @@ def _job_payload() -> dict[str, object]:
     }
 
 
-def test_run_controller_constructs_http_clients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
-    """The platform controller should instantiate GRPOTrainer with HTTP clients."""
+def test_run_controller_constructs_remote_clients(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The controller runtime should instantiate GRPOTrainer with remote clients."""
     job_path = tmp_path / "job.json"
     job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
     captured: dict[str, object] = {}
@@ -86,21 +92,21 @@ def test_run_controller_constructs_http_clients(monkeypatch: pytest.MonkeyPatch,
         def train(self, dataset) -> None:
             captured["dataset"] = list(dataset)
 
-    monkeypatch.setattr(controller_module, "HttpRolloutClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpRewardClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpLearnerClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpServingClient", _StubClient)
-    monkeypatch.setattr(controller_module, "ControllerStatusWriter", _StubStatusWriter)
+    monkeypatch.setattr(controller_module, "RolloutClient", _StubClient)
+    monkeypatch.setattr(controller_module, "RewardClient", _StubClient)
+    monkeypatch.setattr(controller_module, "LearnerClient", _StubClient)
+    monkeypatch.setattr(controller_module, "ServingClient", _StubClient)
+    monkeypatch.setattr(controller_module, "FlashRLJobStatusWriter", _StubStatusWriter)
     monkeypatch.setattr(controller_module, "GRPOTrainer", _StubTrainer)
-    monkeypatch.setattr(controller_module, "load_dataset", lambda job: [])
+    monkeypatch.setattr(controller_module, "load_controller_dataset", lambda job: [])
 
     controller_module.run_controller(job_path)
 
     trainer_kwargs = captured["trainer_kwargs"]
-    assert trainer_kwargs["rollout_client"].url.endswith("/demo-job-rollout.default.svc.cluster.local")
-    assert trainer_kwargs["reward_client"].url.endswith("/demo-job-reward.default.svc.cluster.local")
-    assert trainer_kwargs["learner_client"].url.endswith("/demo-job-learner-0.demo-job-learner.default.svc.cluster.local")
-    assert trainer_kwargs["serving_client"].url.endswith("/demo-job-serving.default.svc.cluster.local")
+    assert trainer_kwargs["rollout"].url.endswith("/demo-job-rollout.default.svc.cluster.local")
+    assert trainer_kwargs["reward"].url.endswith("/demo-job-reward.default.svc.cluster.local")
+    assert trainer_kwargs["learner"].url.endswith("/demo-job-learner-0.demo-job-learner.default.svc.cluster.local")
+    assert trainer_kwargs["serving"].url.endswith("/demo-job-serving.default.svc.cluster.local")
     assert trainer_kwargs["reference_configured"] is False
     assert captured["dataset"] == []
 
@@ -177,13 +183,13 @@ def test_run_controller_uses_static_runtime_spec_and_live_status(
         captured["merged_step"] = job.status.progress.currentStep
         return []
 
-    monkeypatch.setattr(controller_module, "HttpRolloutClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpRewardClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpLearnerClient", _StubClient)
-    monkeypatch.setattr(controller_module, "HttpServingClient", _StubClient)
-    monkeypatch.setattr(controller_module, "ControllerStatusWriter", _StubStatusWriter)
+    monkeypatch.setattr(controller_module, "RolloutClient", _StubClient)
+    monkeypatch.setattr(controller_module, "RewardClient", _StubClient)
+    monkeypatch.setattr(controller_module, "LearnerClient", _StubClient)
+    monkeypatch.setattr(controller_module, "ServingClient", _StubClient)
+    monkeypatch.setattr(controller_module, "FlashRLJobStatusWriter", _StubStatusWriter)
     monkeypatch.setattr(controller_module, "GRPOTrainer", _StubTrainer)
-    monkeypatch.setattr(controller_module, "load_dataset", _capture_dataset)
+    monkeypatch.setattr(controller_module, "load_controller_dataset", _capture_dataset)
 
     controller_module.run_controller(job_path)
 
@@ -191,3 +197,167 @@ def test_run_controller_uses_static_runtime_spec_and_live_status(
     assert captured["weights_prefix"] == "/var/lib/flashrl/shared/weights"
     assert captured["merged_step"] == 11
     assert captured["resume_path"] == "/remote/checkpoints/step-00000010.pt"
+
+
+def test_top_level_cli_dispatches_direct_component_verbs(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The top-level CLI should route direct pod verbs into the runtime CLI."""
+    captured: dict[str, object] = {}
+
+    def _stub_main(argv=None):
+        captured["argv"] = argv
+        return 0
+
+    monkeypatch.setattr(runtime_cli_module, "main", _stub_main)
+
+    exit_code = root_cli_module.main(["rollout", "--port", "9000"])
+
+    assert exit_code == 0
+    assert captured["argv"] == ["rollout", "--port", "9000"]
+
+
+def test_top_level_cli_rejects_old_component_subtree(capsys: pytest.CaptureFixture[str]) -> None:
+    """The removed `flashrl component ...` subtree should now fail clearly."""
+    exit_code = root_cli_module.main(["component", "run", "rollout"])
+
+    assert exit_code == 2
+    assert "Unknown command: component" in capsys.readouterr().err
+
+
+def test_runtime_cli_dispatches_to_explicit_role_modules(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The runtime CLI should only parse args and delegate to one role module."""
+    captured: dict[str, object] = {}
+
+    def _stub_run_rollout_pod(*, host: str, port: int) -> int:
+        captured["dispatch"] = ("rollout", host, port)
+        return 0
+
+    monkeypatch.setattr(runtime_cli_module, "run_rollout_pod", _stub_run_rollout_pod)
+
+    assert runtime_cli_module.main(["rollout", "--host", "127.0.0.1", "--port", "9000"]) == 0
+    assert captured["dispatch"] == ("rollout", "127.0.0.1", 9000)
+
+
+def test_create_rollout_pod_app_builds_rollout_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The rollout module should wire the rollout hook into the rollout server."""
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
+    monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
+    monkeypatch.setenv("FLASHRL_JOB_NAME", "demo-job")
+    monkeypatch.setenv("FLASHRL_NAMESPACE", "default")
+    captured: dict[str, object] = {}
+
+    class _StubServingClient:
+        def __init__(self, url: str) -> None:
+            captured["serving_url"] = url
+
+    class _StubRolloutService:
+        def __init__(self, generator) -> None:
+            captured["generator"] = generator
+
+    monkeypatch.setattr(rollout_runtime_module.runtime_support, "instantiate_hook", lambda binding: "rollout-impl")
+    monkeypatch.setattr(rollout_runtime_module, "ServingClient", _StubServingClient)
+    monkeypatch.setattr(rollout_runtime_module, "RemoteServingBackend", lambda **kwargs: {"backend": kwargs})
+    monkeypatch.setattr(
+        rollout_runtime_module,
+        "build_rollout_generator",
+        lambda **kwargs: captured.setdefault("rollout_builder", kwargs) or "generator",
+    )
+    monkeypatch.setattr(rollout_runtime_module, "RolloutService", _StubRolloutService)
+    monkeypatch.setattr(
+        rollout_runtime_module,
+        "create_rollout_service_app",
+        lambda service: {"app": "rollout", "service": service},
+    )
+
+    app = rollout_runtime_module.create_rollout_pod_app()
+    assert app["app"] == "rollout"
+    assert str(captured["serving_url"]).endswith("/demo-job-serving.default.svc.cluster.local")
+    assert captured["rollout_builder"]["rollout_fn"] == "rollout-impl"
+
+
+def test_create_reward_pod_app_builds_reward_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The reward module should wire the reward hook into the reward server."""
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
+    monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
+    captured: dict[str, object] = {}
+
+    class _StubRewardService:
+        def __init__(self, reward) -> None:
+            captured["reward_impl"] = reward
+
+    monkeypatch.setattr(reward_runtime_module.runtime_support, "instantiate_hook", lambda binding: "reward-hook")
+    monkeypatch.setattr(reward_runtime_module, "UserDefinedReward", lambda **kwargs: {"reward": kwargs})
+    monkeypatch.setattr(reward_runtime_module, "RewardService", _StubRewardService)
+    monkeypatch.setattr(
+        reward_runtime_module,
+        "create_reward_service_app",
+        lambda service: {"app": "reward", "service": service},
+    )
+
+    app = reward_runtime_module.create_reward_pod_app()
+    assert app["app"] == "reward"
+    assert captured["reward_impl"]["reward"]["reward_fn"] == "reward-hook"
+
+
+def test_create_learner_pod_app_builds_learner_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The learner module should build backends and publish weights to shared storage."""
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
+    monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        learner_runtime_module,
+        "create_training_backend",
+        lambda config, **kwargs: captured.setdefault(f"{kwargs['role']}_backend", config.backend) or f"{kwargs['role']}-backend",
+    )
+    monkeypatch.setattr(
+        learner_runtime_module,
+        "LearnerService",
+        lambda actor_backend, reference_backend, **kwargs: captured.setdefault(
+            "learner_service",
+            {
+                "actor_backend": actor_backend,
+                "reference_backend": reference_backend,
+                **kwargs,
+            },
+        )
+        or "learner-client",
+    )
+    monkeypatch.setattr(
+        learner_runtime_module,
+        "create_learner_service_app",
+        lambda service: {"app": "learner", "service": service},
+    )
+
+    app = learner_runtime_module.create_learner_pod_app()
+    assert app["app"] == "learner"
+    assert captured["actor_backend"] == "huggingface"
+    assert str(captured["learner_service"]["publish_dir"]).endswith("/tmp/flashrl/weights")
+    assert captured["learner_service"]["synchronize_serving"] is False
+
+
+def test_create_serving_pod_app_builds_serving_service(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """The serving module should build the serving backend and serving server app."""
+    job_path = tmp_path / "job.json"
+    job_path.write_text(json.dumps(_job_payload()), encoding="utf-8")
+    monkeypatch.setenv("FLASHRL_JOB_CONFIG_PATH", str(job_path))
+    captured: dict[str, object] = {}
+
+    monkeypatch.setattr(
+        serving_runtime_module,
+        "create_serving_backend",
+        lambda config, **kwargs: captured.setdefault("serving_backend", {"backend": config.backend, **kwargs}) or "serving-backend",
+    )
+    monkeypatch.setattr(serving_runtime_module, "ServingService", lambda backend: {"backend": backend})
+    monkeypatch.setattr(
+        serving_runtime_module,
+        "create_serving_service_app",
+        lambda service: {"app": "serving", "service": service},
+    )
+
+    app = serving_runtime_module.create_serving_pod_app()
+    assert app["app"] == "serving"
+    assert captured["serving_backend"]["backend"] == "huggingface"
+    assert str(captured["serving_backend"]["log_dir"]).endswith("/tmp/flashrl/weights")

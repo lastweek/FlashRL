@@ -1,2 +1,1 @@
-"""Runtime entrypoints and app builders for platform pods."""
-
+"""Pod bootstrap and controller runtime for platform workloads."""

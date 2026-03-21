@@ -10,8 +10,8 @@ import yaml
 
 from flashrl.platform.config import PlatformConfig, build_flashrl_job, load_flashrl_config
 from flashrl.platform.k8s.job import FlashRLJob
+from flashrl.platform.k8s.job_resources import render_job_resources
 from flashrl.platform.k8s.operator import FlashRLOperator
-from flashrl.platform.k8s.renderer import render_child_resources
 
 
 def _load_job_file(path: str | Path) -> FlashRLJob:
@@ -49,7 +49,7 @@ def build_argument_parser() -> argparse.ArgumentParser:
     render.add_argument(
         "--children",
         action="store_true",
-        help="Render child Kubernetes resources instead of the FlashRLJob itself.",
+        help="Render the Kubernetes job resources instead of the FlashRLJob itself.",
     )
 
     submit = platform_subparsers.add_parser("submit", help="Submit one FlashRLJob")
@@ -99,7 +99,7 @@ def main(argv: list[str] | None = None) -> int:
             profile=getattr(args, "profile", None),
         )
         if args.children:
-            payload = json.dumps(render_child_resources(job), indent=2)
+            payload = json.dumps(render_job_resources(job), indent=2)
         else:
             payload = _dump_yaml(job.model_dump(mode="json", by_alias=True))
         if args.output:
@@ -121,12 +121,12 @@ def main(argv: list[str] | None = None) -> int:
         if args.namespace is not None:
             job.metadata["namespace"] = args.namespace
         if args.render_only:
-            print(json.dumps(render_child_resources(job), indent=2))
+            print(json.dumps(render_job_resources(job), indent=2))
             return 0
         operator = FlashRLOperator()
         operator.ensure_crd()
         namespace = str(job.metadata.get("namespace") or "default")
-        operator.submit_job(job, namespace=namespace)
+        operator.apply_job(job, namespace=namespace)
         print(f"Submitted FlashRLJob {job.name} to namespace={namespace}.")
         return 0
 
@@ -139,7 +139,7 @@ def main(argv: list[str] | None = None) -> int:
     if args.platform_command == "operator":
         operator = FlashRLOperator()
         operator.ensure_crd()
-        operator.run_forever(namespace=args.namespace, resync_seconds=args.resync_seconds)
+        operator.watch(namespace=args.namespace, resync_seconds=args.resync_seconds)
         return 0
 
     operator = FlashRLOperator()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import importlib
 from pathlib import Path
 import threading
 
@@ -15,19 +16,19 @@ from flashrl.framework.config import GrpoConfig, RolloutConfig, ServingConfig, T
 from flashrl.framework.data_models import Conversation, LearnerBatch, Message, Prompt, RewardOutput, RolloutOutput
 from flashrl.framework.distributed import (
     ActivateWeightVersionRequest,
-    HttpServingClient,
-    LocalLearnerClient,
-    LocalRewardClient,
-    LocalRolloutClient,
-    LocalServingClient,
+    LearnerService,
     OptimizeStepRequest,
+    RewardService,
+    RolloutService,
     RewardBatchRequest,
     RolloutBatchRequest,
+    ServingClient,
+    ServingService,
     StatusResponse,
-    create_learner_app,
-    create_reward_app,
-    create_rollout_app,
-    create_serving_app,
+    create_learner_service_app,
+    create_reward_service_app,
+    create_rollout_service_app,
+    create_serving_service_app,
 )
 from flashrl.framework.rollout.base import build_rollout_generator
 from flashrl.framework.training import HuggingFaceTrainingBackend
@@ -104,14 +105,14 @@ def test_learner_and_serving_service_apps_publish_and_activate_weights(
         ServingConfig(model_name="fake/model", num_threads=1)
     )
 
-    learner_client = LocalLearnerClient(
+    learner_service = LearnerService(
         actor_backend,
         None,
         grpo_config=GrpoConfig(kl_coefficient=0.0),
         publish_dir=tmp_path,
         synchronize_serving=False,
     )
-    learner_app = create_learner_app(learner_client)
+    learner_app = create_learner_service_app(learner_service)
     learner_http = TestClient(learner_app)
 
     optimize_request = OptimizeStepRequest(
@@ -128,8 +129,8 @@ def test_learner_and_serving_service_apps_publish_and_activate_weights(
     assert published["version_id"] == 1
     assert Path(published["artifact_uri"]).exists()
 
-    serving_client = LocalServingClient(serving_backend)
-    serving_app = create_serving_app(serving_client)
+    serving_service = ServingService(serving_backend)
+    serving_app = create_serving_service_app(serving_service)
     serving_http = TestClient(serving_app)
 
     activate_response = serving_http.post(
@@ -156,8 +157,8 @@ def test_rollout_and_reward_service_apps_round_trip_batches(
         serving_backend=serving_backend,
         config=RolloutConfig(max_new_tokens=16),
     )
-    rollout_client = LocalRolloutClient(rollout_generator)
-    reward_client = LocalRewardClient(
+    rollout_service = RolloutService(rollout_generator)
+    reward_service = RewardService(
         reward=type(
             "_Reward",
             (),
@@ -169,8 +170,8 @@ def test_rollout_and_reward_service_apps_round_trip_batches(
         )()
     )
 
-    rollout_http = TestClient(create_rollout_app(rollout_client))
-    reward_http = TestClient(create_reward_app(reward_client))
+    rollout_http = TestClient(create_rollout_service_app(rollout_service))
+    reward_http = TestClient(create_reward_service_app(reward_service))
 
     rollout_response = rollout_http.post(
         "/v1/rollout-batches",
@@ -195,10 +196,10 @@ def test_rollout_and_reward_service_apps_round_trip_batches(
     assert reward_payload["metrics"]["sample_count"] == 4
 
 
-def test_http_serving_client_parses_status_responses(
+def test_serving_client_parses_remote_status_responses(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """HTTP adapters should parse shared status payloads from JSON endpoints."""
+    """Remote clients should parse shared status payloads from JSON endpoints."""
     captured: dict[str, object] = {}
 
     class _Response:
@@ -231,7 +232,7 @@ def test_http_serving_client_parses_status_responses(
         fake_urlopen,
     )
 
-    client = HttpServingClient("http://serving.internal", timeout_seconds=9.0)
+    client = ServingClient("http://serving.internal", timeout_seconds=9.0)
     response = client.status()
     assert captured == {
         "url": "http://serving.internal/v1/status",
@@ -275,7 +276,7 @@ def test_rollout_service_reports_load_and_drains_during_inflight_requests() -> N
             candidate_indices = [candidate for _index, _prompt in enumerate(prompts) for candidate in range(group_size)]
             return prompts, rollouts, prompt_indices, candidate_indices
 
-    app = create_rollout_app(LocalRolloutClient(_BlockingRolloutGenerator()))
+    app = create_rollout_service_app(RolloutService(_BlockingRolloutGenerator()))
     client = TestClient(app)
 
     response_holder: dict[str, object] = {}
@@ -316,17 +317,41 @@ def test_rollout_service_reports_load_and_drains_during_inflight_requests() -> N
     assert drained_status["metadata"]["draining"] is True
 
 
-def test_distributed_package_reexports_clients_and_servers() -> None:
-    """The consolidated distributed package should expose clients and app factories directly."""
+def test_distributed_package_reexports_services_clients_and_servers() -> None:
+    """The distributed package should expose services, clients, and app factories directly."""
     from flashrl.framework.distributed import (
-        HttpServingClient as ImportedHttpServingClient,
-        LocalLearnerClient as ImportedLocalLearnerClient,
-        create_reward_app as imported_create_reward_app,
+        LearnerService as ImportedLearnerService,
+        ServingClient as ImportedServingClient,
+        create_reward_service_app as imported_create_reward_service_app,
     )
 
-    assert ImportedHttpServingClient is HttpServingClient
-    assert ImportedLocalLearnerClient is LocalLearnerClient
-    assert imported_create_reward_app is create_reward_app
+    assert ImportedServingClient is ServingClient
+    assert ImportedLearnerService is LearnerService
+    assert imported_create_reward_service_app is create_reward_service_app
+
+
+def test_distributed_package_no_longer_exports_protocols_or_legacy_names() -> None:
+    """The legacy Local/Http/protocol surface should stay removed."""
+    import flashrl.framework.distributed as distributed_module
+
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.framework.distributed.protocols")
+
+    for name in (
+        "LocalRolloutClient",
+        "LocalRewardClient",
+        "LocalLearnerClient",
+        "LocalServingClient",
+        "HttpRolloutClient",
+        "HttpRewardClient",
+        "HttpLearnerClient",
+        "HttpServingClient",
+        "create_rollout_app",
+        "create_reward_app",
+        "create_learner_app",
+        "create_serving_app",
+    ):
+        assert not hasattr(distributed_module, name), f"legacy export still present: {name}"
 
 
 def test_repo_imports_use_consolidated_distributed_layout() -> None:

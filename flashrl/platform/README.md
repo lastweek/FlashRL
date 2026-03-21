@@ -9,24 +9,44 @@ The primary workflow is:
 3. render one `FlashRLJob`
 4. apply it with `kubectl`
 
+If you want the system picture before the code map, start here:
+
+- [docs/platform-architecture.md](../../docs/platform-architecture.md)
+
 ## Code Map
 
-- `job.py`
+- `k8s/job.py`
   The `FlashRLJob` API, schema, status model, and CRD manifest generator.
 - `config.py`
   The config compiler from `config.yaml` into a validated `FlashRLJob`.
-- `k8s/renderer.py`
-  Pure rendering of child Kubernetes resources for one job.
-- `k8s/operator.py`
-  The reconcile loop, autoscaling, recovery, and status aggregation.
-- `runtime/common.py`
-  Shared pod-runtime helpers such as job loading, service URL resolution, and shared paths.
-- `runtime/components.py`
-  FastAPI app factories for rollout, reward, learner, and serving pods.
+- `k8s/job_resources.py`
+  Explicit rendering of the config, controller, learner, serving, rollout, and reward resources for one job.
+- `k8s/operator/__init__.py`
+  The small public operator facade with `ensure_crd`, `apply_job`, `get_job`, `delete_job`, `reconcile`, and `watch`.
+- `k8s/operator/kube.py`
+  Tiny helper for lazy Kubernetes client loading, watch loading, and normalized error/object handling.
+- `k8s/operator/status.py`
+  Component observation collection plus phase, condition, and CRD status summary logic, using explicit Kubernetes API reads.
+- `k8s/operator/scaling.py`
+  Autoscaling logic for serving, rollout, and reward pools, using explicit AppsV1 replica patches.
+- `k8s/operator/recovery.py`
+  Recovery logic for learner and elastic pools, using explicit StatefulSet and Deployment operations.
+- `k8s/operator/reconcile.py`
+  The explicit reconcile sequence: apply children, observe, scale, recover, summarize, and patch status through raw Kubernetes APIs.
 - `runtime/controller.py`
-  The controller runtime that drives GRPO over HTTP clients.
+  The only platform-specific long-running runtime. It loads the mounted job, builds HTTP clients, and starts GRPO training.
+- `runtime/pod.py`
+  The literal mounted pod contract: load the mounted job, resolve sibling service URLs, and turn storage URIs into container paths.
 - `runtime/cli.py`
-  The `flashrl component run ...` entrypoint used by pod commands.
+  The thin pod-command dispatcher used by `flashrl controller|rollout|reward|learner|serving`.
+- `runtime/rollout.py`
+  The explicit rollout pod bootstrap: rollout hook plus remote serving client plus rollout HTTP server.
+- `runtime/reward.py`
+  The explicit reward pod bootstrap: reward hook plus reward HTTP server.
+- `runtime/learner.py`
+  The explicit learner pod bootstrap: actor/reference backends plus learner HTTP server.
+- `runtime/serving.py`
+  The explicit serving pod bootstrap: serving backend plus serving HTTP server.
 - `dev/minikube.py`
   The local minikube E2E helper used by the opt-in smoke path.
 

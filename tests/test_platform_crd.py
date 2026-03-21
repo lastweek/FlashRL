@@ -13,7 +13,7 @@ from flashrl.framework.config import FlashRLConfig, RunConfig
 from flashrl.platform.cli import main as platform_main
 from flashrl.platform.config import PlatformConfig, build_flashrl_job
 from flashrl.platform.k8s.job import FlashRLJob, flashrljob_crd_manifest
-from flashrl.platform.k8s.renderer import render_child_resources
+from flashrl.platform.k8s.job_resources import render_job_resources
 
 
 pytestmark = pytest.mark.unit
@@ -162,10 +162,10 @@ def test_build_flashrl_job_translates_run_and_platform_configs(tmp_path: Path) -
     assert job.spec.serving.replicas.max == 4
 
 
-def test_render_child_resources_builds_expected_workloads() -> None:
+def test_render_job_resources_builds_expected_workloads() -> None:
     """One FlashRLJob should render the shared runtime image across controller, rollout, and reward."""
     job = FlashRLJob.model_validate(_job_payload())
-    rendered = render_child_resources(job)
+    rendered = render_job_resources(job)
     kinds = [item["kind"] for item in rendered]
     assert kinds.count("Deployment") == 4
     assert kinds.count("StatefulSet") == 1
@@ -204,9 +204,151 @@ def test_platform_module_surface_imports_cleanly() -> None:
     """The structured platform modules should remain importable by responsibility."""
     assert importlib.import_module("flashrl.platform.config") is not None
     assert importlib.import_module("flashrl.platform.k8s.job") is not None
+    assert importlib.import_module("flashrl.platform.k8s.job_resources") is not None
     assert importlib.import_module("flashrl.platform.k8s.operator") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.kube") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.reconcile") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.status") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.scaling") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.recovery") is not None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.k8s.renderer")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.k8s.operator.store")
     assert importlib.import_module("flashrl.platform.runtime.controller") is not None
+    assert importlib.import_module("flashrl.platform.runtime.pod") is not None
     assert importlib.import_module("flashrl.platform.runtime.cli") is not None
+    assert importlib.import_module("flashrl.platform.runtime.rollout") is not None
+    assert importlib.import_module("flashrl.platform.runtime.reward") is not None
+    assert importlib.import_module("flashrl.platform.runtime.learner") is not None
+    assert importlib.import_module("flashrl.platform.runtime.serving") is not None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.common")
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.runtime.components")
+
+
+def test_platform_docs_and_tests_no_longer_reference_flat_operator_files() -> None:
+    """Docs and tests should point at the operator package, not the old flat files."""
+    root = Path(__file__).resolve().parents[1]
+    checked_paths = [
+        root / "flashrl/platform/README.md",
+        root / "tests/test_platform_operator.py",
+    ]
+    forbidden = [
+        "k8s/operator.py",
+        "k8s/status.py",
+        "k8s/scaling.py",
+        "k8s/recovery.py",
+        "k8s/reconcile.py",
+    ]
+
+    for path in checked_paths:
+        content = path.read_text(encoding="utf-8")
+        for needle in forbidden:
+            assert needle not in content, f"{path} still references {needle}"
+
+
+def test_platform_architecture_doc_is_linked_from_readmes() -> None:
+    """The platform architecture doc should be discoverable from the main docs."""
+    root = Path(__file__).resolve().parents[1]
+    architecture_doc = root / "docs/platform-architecture.md"
+    root_readme = root / "README.md"
+    platform_readme = root / "flashrl/platform/README.md"
+
+    assert architecture_doc.exists()
+    assert "docs/platform-architecture.md" in root_readme.read_text(encoding="utf-8")
+    assert "../../docs/platform-architecture.md" in platform_readme.read_text(encoding="utf-8")
+
+
+def test_platform_readme_matches_simplified_runtime_layout() -> None:
+    """The platform README should not mention removed runtime shim modules."""
+    platform_readme = Path(__file__).resolve().parents[1] / "flashrl/platform/README.md"
+    content = platform_readme.read_text(encoding="utf-8")
+
+    assert "runtime/common.py" not in content
+    assert "runtime/components.py" not in content
+    assert "k8s/renderer.py" not in content
+    assert "k8s/job_resources.py" in content
+
+
+def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
+    """The architecture doc should include per-pod init and execution workflows."""
+    architecture_doc = Path(__file__).resolve().parents[1] / "docs/platform-architecture.md"
+    content = architecture_doc.read_text(encoding="utf-8")
+
+    assert "## What Platform Adds Per Pod" in content
+    assert "flashrl.platform.runtime.pod" in content
+    assert "flashrl.platform.runtime.controller" in content
+    assert "flashrl.platform.runtime.rollout" in content
+    assert "flashrl.platform.runtime.reward" in content
+    assert "flashrl.platform.runtime.learner" in content
+    assert "flashrl.platform.runtime.serving" in content
+    for heading in (
+        "## Inside Each Pod",
+        "### Controller Pod",
+        "### Rollout Pod",
+        "### Reward Pod",
+        "### Learner Pod",
+        "### Serving Pod",
+        "#### Init Workflow",
+        "#### Execution Workflow",
+    ):
+        assert heading in content
+
+    assert "platform runtime" in content
+    assert "framework distributed" in content
+    assert "Controller Container" in content
+    assert "Rollout Container" in content
+    assert "Reward Container" in content
+    assert "Learner Container" in content
+    assert "Serving Container" in content
+    assert "container=controller" in content
+    assert "container=rollout" in content
+    assert "container=reward" in content
+    assert "container=learner" in content
+    assert "container=serving" in content
+    assert "<job>-controller" in content
+    assert "<job>-rollout" in content
+    assert "<job>-reward" in content
+    assert "<job>-learner" in content
+    assert "<job>-serving" in content
+    assert "load_mounted_job" in content
+    assert "service_url_for" in content
+    assert "storage_path_from_uri" in content
+    assert "RolloutClient" in content
+    assert "RewardClient" in content
+    assert "LearnerClient" in content
+    assert "ServingClient" in content
+    assert "RolloutService" in content
+    assert "RewardService" in content
+    assert "LearnerService" in content
+    assert "ServingService" in content
+    assert "RemoteServingBackend" in content
+    assert "create_rollout_service_app" in content
+    assert "create_reward_service_app" in content
+    assert "create_learner_service_app" in content
+    assert "create_serving_service_app" in content
+    assert "GRPOTrainer" in content
+    assert "/v1/rollout-batches" in content
+    assert "/v1/reward-batches" in content
+    assert "/v1/optimize-steps" in content
+    assert "/v1/generate-grouped" in content
+    assert "/v1/activate-weight-version" in content
+    for legacy_name in (
+        "HttpRolloutClient",
+        "HttpRewardClient",
+        "HttpLearnerClient",
+        "HttpServingClient",
+        "HttpServingBackend",
+        "LocalLearnerClient",
+        "LocalServingClient",
+        "create_rollout_app",
+        "create_reward_app",
+        "create_learner_app",
+        "create_serving_app",
+    ):
+        assert legacy_name not in content
 
 
 def test_platform_cli_no_longer_supports_render_operator() -> None:
@@ -230,10 +372,10 @@ def test_flashrl_job_defaults_platform_policy_knobs() -> None:
     assert job.spec.rollout.failurePolicy.mode == "replace-pod"
 
 
-def test_render_child_resources_include_rbac_pdb_and_component_commands() -> None:
+def test_render_job_resources_include_rbac_pdb_and_component_commands() -> None:
     """Rendered children should include platform infrastructure and per-component commands."""
     job = FlashRLJob.model_validate(_job_payload())
-    rendered = render_child_resources(job)
+    rendered = render_job_resources(job)
 
     kinds = [item["kind"] for item in rendered]
     assert kinds.count("PersistentVolumeClaim") == 1
@@ -257,10 +399,11 @@ def test_render_child_resources_include_rbac_pdb_and_component_commands() -> Non
         if item["kind"] == "Deployment" and item["metadata"]["name"] == "demo-job-serving"
     )
     container = serving_deployment["spec"]["template"]["spec"]["containers"][0]
-    assert container["command"] == ["flashrl", "component", "run", "serving-vllm"]
+    assert container["command"] == ["flashrl", "serving"]
     assert container["readinessProbe"]["httpGet"]["path"] == "/readyz"
     assert container["livenessProbe"]["httpGet"]["path"] == "/healthz"
     assert "lifecycle" in container
+    assert not any(env["name"] == "FLASHRL_COMPONENT" for env in container["env"])
     assert any(
         mount["name"] == "shared-storage" and mount["mountPath"] == "/var/lib/flashrl/shared"
         for mount in container["volumeMounts"]

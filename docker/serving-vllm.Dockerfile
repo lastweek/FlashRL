@@ -19,4 +19,4 @@ RUN python -m pip install --upgrade pip \
 ENV PYTHONUNBUFFERED=1
 
 ENTRYPOINT ["flashrl"]
-CMD ["component", "run", "serving-vllm"]
+CMD ["serving"]

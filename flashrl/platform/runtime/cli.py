@@ -1,56 +1,36 @@
-"""CLI entrypoints for platform component pods."""
+"""Direct pod-command dispatcher for FlashRL platform workloads."""
 
 from __future__ import annotations
 
 import argparse
 
-import uvicorn
-
-from flashrl.platform.runtime.common import load_job_config
-from flashrl.platform.runtime.components import (
-    create_learner_component_app,
-    create_reward_component_app,
-    create_rollout_component_app,
-    create_serving_component_app,
-)
-from flashrl.platform.runtime.controller import create_controller_app
+from flashrl.platform.runtime.controller import run_controller_pod
+from flashrl.platform.runtime.learner import run_learner_pod
+from flashrl.platform.runtime.reward import run_reward_pod
+from flashrl.platform.runtime.rollout import run_rollout_pod
+from flashrl.platform.runtime.serving import run_serving_pod
 
 
 def build_component_argument_parser() -> argparse.ArgumentParser:
-    """Build the component runtime CLI parser."""
-    parser = argparse.ArgumentParser(prog="flashrl", description="FlashRL component runtime")
+    """Build the direct pod-runtime CLI parser."""
+    parser = argparse.ArgumentParser(prog="flashrl", description="FlashRL platform pod runtime")
     subparsers = parser.add_subparsers(dest="component_command", required=True)
-    run = subparsers.add_parser("run", help="Run one FlashRL platform component")
-    run.add_argument(
-        "component",
-        choices=["controller", "rollout", "reward", "learner", "serving-vllm"],
-    )
-    run.add_argument("--host", default="0.0.0.0")
-    run.add_argument("--port", type=int, default=8000)
+    for component in ("controller", "rollout", "reward", "learner", "serving"):
+        subparser = subparsers.add_parser(component, help=f"Run the {component} platform pod")
+        subparser.add_argument("--host", default="0.0.0.0")
+        subparser.add_argument("--port", type=int, default=8000)
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
-    """Run one platform component entrypoint."""
+    """Parse the pod command, then dispatch to one explicit role module."""
     parser = build_component_argument_parser()
     args = parser.parse_args(argv)
-    if args.component_command != "run":
-        parser.error("unsupported component command")
-
-    if args.component == "controller":
-        uvicorn.run(create_controller_app(), host=args.host, port=args.port, log_level="info")
-        return 0
-
-    job = load_job_config()
-    if args.component == "rollout":
-        app = create_rollout_component_app(job)
-    elif args.component == "reward":
-        app = create_reward_component_app(job)
-    elif args.component == "learner":
-        app = create_learner_component_app(job)
-    elif args.component == "serving-vllm":
-        app = create_serving_component_app(job)
-    else:  # pragma: no cover - argparse choices guard this.
-        parser.error(f"unknown component {args.component!r}")
-    uvicorn.run(app, host=args.host, port=args.port, log_level="info")
-    return 0
+    dispatch = {
+        "controller": run_controller_pod,
+        "rollout": run_rollout_pod,
+        "reward": run_reward_pod,
+        "learner": run_learner_pod,
+        "serving": run_serving_pod,
+    }
+    return int(dispatch[args.component_command](host=args.host, port=args.port))

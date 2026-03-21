@@ -3,12 +3,24 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from datetime import datetime, timezone
+import importlib
 from urllib.parse import urlparse
 
 import pytest
 
-from flashrl.platform.k8s.job import FlashRLJob
+from flashrl.framework.distributed.models import ComponentStatus
+from flashrl.platform.k8s.job import FlashRLJob, WorkloadStatus
 from flashrl.platform.k8s.operator import FINALIZER, FlashRLOperator
+from flashrl.platform.k8s.operator.reconcile import JobReconciler
+from flashrl.platform.k8s.operator.recovery import RecoveryManager
+from flashrl.platform.k8s.operator.scaling import Autoscaler
+from flashrl.platform.k8s.operator.status import (
+    ComponentObservation,
+    JobStatusSummary,
+    LoadSnapshot,
+    StatusCollector,
+)
 
 
 pytestmark = pytest.mark.unit
@@ -450,6 +462,25 @@ def _http_status_map(mapping: dict[str, dict[str, object]]):
     return _getter
 
 
+def test_operator_module_exports_public_facade() -> None:
+    """The operator module should keep the stable public facade."""
+    module = importlib.import_module("flashrl.platform.k8s.operator")
+
+    assert getattr(module, "FlashRLOperator", None) is not None
+    assert getattr(module, "FINALIZER", None) == FINALIZER
+
+
+def test_operator_package_submodules_import_cleanly() -> None:
+    """The operator package should expose the explicit internal submodules."""
+    assert importlib.import_module("flashrl.platform.k8s.operator.kube") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.reconcile") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.status") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.scaling") is not None
+    assert importlib.import_module("flashrl.platform.k8s.operator.recovery") is not None
+    with pytest.raises(ModuleNotFoundError):
+        importlib.import_module("flashrl.platform.k8s.operator.store")
+
+
 def test_operator_reconcile_scales_serving_and_preserves_controller_progress() -> None:
     """Reconcile should add a finalizer, scale serving, and keep controller-owned progress."""
     cluster = FakeCluster()
@@ -500,7 +531,7 @@ def test_operator_reconcile_scales_serving_and_preserves_controller_progress() -
         http_getter=_http_status_map(status_map),
     )
     job = FlashRLJob.model_validate(cluster.get_custom_object("default", "demo-job"))
-    status = operator.reconcile_payload(job)
+    status = operator.reconcile(job)
 
     custom_object = cluster.get_custom_object("default", "demo-job")
     serving = cluster.get_resource("Deployment", "default", "demo-job-serving")
@@ -544,7 +575,7 @@ def test_operator_reconcile_restarts_learner_set_after_timeout() -> None:
 
     operator = FlashRLOperator(client_module=FakeClientModule(cluster), http_getter=_http_status_map({}))
     job = FlashRLJob.model_validate(cluster.get_custom_object("default", "demo-job"))
-    status = operator.reconcile_payload(job)
+    status = operator.reconcile(job)
 
     learner = cluster.get_resource("StatefulSet", "default", "demo-job-learner")
     assert learner["spec"]["replicas"] == 0
@@ -583,10 +614,169 @@ def test_operator_reconcile_restarts_zero_ready_serving_pool_after_timeout() -> 
 
     operator = FlashRLOperator(client_module=FakeClientModule(cluster), http_getter=_http_status_map({}))
     job = FlashRLJob.model_validate(cluster.get_custom_object("default", "demo-job"))
-    status = operator.reconcile_payload(job)
+    status = operator.reconcile(job)
 
     serving = cluster.get_resource("Deployment", "default", "demo-job-serving")
     annotations = serving["spec"]["template"]["metadata"]["annotations"]
     assert "flashrl.dev/restartedAt" in annotations
     assert status["components"]["serving"]["recoveryAttempts"] == 1
     assert status["components"]["serving"]["phase"] == "Recovering"
+
+
+def test_operator_apply_job_replaces_existing_custom_object() -> None:
+    """FlashRLOperator.apply_job should upsert FlashRLJobs."""
+    cluster = FakeCluster()
+    cluster.put_custom_object("default", _job_payload())
+    operator = FlashRLOperator(client_module=FakeClientModule(cluster))
+    job = FlashRLJob.model_validate(_job_payload())
+    job.metadata["labels"] = {"env": "test"}
+
+    payload = operator.apply_job(job, namespace="default")
+
+    assert payload["metadata"]["labels"] == {"env": "test"}
+    assert cluster.get_custom_object("default", "demo-job")["metadata"]["labels"] == {"env": "test"}
+
+
+def test_status_collector_summarize_marks_serving_convergence_blocked() -> None:
+    """StatusCollector should surface serving convergence drift in job conditions."""
+    job = FlashRLJob.model_validate(_job_payload())
+    job.status.weightVersion.desired = {"version_id": 3, "model_source": "weights://3", "origin": "sync"}
+    collector = StatusCollector(
+        lambda: FakeClientModule(FakeCluster()),
+        now_fn=lambda: "2026-03-20T00:00:00Z",
+    )
+    ready_status = WorkloadStatus(
+        phase="Ready",
+        desiredReplicas=1,
+        readyReplicas=1,
+        availableReplicas=1,
+    )
+    observations = {
+        component: ComponentObservation(
+            workload={},
+            pods=[],
+            pod_statuses=[],
+            status=ready_status.model_copy(deep=True),
+            load=LoadSnapshot(False, 0, 0, 0.0),
+        )
+        for component in ("controller", "learner", "rollout", "reward")
+    }
+    observations["serving"] = ComponentObservation(
+        workload={},
+        pods=[],
+        pod_statuses=[
+            ComponentStatus.model_validate(
+                {
+                    "name": "serving",
+                    "phase": "Ready",
+                    "healthy": True,
+                    "ready_replica_count": 1,
+                    "desired_replica_count": 1,
+                    "active_weight_version": {
+                        "version_id": 1,
+                        "model_source": "weights://1",
+                        "origin": "sync",
+                    },
+                    "metadata": {"draining": False},
+                }
+            )
+        ],
+        status=ready_status.model_copy(deep=True),
+        load=LoadSnapshot(False, 0, 0, 0.0),
+    )
+    summary = collector.summarize(job, observations)
+
+    assert summary.phase == "Degraded"
+    assert any(condition.type == "ServingConvergenceBlocked" for condition in summary.conditions)
+
+
+def test_autoscaler_desired_scale_target_respects_scale_up_cooldown() -> None:
+    """Autoscaler should hold replica count during scale-up cooldown."""
+    autoscaler = Autoscaler(lambda: FakeClientModule(FakeCluster()))
+    policy = FlashRLJob.model_validate(_job_payload()).spec.serving.autoscaling
+    assert policy is not None
+    previous = WorkloadStatus.model_validate({"desiredReplicas": 2, "lastScaleAt": "2026-03-20T00:00:05Z"})
+    desired, low_load_since = autoscaler.desired_scale_target(
+        policy=policy,
+        current_replicas=2,
+        min_replicas=2,
+        max_replicas=6,
+        load=LoadSnapshot(True, 10, 4, 0.5),
+        previous=previous,
+        now=datetime(2026, 3, 20, 0, 0, 8, tzinfo=timezone.utc),
+        now_iso="2026-03-20T00:00:08Z",
+    )
+
+    assert desired == 2
+    assert low_load_since is None
+
+
+def test_recovery_manager_marks_controller_without_ready_replicas_degraded() -> None:
+    """RecoveryManager should mark the controller degraded without restarting it."""
+    manager = RecoveryManager(
+        lambda: FakeClientModule(FakeCluster()),
+        now_fn=lambda: "2026-03-20T00:00:00Z",
+    )
+    job = FlashRLJob.model_validate(_job_payload())
+    controller = ComponentObservation(
+        workload={},
+        pods=[],
+        pod_statuses=[],
+        status=WorkloadStatus.model_validate({"desiredReplicas": 1, "readyReplicas": 0}),
+        load=LoadSnapshot(False, 0, 0, 0.0),
+    )
+    observations = {"controller": controller}
+
+    manager.apply(job, observations, namespace="default")
+
+    assert controller.status.phase == "Degraded"
+    assert controller.status.lastError == "Controller deployment has no ready replicas."
+
+
+def test_job_reconciler_orders_main_reconcile_steps() -> None:
+    """JobReconciler should run apply, observe, scale, recover, summarize, then patch status."""
+    calls: list[str] = []
+    job = FlashRLJob.model_validate(_job_payload())
+
+    class StubStatusCollector:
+        def collect(self, job: FlashRLJob, *, namespace: str) -> dict[str, object]:
+            calls.append("collect")
+            return {}
+
+        def summarize(self, job: FlashRLJob, observations: dict[str, object]) -> JobStatusSummary:
+            calls.append("summarize")
+            return JobStatusSummary(phase="Pending", conditions=[], last_error=None)
+
+        def build_status_patch(self, job: FlashRLJob, *, summary: JobStatusSummary, observations: dict[str, object]) -> dict[str, object]:
+            calls.append("build-status")
+            return {"phase": summary.phase}
+
+    class StubAutoscaler:
+        def apply(self, job: FlashRLJob, observations: dict[str, object], *, namespace: str) -> None:
+            calls.append("scale")
+
+    class StubRecoveryManager:
+        def apply(self, job: FlashRLJob, observations: dict[str, object], *, namespace: str) -> None:
+            calls.append("recover")
+
+    reconciler = JobReconciler(
+        lambda: object(),
+        lambda: (lambda: object()),
+        StubStatusCollector(),
+        StubAutoscaler(),
+        StubRecoveryManager(),
+        finalizer=FINALIZER,
+    )
+    reconciler._ensure_finalizer = lambda job, namespace: calls.append("finalizer")  # type: ignore[method-assign]
+    reconciler._apply_resource = lambda resource, namespace: calls.append("apply")  # type: ignore[method-assign]
+    reconciler._patch_job_status = lambda job, namespace, status: calls.append("patch-status")  # type: ignore[method-assign]
+
+    reconciler.reconcile(job)
+
+    assert calls[0] == "finalizer"
+    assert calls.count("apply") > 0
+    assert calls.index("collect") < calls.index("scale")
+    assert calls.index("scale") < calls.index("recover")
+    assert calls.index("recover") < calls.index("summarize")
+    assert calls.index("summarize") < calls.index("build-status")
+    assert calls.index("build-status") < calls.index("patch-status")

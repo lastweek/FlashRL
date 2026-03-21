@@ -9,16 +9,18 @@ def main(argv: list[str] | None = None) -> int:
     """Dispatch top-level subcommands."""
     args = list(sys.argv[1:] if argv is None else argv)
     if not args:
-        print("Usage: flashrl <platform|component> <subcommand> [...]", file=sys.stderr)
+        print(
+            "Usage: flashrl <platform|controller|rollout|reward|learner|serving> [...]", file=sys.stderr
+        )
         return 2
     if args[0] == "platform":
         from flashrl.platform.cli import main as platform_main
 
         return int(platform_main(["platform", *args[1:]]))
-    if args[0] == "component":
+    if args[0] in {"controller", "rollout", "reward", "learner", "serving"}:
         from flashrl.platform.runtime.cli import main as component_main
 
-        return int(component_main(args[1:]))
+        return int(component_main(args))
     print(f"Unknown command: {args[0]}", file=sys.stderr)
     return 2
 

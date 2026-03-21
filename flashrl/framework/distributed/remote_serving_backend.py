@@ -1,4 +1,4 @@
-"""ServingBackend adapter over the serving HTTP client."""
+"""ServingBackend adapter over the remote serving client."""
 
 from __future__ import annotations
 
@@ -7,18 +7,18 @@ from typing import Any
 from flashrl.framework.config import RolloutConfig, ServingConfig
 from flashrl.framework.data_models import WeightVersionInfo
 from flashrl.framework.distributed.models import GenerateGroupedRequest, WeightVersionRef
-from flashrl.framework.distributed.serving_client import HttpServingClient
+from flashrl.framework.distributed.serving_client import ServingClient
 from flashrl.framework.serving.base import ServingBackend
 
 
-class HttpServingBackend(ServingBackend):
+class RemoteServingBackend(ServingBackend):
     """Remote serving backend used by rollout pods in platform mode."""
 
     def __init__(
         self,
         *,
         config: ServingConfig,
-        client: HttpServingClient,
+        client: ServingClient,
     ) -> None:
         self.config = config
         self.device = "remote"
@@ -74,7 +74,7 @@ class HttpServingBackend(ServingBackend):
         origin: str = "sync",
     ) -> WeightVersionInfo:
         del training_actor, source_training_step, source_epoch, origin
-        raise NotImplementedError("HttpServingBackend cannot sync local training weights directly.")
+        raise NotImplementedError("RemoteServingBackend cannot sync local training weights directly.")
 
     def current_weight_version(self) -> WeightVersionInfo:
         active = self._active_weight_version

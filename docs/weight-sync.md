@@ -403,7 +403,7 @@ sequenceDiagram
     participant Actor as ActorTrainingBackend
     participant Serving as ServingBackend
     participant Rollout as RolloutGenerator
-    participant Learner as LocalLearnerClient
+    participant Learner as LearnerService
 
     Note over Trainer: Training Step Begins
     Trainer->>Rollout: Generate rollouts with current weights
@@ -448,7 +448,7 @@ def _optimize_batch(
     rollout_weight_version: WeightVersionInfo | None,
 ) -> OptimizationResult:
     """Delegate learner-side tensor work to the training backend."""
-    optimize_response = self.learner_client.optimize_step(
+    optimize_response = self.learner.optimize_step(
         OptimizeStepRequest(
             step_id=(context.step if context is not None else None),
             epoch=(context.epoch if context is not None else 0),
@@ -460,7 +460,7 @@ def _optimize_batch(
 
     # Weight synchronization happens inside optimize_step
     activation_response, sync_seconds = timed_call(
-        lambda: self.serving_client.activate_weight_version(
+        lambda: self.serving.activate_weight_version(
             ActivateWeightVersionRequest(
                 step_id=(context.step if context is not None else None),
                 weight_version=optimize_response.weight_version,

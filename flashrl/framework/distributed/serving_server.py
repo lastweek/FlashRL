@@ -11,15 +11,15 @@ from flashrl.framework.distributed.models import (
     GenerateGroupedResponse,
 )
 from flashrl.framework.distributed.server_common import install_common_routes
-from flashrl.framework.distributed.serving_client import LocalServingClient
+from flashrl.framework.distributed.serving_service import ServingService
 
 
-def create_serving_app(client: LocalServingClient) -> FastAPI:
-    """Create a serving RPC app around one local serving adapter."""
+def create_serving_service_app(service: ServingService) -> FastAPI:
+    """Create a serving RPC app around one local serving service."""
     app = FastAPI(title="FlashRL Serving Service")
     install_common_routes(
         app,
-        status_getter=lambda: client.status().status,
+        status_getter=lambda: service.status().status,
         kind="ServingService",
         name="serving",
         drainable=True,
@@ -27,12 +27,12 @@ def create_serving_app(client: LocalServingClient) -> FastAPI:
 
     @app.post("/v1/generate-grouped")
     def generate_grouped(request: GenerateGroupedRequest) -> GenerateGroupedResponse:
-        return client.generate_grouped(request)
+        return service.generate_grouped(request)
 
     @app.post("/v1/activate-weight-version")
     def activate_weight_version(
         request: ActivateWeightVersionRequest,
     ) -> ActivateWeightVersionResponse:
-        return client.activate_weight_version(request)
+        return service.activate_weight_version(request)
 
     return app

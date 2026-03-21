@@ -15,10 +15,8 @@ from flashrl.framework.data_models import (
     TrainingBatch,
     WeightVersionInfo,
 )
-from flashrl.framework.distributed.learner_client import LocalLearnerClient
-from flashrl.framework.distributed.reward_client import LocalRewardClient
-from flashrl.framework.distributed.rollout_client import LocalRolloutClient
-from flashrl.framework.distributed.serving_client import LocalServingClient
+from flashrl.framework.distributed.learner_client import LearnerClient
+from flashrl.framework.distributed.learner_service import LearnerService
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     LoadCheckpointRequest,
@@ -27,6 +25,12 @@ from flashrl.framework.distributed.models import (
     RolloutBatchRequest,
     SaveCheckpointRequest,
 )
+from flashrl.framework.distributed.reward_client import RewardClient
+from flashrl.framework.distributed.reward_service import RewardService
+from flashrl.framework.distributed.rollout_client import RolloutClient
+from flashrl.framework.distributed.rollout_service import RolloutService
+from flashrl.framework.distributed.serving_client import ServingClient
+from flashrl.framework.distributed.serving_service import ServingService
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -54,12 +58,6 @@ from flashrl.framework.trainer.grpo.grpo_helpers import (
 from flashrl.framework.utils import mean, summary_stats, truncate_preview
 
 if TYPE_CHECKING:
-    from flashrl.framework.distributed.protocols import (
-        LearnerClient,
-        RewardClient,
-        RolloutClient,
-        ServingClient,
-    )
     from flashrl.framework.metrics import MetricsSink
     from flashrl.framework.run_logger import RunLogger
     from flashrl.framework.serving import ServingBackend
@@ -81,10 +79,10 @@ class GRPOTrainer:
         run_logger: "RunLogger | None" = None,
         metrics_sink: "MetricsSink | None" = None,
         on_step_complete: Callable[[dict[str, Any]], None] | None = None,
-        rollout_client: "RolloutClient | None" = None,
-        reward_client: "RewardClient | None" = None,
-        learner_client: "LearnerClient | None" = None,
-        serving_client: "ServingClient | None" = None,
+        rollout: RolloutService | RolloutClient | None = None,
+        reward: RewardService | RewardClient | None = None,
+        learner: LearnerService | LearnerClient | None = None,
+        serving: ServingService | ServingClient | None = None,
         reference_configured: bool | None = None,
     ) -> None:
         """Initialize GRPO trainer."""
@@ -106,16 +104,16 @@ class GRPOTrainer:
             if reference_configured is None
             else bool(reference_configured)
         )
-        self.rollout_client = rollout_client or self._build_default_rollout_client(
+        self.rollout = rollout or self._build_default_rollout_service(
             rollout_generator
         )
-        self.reward_client = reward_client or self._build_default_reward_client(reward_fn)
-        self.learner_client = learner_client or self._build_default_learner_client(
+        self.reward = reward or self._build_default_reward_service(reward_fn)
+        self.learner = learner or self._build_default_learner_service(
             actor_backend=actor_backend,
             reference_backend=reference_backend,
             serving_backend=serving_backend,
         )
-        self.serving_client = serving_client or self._build_default_serving_client(
+        self.serving = serving or self._build_default_serving_service(
             serving_backend
         )
 
@@ -135,13 +133,13 @@ class GRPOTrainer:
         self.current_epoch = 0
         self.total_steps = 0
         self._active_step_context = None
-        for client in (
-            self.rollout_client,
-            self.reward_client,
-            self.learner_client,
-            self.serving_client,
+        for dependency in (
+            self.rollout,
+            self.reward,
+            self.learner,
+            self.serving,
         ):
-            reset = getattr(client, "reset_state", None)
+            reset = getattr(dependency, "reset_state", None)
             if callable(reset):
                 reset()
 
@@ -150,32 +148,32 @@ class GRPOTrainer:
         """Return the currently running step context when a step is in progress."""
         return self._active_step_context
 
-    def _build_default_rollout_client(
+    def _build_default_rollout_service(
         self,
         rollout_generator: BaseRolloutGenerator | None,
-    ) -> "RolloutClient":
+    ) -> RolloutService:
         if rollout_generator is None:
-            raise ValueError("rollout_generator is required when rollout_client is not provided.")
-        return LocalRolloutClient(rollout_generator)
+            raise ValueError("rollout_generator is required when rollout is not provided.")
+        return RolloutService(rollout_generator)
 
-    def _build_default_reward_client(
+    def _build_default_reward_service(
         self,
         reward_fn: UserDefinedReward | None,
-    ) -> "RewardClient":
+    ) -> RewardService:
         if reward_fn is None:
-            raise ValueError("reward_fn is required when reward_client is not provided.")
-        return LocalRewardClient(reward_fn)
+            raise ValueError("reward_fn is required when reward is not provided.")
+        return RewardService(reward_fn)
 
-    def _build_default_learner_client(
+    def _build_default_learner_service(
         self,
         *,
         actor_backend: "ActorTrainingBackend | None",
         reference_backend: "ReferenceTrainingBackend | None",
         serving_backend: "ServingBackend | None",
-    ) -> "LearnerClient":
+    ) -> LearnerService:
         if actor_backend is None:
-            raise ValueError("actor_backend is required when learner_client is not provided.")
-        return LocalLearnerClient(
+            raise ValueError("actor_backend is required when learner is not provided.")
+        return LearnerService(
             actor_backend,
             reference_backend,
             grpo_config=self.grpo_config,
@@ -183,13 +181,13 @@ class GRPOTrainer:
             synchronize_serving=True,
         )
 
-    def _build_default_serving_client(
+    def _build_default_serving_service(
         self,
         serving_backend: "ServingBackend | None",
-    ) -> "ServingClient":
+    ) -> ServingService:
         if serving_backend is None:
-            raise ValueError("serving_backend is required when serving_client is not provided.")
-        return LocalServingClient(serving_backend)
+            raise ValueError("serving_backend is required when serving is not provided.")
+        return ServingService(serving_backend)
 
     def train(self, dataset: Any) -> None:
         """Train on the given dataset."""
@@ -276,7 +274,7 @@ class GRPOTrainer:
         rollout_started_at = current_time()
         self._install_serving_debug(context)
         try:
-            rollout_response = self.rollout_client.rollout_batch(
+            rollout_response = self.rollout.rollout_batch(
                 RolloutBatchRequest(
                     step_id=context.step,
                     prompts=prompts,
@@ -463,7 +461,7 @@ class GRPOTrainer:
         """Compute rewards and attach prompt/response context on failure."""
         started_at = current_time()
         try:
-            rewards = self.reward_client.reward_batch(
+            rewards = self.reward.reward_batch(
                 RewardBatchRequest(
                     step_id=context.step,
                     rollouts=list(rollouts),
@@ -547,7 +545,7 @@ class GRPOTrainer:
         rollout_weight_version: WeightVersionInfo | None,
     ) -> OptimizationResult:
         """Delegate learner-side tensor work to the training backend."""
-        optimize_response = self.learner_client.optimize_step(
+        optimize_response = self.learner.optimize_step(
             OptimizeStepRequest(
                 step_id=(context.step if context is not None else None),
                 epoch=(context.epoch if context is not None else 0),
@@ -577,7 +575,7 @@ class GRPOTrainer:
             self._log_stage(context, stage)
 
         activation_response, sync_seconds = timed_call(
-            lambda: self.serving_client.activate_weight_version(
+            lambda: self.serving.activate_weight_version(
                 ActivateWeightVersionRequest(
                     step_id=(context.step if context is not None else None),
                     weight_version=optimize_response.weight_version,
@@ -727,7 +725,7 @@ class GRPOTrainer:
         checkpoint_metadata: dict[str, Any] | None = None,
     ) -> None:
         """Save model checkpoint."""
-        self.learner_client.save_checkpoint(
+        self.learner.save_checkpoint(
             SaveCheckpointRequest(
                 path=path,
                 controller_state={
@@ -749,7 +747,7 @@ class GRPOTrainer:
         path: str,
     ) -> tuple[dict[str, Any], dict[str, Any] | None]:
         """Load checkpoint state and expose any attached checkpoint metadata."""
-        response = self.learner_client.load_checkpoint(LoadCheckpointRequest(path=path))
+        response = self.learner.load_checkpoint(LoadCheckpointRequest(path=path))
         controller_state = dict(response.controller_state)
         checkpoint_metadata = response.checkpoint_metadata
         self.current_epoch = int(controller_state.get("epoch", 0))

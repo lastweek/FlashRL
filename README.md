@@ -99,6 +99,10 @@ Operator lifecycle:
 See [flashrl/platform/README.md](flashrl/platform/README.md) for the full
 platform install and run flow.
 
+Architecture diagrams:
+
+- [docs/platform-architecture.md](docs/platform-architecture.md)
+
 ## Observability
 
 TensorBoard is the default local metrics path:

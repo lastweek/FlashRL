@@ -5,16 +5,16 @@ from __future__ import annotations
 from fastapi import FastAPI
 
 from flashrl.framework.distributed.models import RolloutBatchRequest, RolloutBatchResponse
-from flashrl.framework.distributed.rollout_client import LocalRolloutClient
+from flashrl.framework.distributed.rollout_service import RolloutService
 from flashrl.framework.distributed.server_common import install_common_routes
 
 
-def create_rollout_app(client: LocalRolloutClient) -> FastAPI:
-    """Create a rollout RPC app around one local rollout adapter."""
+def create_rollout_service_app(service: RolloutService) -> FastAPI:
+    """Create a rollout RPC app around one local rollout service."""
     app = FastAPI(title="FlashRL Rollout Service")
     install_common_routes(
         app,
-        status_getter=lambda: client.status().status,
+        status_getter=lambda: service.status().status,
         kind="RolloutService",
         name="rollout",
         drainable=True,
@@ -22,6 +22,6 @@ def create_rollout_app(client: LocalRolloutClient) -> FastAPI:
 
     @app.post("/v1/rollout-batches")
     def rollout_batches(request: RolloutBatchRequest) -> RolloutBatchResponse:
-        return client.rollout_batch(request)
+        return service.rollout_batch(request)
 
     return app

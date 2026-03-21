@@ -1,29 +1,37 @@
-"""Platform controller runtime that drives GRPO over HTTP services."""
+"""Explicit controller pod runtime for FlashRL platform mode."""
 
 from __future__ import annotations
 
+import json
 import os
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Any
 
 from fastapi import FastAPI
+import uvicorn
 
 from flashrl.framework.admin import utc_now_iso
+from flashrl.framework import runtime_support
 from flashrl.framework.distributed.models import ComponentStatus
 from flashrl.framework.distributed.server_common import install_common_routes
 from flashrl.framework.distributed import (
-    HttpLearnerClient,
-    HttpRewardClient,
-    HttpRolloutClient,
-    HttpServingClient,
+    LearnerClient,
+    RewardClient,
+    RolloutClient,
+    ServingClient,
 )
+from flashrl.framework.data_models import Prompt
 from flashrl.framework.trainer.grpo.trainer import GRPOTrainer
-from flashrl.platform.k8s.job import FlashRLJob, GROUP, PLURAL, VERSION
-from flashrl.platform.runtime.common import load_dataset, load_job_config, service_url, shared_path
+from flashrl.platform.k8s.job import DatasetSpec, FlashRLJob, GROUP, PLURAL, VERSION
+from flashrl.platform.runtime.pod import (
+    load_mounted_job,
+    service_url_for,
+    storage_path_from_uri,
+)
 
 
-class ControllerStatusWriter:
+class FlashRLJobStatusWriter:
     """Best-effort CRD status writer used by the controller pod."""
 
     def __init__(self, *, job_name: str, namespace: str) -> None:
@@ -80,6 +88,17 @@ class ControllerStatusWriter:
         return self._api
 
 
+def load_controller_dataset(job: FlashRLJob) -> list[Prompt]:
+    """Resolve the controller-owned dataset source for one platform run."""
+    dataset_spec = job.spec.dataset
+    if dataset_spec.type == "hook":
+        if job.spec.userCode.dataset is None:
+            raise ValueError("dataset.type='hook' requires userCode.dataset.")
+        dataset = runtime_support.instantiate_hook(job.spec.userCode.dataset)
+        return runtime_support.normalize_dataset(dataset)
+    return _load_dataset_from_uri(dataset_spec)
+
+
 class _ControllerServiceState:
     """Track the long-lived controller pod state while training runs in the background."""
 
@@ -133,7 +152,12 @@ class _ControllerServiceState:
 
 
 def create_controller_app(job_path: str | Path | None = None) -> FastAPI:
-    """Create the long-lived controller pod app with background training execution."""
+    """Create the long-lived controller pod app with background training execution.
+
+    This module is the only platform-specific long-running runtime. It loads
+    the mounted job, talks to the distributed services through remote clients, and patches
+    controller-owned status back into the FlashRLJob CR.
+    """
     state = _ControllerServiceState(job_path=job_path)
     app = FastAPI(title="FlashRL Controller")
     install_common_routes(
@@ -150,9 +174,15 @@ def create_controller_app(job_path: str | Path | None = None) -> FastAPI:
     return app
 
 
+def run_controller_pod(*, host: str = "0.0.0.0", port: int = 8000) -> int:
+    """Run the controller pod HTTP server."""
+    uvicorn.run(create_controller_app(), host=host, port=port, log_level="info")
+    return 0
+
+
 def run_controller(job_path: str | Path | None = None) -> None:
     """Run the GRPO controller loop for one platform job."""
-    static_job = load_job_config(job_path)
+    static_job = load_mounted_job(job_path)
     namespace = str(
         os.environ.get("FLASHRL_NAMESPACE")
         or static_job.metadata.get("namespace")
@@ -160,7 +190,7 @@ def run_controller(job_path: str | Path | None = None) -> None:
     )
     os.environ.setdefault("FLASHRL_JOB_NAME", static_job.name)
     os.environ.setdefault("FLASHRL_NAMESPACE", namespace)
-    status_writer = ControllerStatusWriter(job_name=static_job.name, namespace=namespace)
+    status_writer = FlashRLJobStatusWriter(job_name=static_job.name, namespace=namespace)
     live_job = status_writer.get_job()
     job = static_job
     if live_job is not None:
@@ -169,10 +199,10 @@ def run_controller(job_path: str | Path | None = None) -> None:
             if metadata_key in live_job.metadata:
                 job.metadata[metadata_key] = live_job.metadata[metadata_key]
 
-    rollout_client = HttpRolloutClient(service_url("rollout"))
-    reward_client = HttpRewardClient(service_url("reward"))
-    learner_client = HttpLearnerClient(service_url("learner"))
-    serving_client = HttpServingClient(service_url("serving"))
+    rollout = RolloutClient(service_url_for("rollout"))
+    reward = RewardClient(service_url_for("reward"))
+    learner = LearnerClient(service_url_for("learner"))
+    serving = ServingClient(service_url_for("serving"))
 
     trainer = GRPOTrainer(
         config=job.spec.framework.trainer,
@@ -182,16 +212,16 @@ def run_controller(job_path: str | Path | None = None) -> None:
         serving_backend=None,
         reward_fn=None,
         rollout_generator=None,
-        rollout_client=rollout_client,
-        reward_client=reward_client,
-        learner_client=learner_client,
-        serving_client=serving_client,
+        rollout=rollout,
+        reward=reward,
+        learner=learner,
+        serving=serving,
         reference_configured=job.spec.framework.reference is not None,
         on_step_complete=lambda info: _on_step_complete(
             info=info,
             job=job,
             trainer=trainer,
-            serving_client=serving_client,
+            serving=serving,
             status_writer=status_writer,
         ),
     )
@@ -216,7 +246,7 @@ def run_controller(job_path: str | Path | None = None) -> None:
             }
         )
 
-    dataset = load_dataset(job)
+    dataset = load_controller_dataset(job)
 
     try:
         trainer.train(dataset)
@@ -249,7 +279,7 @@ def _resume_target(job: FlashRLJob) -> str | None:
 def _checkpoint_path(job: FlashRLJob, *, step: int, final: bool) -> Path:
     if final and job.spec.checkpointing.final_path is not None:
         return Path(job.spec.checkpointing.final_path)
-    base_dir = shared_path(job.spec.storage.checkpoints.uriPrefix, purpose="checkpoints")
+    base_dir = storage_path_from_uri(job.spec.storage.checkpoints.uriPrefix, purpose="checkpoints")
     base_dir.mkdir(parents=True, exist_ok=True)
     if final:
         return base_dir / "final.pt"
@@ -261,8 +291,8 @@ def _on_step_complete(
     info: dict[str, Any],
     job: FlashRLJob,
     trainer: GRPOTrainer,
-    serving_client: HttpServingClient,
-    status_writer: ControllerStatusWriter,
+    serving: ServingClient,
+    status_writer: FlashRLJobStatusWriter,
 ) -> None:
     step = int(info["step"])
     epoch = int(info["epoch"])
@@ -274,7 +304,7 @@ def _on_step_complete(
         }
     }
     try:
-        serving_status = serving_client.status().status
+        serving_status = serving.status().status
     except Exception:
         serving_status = None
     if serving_status is not None and serving_status.active_weight_version is not None:
@@ -294,3 +324,27 @@ def _on_step_complete(
         }
 
     status_writer.patch_status(patch)
+
+
+def _load_dataset_from_uri(dataset_spec: DatasetSpec) -> list[Prompt]:
+    path = storage_path_from_uri(str(dataset_spec.uri), purpose="dataset")
+    if dataset_spec.format == "jsonl":
+        items = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+    elif dataset_spec.format == "json":
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        items = payload if isinstance(payload, list) else [payload]
+    else:
+        raise NotImplementedError(
+            f"Platform dataset.type='uri' currently supports only json/jsonl paths; got format={dataset_spec.format!r}."
+        )
+
+    normalized: list[Prompt] = []
+    for item in items:
+        if isinstance(item, str):
+            normalized.append(Prompt(text=item))
+            continue
+        if isinstance(item, dict):
+            normalized.append(Prompt.model_validate(item))
+            continue
+        normalized.append(Prompt(text=str(item)))
+    return normalized
