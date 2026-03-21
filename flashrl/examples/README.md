@@ -17,7 +17,6 @@ Other examples:
 
 - `math`: training-integrated whitebox rollout example
 - `code_single_turn`: single-turn code reasoning baseline
-- `mock_checkpointing`: checkpointing and runtime behavior smoke example
 
 ## Module-First Commands
 
@@ -56,7 +55,6 @@ Example docs:
 - [agent_harness_ablation/README.md](agent_harness_ablation/README.md)
 - [math/README.md](math/README.md)
 - [code_single_turn/README.md](code_single_turn/README.md)
-- [mock_checkpointing/README.md](mock_checkpointing/README.md)
 
 Local observability:
 
