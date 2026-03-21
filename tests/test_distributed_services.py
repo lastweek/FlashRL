@@ -317,8 +317,8 @@ def test_rollout_service_reports_load_and_drains_during_inflight_requests() -> N
     assert drained_status["metadata"]["draining"] is True
 
 
-def test_distributed_package_reexports_services_clients_and_servers() -> None:
-    """The distributed package should expose services, clients, and app factories directly."""
+def test_distributed_package_reexports_services_clients_and_app_builders() -> None:
+    """The distributed package should expose services, clients, and app builders directly."""
     from flashrl.framework.distributed import (
         LearnerService as ImportedLearnerService,
         ServingClient as ImportedServingClient,
@@ -334,8 +334,18 @@ def test_distributed_package_no_longer_exports_protocols_or_legacy_names() -> No
     """The legacy Local/Http/protocol surface should stay removed."""
     import flashrl.framework.distributed as distributed_module
 
+    assert importlib.import_module("flashrl.framework.distributed.http_common") is not None
     with pytest.raises(ModuleNotFoundError):
         importlib.import_module("flashrl.framework.distributed.protocols")
+    for module_name in (
+        "flashrl.framework.distributed.reward_server",
+        "flashrl.framework.distributed.rollout_server",
+        "flashrl.framework.distributed.learner_server",
+        "flashrl.framework.distributed.serving_server",
+        "flashrl.framework.distributed.server_common",
+    ):
+        with pytest.raises(ModuleNotFoundError):
+            importlib.import_module(module_name)
 
     for name in (
         "LocalRolloutClient",
@@ -359,7 +369,6 @@ def test_repo_imports_use_consolidated_distributed_layout() -> None:
     repo_root = Path(__file__).resolve().parents[1]
     legacy_paths = [
         ".".join(["flashrl", "framework", "services"]),
-        ".".join(["flashrl", "framework", "distributed", "http"]),
         ".".join(["flashrl", "framework", "distributed", "local"]),
     ]
 

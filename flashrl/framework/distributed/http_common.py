@@ -1,4 +1,4 @@
-"""Shared FastAPI server helpers for distributed FlashRL RPC services."""
+"""Shared FastAPI HTTP helpers for distributed FlashRL services."""
 
 from __future__ import annotations
 

@@ -13,8 +13,8 @@ import uvicorn
 
 from flashrl.framework.admin import utc_now_iso
 from flashrl.framework import runtime_support
+from flashrl.framework.distributed.http_common import install_common_routes
 from flashrl.framework.distributed.models import ComponentStatus
-from flashrl.framework.distributed.server_common import install_common_routes
 from flashrl.framework.distributed import (
     LearnerClient,
     RewardClient,

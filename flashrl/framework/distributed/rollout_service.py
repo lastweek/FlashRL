@@ -1,8 +1,11 @@
-"""In-process rollout service implementation."""
+"""In-process rollout service implementation and HTTP app builder."""
 
 from __future__ import annotations
 
+from fastapi import FastAPI
+
 from flashrl.framework.data_models import WeightVersionInfo
+from flashrl.framework.distributed.http_common import install_common_routes
 from flashrl.framework.distributed.models import (
     ComponentStatus,
     RolloutBatchRequest,
@@ -68,3 +71,21 @@ class RolloutService:
                 desired_replica_count=1,
             )
         )
+
+
+def create_rollout_service_app(service: RolloutService) -> FastAPI:
+    """Create a rollout RPC app around one local rollout service."""
+    app = FastAPI(title="FlashRL Rollout Service")
+    install_common_routes(
+        app,
+        status_getter=lambda: service.status().status,
+        kind="RolloutService",
+        name="rollout",
+        drainable=True,
+    )
+
+    @app.post("/v1/rollout-batches")
+    def rollout_batches(request: RolloutBatchRequest) -> RolloutBatchResponse:
+        return service.rollout_batch(request)
+
+    return app

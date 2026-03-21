@@ -325,6 +325,8 @@ def test_platform_architecture_doc_covers_per_pod_workflows() -> None:
     assert "LearnerService" in content
     assert "ServingService" in content
     assert "RemoteServingBackend" in content
+    assert "http_common.py" in content
+    assert "install_common_routes" in content
     assert "create_rollout_service_app" in content
     assert "create_reward_service_app" in content
     assert "create_learner_service_app" in content

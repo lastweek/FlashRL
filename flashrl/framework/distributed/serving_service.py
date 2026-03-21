@@ -1,13 +1,15 @@
-"""In-process serving service implementation."""
+"""In-process serving service implementation and HTTP app builder."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
+from fastapi import FastAPI
 import torch
 
 from flashrl.framework.admin import utc_now_iso
 from flashrl.framework.data_models import WeightVersionInfo
+from flashrl.framework.distributed.http_common import install_common_routes
 from flashrl.framework.distributed.models import (
     ActivateWeightVersionRequest,
     ActivateWeightVersionResponse,
@@ -127,6 +129,30 @@ class ServingService:
             return getter()
         except Exception:
             return None
+
+
+def create_serving_service_app(service: ServingService) -> FastAPI:
+    """Create a serving RPC app around one local serving service."""
+    app = FastAPI(title="FlashRL Serving Service")
+    install_common_routes(
+        app,
+        status_getter=lambda: service.status().status,
+        kind="ServingService",
+        name="serving",
+        drainable=True,
+    )
+
+    @app.post("/v1/generate-grouped")
+    def generate_grouped(request: GenerateGroupedRequest) -> GenerateGroupedResponse:
+        return service.generate_grouped(request)
+
+    @app.post("/v1/activate-weight-version")
+    def activate_weight_version(
+        request: ActivateWeightVersionRequest,
+    ) -> ActivateWeightVersionResponse:
+        return service.activate_weight_version(request)
+
+    return app
 
 
 def activate_huggingface_serving_backend_from_ref(

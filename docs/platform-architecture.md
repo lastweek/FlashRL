@@ -18,13 +18,22 @@ There are four separate concerns in platform mode:
 - job workloads
   These are the controller, learner, serving, rollout, and reward pods created for one job.
 - framework service layer
-  These are the HTTP servers and clients inside the pods that actually move rollout, reward, optimize, and serve requests.
+  These are the remote clients, in-process services, and shared HTTP route helpers inside the pods that actually move rollout, reward, optimize, and serve requests.
 
 The important split is:
 
 - the operator manages Kubernetes objects
 - the controller pod runs training
 - the other job pods expose services the controller talks to
+
+Inside `flashrl.framework.distributed`, the current code shape is:
+
+- `*_client.py`
+  Remote callers used by the controller or by one pod calling another pod.
+- `*_service.py`
+  In-process service logic plus the `create_*_service_app(...)` FastAPI app builders.
+- `http_common.py`
+  Shared HTTP lifecycle, readiness, drain, status, and admin route wiring.
 
 ## What Runs Where
 
@@ -45,7 +54,7 @@ That means there is no separate controller image. Controller, rollout, and rewar
 
 | Pod | Platform software in the pod | What platform adds | Framework software used | User hook or backend |
 | --- | --- | --- | --- | --- |
-| controller | `flashrl.platform.runtime.controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop | `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, controller status routes | dataset hook or dataset URI |
+| controller | `flashrl.platform.runtime.controller` | Load mounted `FlashRLJob`, resolve sibling service URLs, merge live CRD status, patch controller-owned status, resolve checkpoints, start background training loop | `RolloutClient`, `RewardClient`, `LearnerClient`, `ServingClient`, `GRPOTrainer`, `install_common_routes` from `http_common.py`, controller status routes | dataset hook or dataset URI |
 | rollout | `flashrl.platform.runtime.rollout` | Load mounted job, instantiate rollout hook, create remote serving client, wire rollout generator into the rollout service | `ServingClient`, `RemoteServingBackend`, `build_rollout_generator`, `RolloutService`, `create_rollout_service_app` | `userCode.rollout` |
 | reward | `flashrl.platform.runtime.reward` | Load mounted job and instantiate the reward hook, then wire it into the reward service | `UserDefinedReward`, `RewardService`, `create_reward_service_app` | `userCode.reward` |
 | learner | `flashrl.platform.runtime.learner` | Load mounted job, create actor/reference backends, resolve shared storage paths, publish learner artifacts | `create_training_backend`, `LearnerService`, `create_learner_service_app` | training backends from framework config |
@@ -89,7 +98,7 @@ flowchart TB
         R1[container ENTRYPOINT: flashrl]
         R2[pod command: controller or rollout or reward]
         R3[platform runtime bootstrap]
-        R4[framework distributed server/client layer]
+        R4[framework distributed clients and service app builders]
         R5[user hooks and framework logic]
         R1 --> R2 --> R3 --> R4 --> R5
     end
@@ -98,7 +107,7 @@ flowchart TB
         S1[container ENTRYPOINT: flashrl]
         S2[pod command: serving]
         S3[platform runtime bootstrap]
-        S4[framework serving server]
+        S4[serving service app builder]
         S5[serving backend: huggingface or vllm]
         S1 --> S2 --> S3 --> S4 --> S5
     end
@@ -107,7 +116,7 @@ flowchart TB
         T1[container ENTRYPOINT: flashrl]
         T2[pod command: learner]
         T3[platform runtime bootstrap]
-        T4[framework learner server]
+        T4[learner service app builder]
         T5[training backend: huggingface or fsdp2]
         T1 --> T2 --> T3 --> T4 --> T5
     end
@@ -121,7 +130,7 @@ flowchart TB
     end
 ```
 
-Interpretation: each image has a thin CLI/runtime entry layer on top of the real service or operator logic. The runtime images mostly bootstrap a concrete implementation and then hand off to the existing framework distributed server layer.
+Interpretation: each image has a thin CLI/runtime entry layer on top of the real service or operator logic. The runtime images mostly bootstrap a concrete implementation and then hand off to the framework distributed clients, services, and shared HTTP helpers.
 
 ## Execution Workflow
 
@@ -180,14 +189,14 @@ Every workload pod follows the same broad pattern:
 
 1. Kubernetes starts the container with a `flashrl ...` command
 2. `flashrl.platform.runtime` bootstraps the pod-specific implementation
-3. `flashrl.framework.distributed` exposes the HTTP service surface
+3. `flashrl.framework.distributed` exposes the HTTP service surface through `create_*_service_app(...)`
 4. the hook or backend implementation does the real work
 
 In the diagrams below:
 
 - `pod contract` means `flashrl.platform.runtime.pod`
 - `platform bootstrap` means one of `flashrl.platform.runtime.controller|rollout|reward|learner|serving`
-- `framework` means `flashrl.framework.distributed` plus backend or hook code
+- `framework` means `flashrl.framework.distributed` service/client code plus backend or hook code
 
 ### Controller Pod
 
@@ -202,12 +211,12 @@ sequenceDiagram
     participant Container as Controller Container
     participant PodContract as flashrl.platform.runtime.pod
     participant Platform as flashrl.platform.runtime.controller
-    participant Framework as flashrl.framework.distributed plus GRPOTrainer
+    participant Framework as flashrl.framework.distributed.http_common plus GRPOTrainer
     participant API as Kubernetes API
 
     Container->>Platform: flashrl controller
     Platform->>Platform: create_controller_app
-    Platform->>Framework: install controller status routes
+    Platform->>Framework: install_common_routes
     Platform->>Platform: FastAPI startup hook fires
     Platform->>Platform: background thread starts
     Platform->>PodContract: load_mounted_job
@@ -246,11 +255,11 @@ sequenceDiagram
     Platform->>API: patch progress, checkpoint, weightVersion
 ```
 
-Interpretation: the controller pod is different from every other pod because it does not just expose one adapter. It starts an HTTP app for health and status, then launches a background training loop that coordinates the other services and patches job status back into Kubernetes.
+Interpretation: the controller pod is different from every other pod because it does not just expose one adapter. It installs common HTTP routes through `http_common.py`, then launches a background training loop that coordinates the other services and patches job status back into Kubernetes.
 
 ### Rollout Pod
 
-The rollout pod is an adapter-plus-hook service: platform wires the hook and remote serving client together, while the framework server owns the HTTP surface.
+The rollout pod is an adapter-plus-hook service: platform wires the hook and remote serving client together, while the framework app builder inside `rollout_service.py` owns the HTTP surface.
 Kubernetes naming: `container=rollout`, workload/pod prefix=`<job>-rollout`.
 Platform modules: `flashrl.platform.runtime.rollout` plus shared `flashrl.platform.runtime.pod`.
 
@@ -291,7 +300,7 @@ sequenceDiagram
     Framework-->>Controller: batched rollouts
 ```
 
-Interpretation: steady-state rollout execution is request-driven. The controller calls the rollout service, the framework server passes the request into the rollout generator, and the rollout logic calls serving remotely to produce outputs.
+Interpretation: steady-state rollout execution is request-driven. The controller calls the rollout service, the framework app hands the request into `RolloutService`, and the rollout logic calls serving remotely to produce outputs.
 
 ### Reward Pod
 
@@ -330,7 +339,7 @@ sequenceDiagram
     Framework-->>Controller: reward response
 ```
 
-Interpretation: the reward pod is the cleanest boundary split. Platform bootstraps the reward object once, and every request after that stays on the framework server plus reward implementation path.
+Interpretation: the reward pod is the cleanest boundary split. Platform bootstraps the reward object once, and every request after that stays on the `RewardService` plus reward implementation path.
 
 ### Learner Pod
 
@@ -378,7 +387,7 @@ sequenceDiagram
     Framework-->>Controller: checkpoint response
 ```
 
-Interpretation: after startup, the learner pod is a pure RPC service around training backends. The framework server owns the HTTP contract, while the backend does optimization and writes artifacts to shared storage.
+Interpretation: after startup, the learner pod is a pure RPC service around training backends. The `LearnerService` module owns both the in-process behavior and the HTTP app builder, while the backend does optimization and writes artifacts to shared storage.
 
 ### Serving Pod
 
@@ -425,7 +434,7 @@ sequenceDiagram
     Framework-->>Controller: activation response
 ```
 
-Interpretation: the serving pod spends most of its life handling two RPCs: grouped generation for rollout and active-weight switching for the controller. Platform code only matters during initialization; the steady-state path is framework server plus serving backend.
+Interpretation: the serving pod spends most of its life handling two RPCs: grouped generation for rollout and active-weight switching for the controller. Platform code only matters during initialization; the steady-state path is `ServingService` plus serving backend.
 
 Across all five pods, the recurring pattern is stable:
 
