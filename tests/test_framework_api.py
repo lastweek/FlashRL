@@ -8,8 +8,11 @@ from pathlib import Path
 import subprocess
 import sys
 import textwrap
+from types import SimpleNamespace
 
 import pytest
+
+from flashrl.framework import FlashRL, GrpoConfig, ServingConfig, TrainingConfig
 
 
 pytestmark = pytest.mark.unit
@@ -209,3 +212,27 @@ def test_run_logger_uses_direct_internal_imports() -> None:
     source = Path(__file__).resolve().parents[1] / "flashrl" / "framework" / "run_logger.py"
     text = source.read_text(encoding="utf-8")
     assert "from flashrl.framework import log_paths, rollout_logging" not in text
+
+
+def test_flashrl_emits_shared_mps_guardrail_warning_for_explicit_shared_mps() -> None:
+    """Explicit shared-MPS Hugging Face runs should emit a reliability warning."""
+    flashrl = FlashRL.__new__(FlashRL)
+    flashrl.actor_config = TrainingConfig(model_name="fake/model", device="mps")
+    flashrl.serving_config = ServingConfig(model_name="fake/model", device="mps", backend="huggingface")
+    flashrl.grpo_config = GrpoConfig(group_size=2, max_new_tokens=384)
+    flashrl._actor_backend = SimpleNamespace(device=SimpleNamespace(type="mps"))
+    flashrl._serving_backend = SimpleNamespace(device=SimpleNamespace(type="mps"))
+
+    recorded: list[tuple[str, str, str]] = []
+    flashrl._emit_bootstrap_stage = lambda label, component, message: recorded.append(
+        (label, component, message)
+    )
+
+    flashrl._emit_shared_mps_guardrail_warning()
+
+    assert len(recorded) == 1
+    label, component, message = recorded[0]
+    assert label == "warn"
+    assert component == "mps_guardrail"
+    assert "device=cpu" in message
+    assert "lower grpo.max_new_tokens" in message

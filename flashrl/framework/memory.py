@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import gc
 from typing import Any
 
 import psutil
@@ -105,6 +106,16 @@ def capture_memory_snapshot(device: Any | None = None) -> dict[str, Any]:
         "system": system_payload,
         "device": {key: value for key, value in device_payload.items() if value is not None},
     }
+
+
+def release_device_cache(device: Any | None = None) -> None:
+    """Best-effort allocator cleanup for devices with explicit cache control."""
+    device_type = _device_type_for(device)
+    if device_type != "mps":
+        return
+    gc.collect()
+    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
+        torch.mps.empty_cache()
 
 
 def extract_memory_counters(snapshot: dict[str, Any] | None) -> dict[str, Any]:

@@ -8,6 +8,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from flashrl.framework.agent import Agent
 from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
@@ -735,6 +736,21 @@ def test_code_basic_modules_hold_the_actual_logic() -> None:
     assert "exec(compile(" not in train_source
     assert "from flashrl.examples.code_single_turn import train as code_example" in eval_source
     assert not Path("flashrl/examples/code_single_turn/workflow.py").exists()
+
+
+def test_code_basic_default_local_config_is_cpu_first() -> None:
+    """The documented default config should bias toward reliable local CPU runs."""
+    config_payload = yaml.safe_load(
+        Path("flashrl/examples/code_single_turn/config.yaml").read_text(encoding="utf-8")
+    )
+    framework = config_payload["framework"]
+    assert framework["actor"]["device"] == "cpu"
+    assert framework["serving"]["device"] == "cpu"
+    assert framework["grpo"]["max_new_tokens"] == 192
+
+    readme = Path("flashrl/examples/code_single_turn/README.md").read_text(encoding="utf-8")
+    assert "CPU-first" in readme
+    assert "device: mps" in readme
 
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(

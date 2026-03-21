@@ -27,9 +27,9 @@ def get_device(device: str | None = None) -> torch.device:
     if DEFAULT_DEVICE is None:
         if torch.cuda.is_available():
             DEFAULT_DEVICE = torch.device("cuda")
-        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
-            DEFAULT_DEVICE = torch.device("mps")
         else:
+            # Reliability-first default: keep Apple MPS opt-in and fall back to CPU
+            # when CUDA is unavailable.
             DEFAULT_DEVICE = torch.device("cpu")
 
     return DEFAULT_DEVICE

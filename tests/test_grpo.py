@@ -11,6 +11,8 @@ import pytest
 import torch
 
 import flashrl.framework.flashrl as flashrl_module
+import flashrl.framework.controller.grpo.controller as controller_module
+import flashrl.framework.training.optimization as optimization_module
 from flashrl.framework import FlashRL, GrpoConfig, LoggingConfig, MetricsConfig
 from flashrl.framework.config import ControllerConfig, ServingConfig, TrainingConfig
 from flashrl.framework.data_models import (
@@ -26,7 +28,11 @@ from flashrl.framework.reward.user_defined import UserDefinedReward
 from flashrl.framework.rollout.function import FunctionRolloutGenerator
 from flashrl.framework.controller.grpo.controller import GRPOController
 from flashrl.framework.controller.grpo.grpo_helpers import compute_advantages, prompt_batch_size
-from flashrl.framework.controller.grpo.loss_variants import assemble_grpo_loss
+from flashrl.framework.controller.grpo.loss_variants import (
+    LossAssemblyResult,
+    assemble_grpo_loss,
+    get_current_policy_log_probs,
+)
 from flashrl.framework.data_models import LearnerBatch
 from tests.conftest import (
     TinyReferenceModel,
@@ -380,6 +386,182 @@ def test_grpo_rollout_response_log_probs_align_with_response_tokens() -> None:
             advantages=torch.tensor([1.0, -1.0], dtype=torch.float32),
             config=trainer.grpo_config,
         )
+
+
+def test_assemble_grpo_loss_accepts_precomputed_current_policy_log_probs() -> None:
+    """Low-memory loss assembly should match the logits-based path numerically."""
+    trainer = build_controller(batch_size=4, group_size=2)
+    prompts = [Prompt(text="prompt 0"), Prompt(text="prompt 1")]
+    rollouts = make_rollout_fn(response_suffix="precomputed", repeat=2)(
+        prompts,
+        trainer.serving_backend,
+    )
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[int(tid) for tid in rollout.prompt_token_ids] for rollout in rollouts],
+        response_token_ids=[[int(tid) for tid in rollout.response_token_ids] for rollout in rollouts],
+        response_token_logprobs=[rollout.response_token_logprobs for rollout in rollouts],
+        advantages=[0.25 for _ in rollouts],
+        group_size=2,
+        prompt_count=2,
+    )
+    input_ids, attention_mask, prompt_lengths, _, rollout_response_log_probs = trainer.training_backend.prepare_inputs(
+        learner_batch,
+    )
+    actor_logits = trainer.training_backend.actor.model(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+    ).logits
+    current_policy_log_probs, _, _ = get_current_policy_log_probs(
+        input_ids,
+        attention_mask,
+        actor_logits,
+    )
+    advantages = torch.tensor([1.0, -1.0], dtype=torch.float32)
+
+    baseline = assemble_grpo_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=actor_logits,
+        ref_logits=None,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        config=trainer.grpo_config,
+    )
+    low_memory = assemble_grpo_loss(
+        input_ids=input_ids,
+        attention_mask=attention_mask,
+        prompt_lengths=prompt_lengths,
+        actor_logits=None,
+        ref_logits=None,
+        rollout_response_log_probs=rollout_response_log_probs,
+        advantages=advantages,
+        config=trainer.grpo_config,
+        current_policy_log_probs=current_policy_log_probs,
+    )
+
+    assert low_memory.loss.item() == pytest.approx(baseline.loss.item())
+    assert low_memory.policy_loss.item() == pytest.approx(baseline.policy_loss.item())
+    assert low_memory.kl_divergence.item() == pytest.approx(baseline.kl_divergence.item())
+    assert low_memory.response_tokens_total == baseline.response_tokens_total
+
+
+def test_optimize_grpo_batch_uses_low_memory_path_when_entropy_is_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The common no-entropy path should pass token log-probs instead of full logits."""
+    backend = TinyTrainingBackend()
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[1, 2], [3, 4]],
+        response_token_ids=[[5, 6], [7, 8]],
+        response_token_logprobs=[[-0.1, -0.2], [-0.1, -0.2]],
+        advantages=[0.5, -0.5],
+        group_size=2,
+        prompt_count=1,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_assemble_grpo_loss(**kwargs):
+        captured["actor_logits_is_none"] = kwargs["actor_logits"] is None
+        captured["has_current_policy_log_probs"] = kwargs["current_policy_log_probs"] is not None
+        loss = backend.model_copy.model.logit_bias.sum() * 0.0
+        return LossAssemblyResult(
+            loss=loss,
+            policy_loss=loss,
+            kl_divergence=loss,
+            response_tokens_total=4,
+            importance_sampling_ratio_mean=1.0,
+            importance_sampling_ratio_std=0.0,
+            importance_sampling_ratio_min=1.0,
+            importance_sampling_ratio_max=1.0,
+            clip_fraction=0.0,
+        )
+
+    monkeypatch.setattr(optimization_module, "assemble_grpo_loss", fake_assemble_grpo_loss)
+
+    optimization_module.optimize_grpo_batch(
+        actor_backend=backend,
+        reference_backend=None,
+        grpo_config=GrpoConfig(group_size=2, entropy_coefficient=0.0),
+        learner_batch=learner_batch,
+    )
+
+    assert captured == {
+        "actor_logits_is_none": True,
+        "has_current_policy_log_probs": True,
+    }
+
+
+def test_optimize_grpo_batch_keeps_full_logits_when_entropy_is_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Entropy regularization should keep the full-logits path enabled."""
+    backend = TinyTrainingBackend()
+    learner_batch = LearnerBatch(
+        prompt_token_ids=[[1, 2], [3, 4]],
+        response_token_ids=[[5, 6], [7, 8]],
+        response_token_logprobs=[[-0.1, -0.2], [-0.1, -0.2]],
+        advantages=[0.5, -0.5],
+        group_size=2,
+        prompt_count=1,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_assemble_grpo_loss(**kwargs):
+        captured["actor_logits_is_none"] = kwargs["actor_logits"] is None
+        captured["has_current_policy_log_probs"] = kwargs["current_policy_log_probs"] is not None
+        loss = backend.model_copy.model.logit_bias.sum() * 0.0
+        return LossAssemblyResult(
+            loss=loss,
+            policy_loss=loss,
+            kl_divergence=loss,
+            response_tokens_total=4,
+            importance_sampling_ratio_mean=1.0,
+            importance_sampling_ratio_std=0.0,
+            importance_sampling_ratio_min=1.0,
+            importance_sampling_ratio_max=1.0,
+            clip_fraction=0.0,
+        )
+
+    monkeypatch.setattr(optimization_module, "assemble_grpo_loss", fake_assemble_grpo_loss)
+
+    optimization_module.optimize_grpo_batch(
+        actor_backend=backend,
+        reference_backend=None,
+        grpo_config=GrpoConfig(group_size=2, entropy_coefficient=0.01),
+        learner_batch=learner_batch,
+    )
+
+    assert captured == {
+        "actor_logits_is_none": False,
+        "has_current_policy_log_probs": False,
+    }
+
+
+def test_grpo_controller_releases_shared_mps_cache_before_optimization(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Shared Hugging Face MPS runs should trigger the pre-optimization cache release hook."""
+    trainer = build_controller(batch_size=2, group_size=2)
+    trainer.actor_backend.device = SimpleNamespace(type="mps")
+    trainer.serving_backend.device = SimpleNamespace(type="mps")
+    trainer.actor_backend.config.backend = "huggingface"
+    trainer.serving_backend.config.backend = "huggingface"
+    released: list[str] = []
+
+    monkeypatch.setattr(
+        controller_module,
+        "release_device_cache",
+        lambda device: released.append(str(getattr(device, "type", device))),
+    )
+
+    trainer._release_shared_mps_cache_before_optimization()
+    assert released == ["mps"]
+
+    trainer.serving_backend.device = SimpleNamespace(type="cpu")
+    released.clear()
+    trainer._release_shared_mps_cache_before_optimization()
+    assert released == []
 
 
 def test_grpo_zero_advantages_with_zero_kl_produce_zero_loss() -> None:

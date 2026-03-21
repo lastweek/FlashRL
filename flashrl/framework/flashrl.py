@@ -253,6 +253,35 @@ class FlashRL:
         """Print one concise bootstrap stage line."""
         self._emit_bootstrap_console(f"  {label:<8} {component:<17} {message}")
 
+    def _shared_mps_guardrail_message(self) -> str | None:
+        """Return one warning message for explicit shared-MPS local training."""
+        actor_device = str(self.actor_config.device or "").lower()
+        serving_device = str(self.serving_config.device or "").lower()
+        actor_backend = str(self.actor_config.backend)
+        serving_backend = str(self.serving_config.backend)
+        actor_runtime_device = str(getattr(getattr(self._actor_backend, "device", None), "type", ""))
+        serving_runtime_device = str(getattr(getattr(self._serving_backend, "device", None), "type", ""))
+        if actor_device != "mps" or serving_device != "mps":
+            return None
+        if actor_backend != "huggingface" or serving_backend != "huggingface":
+            return None
+        if actor_runtime_device != "mps" or serving_runtime_device != "mps":
+            return None
+        if self.grpo_config.group_size <= 1 and self.grpo_config.max_new_tokens < 256:
+            return None
+        return (
+            "explicit actor+serving device=mps with huggingface group_size="
+            f"{self.grpo_config.group_size} max_new_tokens={self.grpo_config.max_new_tokens} "
+            "can OOM; prefer device=cpu, lower grpo.max_new_tokens, or keep mps as an explicit opt-in."
+        )
+
+    def _emit_shared_mps_guardrail_warning(self) -> None:
+        """Emit one startup warning for explicit risky shared-MPS configurations."""
+        message = self._shared_mps_guardrail_message()
+        if message is None:
+            return
+        self._emit_bootstrap_stage("warn", "mps_guardrail", message)
+
     @classmethod
     def from_yaml(cls, path: str | Path) -> "FlashRL":
         """Construct FlashRL from a YAML run config."""
@@ -405,6 +434,7 @@ class FlashRL:
                 cpu_threads=self.serving_config.num_threads,
             )
         )
+        self._emit_shared_mps_guardrail_warning()
 
         self._rollout_generator = build_rollout_generator(
             rollout_fn=self.rollout_fn,

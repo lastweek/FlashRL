@@ -27,7 +27,7 @@ def test_get_device_prefers_explicit_device(monkeypatch: pytest.MonkeyPatch) -> 
     ("cuda_available", "mps_available", "expected"),
     [
         (True, True, "cuda"),
-        (False, True, "mps"),
+        (False, True, "cpu"),
         (False, False, "cpu"),
     ],
 )
@@ -37,7 +37,7 @@ def test_get_device_autodetect_precedence(
     mps_available: bool,
     expected: str,
 ) -> None:
-    """Autodetection should prefer cuda, then mps, then cpu."""
+    """Autodetection should prefer cuda, then cpu, with MPS as explicit opt-in."""
     reset_device_state(monkeypatch)
     monkeypatch.setattr(
         device_module.torch,
@@ -52,6 +52,12 @@ def test_get_device_autodetect_precedence(
     )
 
     assert device_module.get_device().type == expected
+
+
+def test_get_device_supports_explicit_mps_opt_in(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Explicit MPS selection should remain available even though autodetect prefers CPU."""
+    reset_device_state(monkeypatch)
+    assert device_module.get_device("mps").type == "mps"
 
 
 def test_set_num_threads_updates_env_and_sets_interop_once(
@@ -78,4 +84,3 @@ def test_set_num_threads_updates_env_and_sets_interop_once(
     assert device_module._INTEROP_THREADS_SET is True
     assert device_module.os.environ["OMP_NUM_THREADS"] == "4"
     assert device_module.os.environ["MKL_NUM_THREADS"] == "4"
-

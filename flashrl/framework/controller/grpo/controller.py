@@ -27,7 +27,11 @@ from flashrl.framework.distributed.models import (
 from flashrl.framework.distributed.reward_client import RewardClient
 from flashrl.framework.distributed.rollout_client import RolloutClient
 from flashrl.framework.distributed.serving_client import ServingClient
-from flashrl.framework.memory import capture_memory_snapshot, summarize_memory_window
+from flashrl.framework.memory import (
+    capture_memory_snapshot,
+    release_device_cache,
+    summarize_memory_window,
+)
 from flashrl.framework.observability import (
     RuntimeEvent,
     StageResult,
@@ -384,6 +388,7 @@ class GRPOController:
             ),
         )
 
+        self._release_shared_mps_cache_before_optimization()
         learner_batch = self._build_learner_batch(batch, advantages)
         # Explicitly delete the advantages tensor to free memory early
         del advantages
@@ -642,6 +647,25 @@ class GRPOController:
         if self.serving_backend is not None:
             return getattr(self.serving_backend, "device", None)
         return None
+
+    def _uses_shared_huggingface_mps(self) -> bool:
+        """Return whether actor and serving are both running on the same MPS path."""
+        actor_device_type = str(getattr(getattr(self.actor_backend, "device", None), "type", ""))
+        serving_device_type = str(getattr(getattr(self.serving_backend, "device", None), "type", ""))
+        serving_backend_name = str(getattr(getattr(self.serving_backend, "config", None), "backend", ""))
+        actor_backend_name = str(getattr(getattr(self.actor_backend, "config", None), "backend", ""))
+        return (
+            actor_device_type == "mps"
+            and serving_device_type == "mps"
+            and actor_backend_name == "huggingface"
+            and serving_backend_name == "huggingface"
+        )
+
+    def _release_shared_mps_cache_before_optimization(self) -> None:
+        """Best-effort guardrail before learner optimization on shared MPS runs."""
+        if not self._uses_shared_huggingface_mps():
+            return
+        release_device_cache(getattr(self.serving_backend, "device", None))
 
     def _stage_memory_snapshots(self, stages: list[StageResult]) -> list[dict[str, Any]]:
         """Collect before/after memory snapshots from measured learner stages."""

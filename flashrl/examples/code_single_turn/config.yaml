@@ -2,11 +2,13 @@ framework:
   actor:
     model_name: Qwen/Qwen2.5-Coder-0.5B
     backend: huggingface
+    device: cpu
     num_threads: 1
 
   serving:
     model_name: Qwen/Qwen2.5-Coder-0.5B
     backend: huggingface
+    device: cpu
     num_threads: 1
     debug_live_rollout: true
 
@@ -19,7 +21,7 @@ framework:
     group_size: 2
     clip_ratio: 0.2
     kl_coefficient: 0.0
-    max_new_tokens: 384
+    max_new_tokens: 192
     temperature: 1.0
     top_p: 0.9
     top_k: 0

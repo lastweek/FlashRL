@@ -1053,12 +1053,13 @@ def assemble_grpo_loss(
     input_ids: torch.Tensor,
     attention_mask: torch.Tensor,
     prompt_lengths: torch.Tensor,
-    actor_logits: torch.Tensor,
+    actor_logits: torch.Tensor | None,
     ref_logits: torch.Tensor | None,
     rollout_response_log_probs: list[list[float]],  # π^infer_old
     training_response_log_probs: list[list[float]] | None = None,  # π^train_old
     advantages: torch.Tensor,
     config: GrpoConfig,
+    current_policy_log_probs: torch.Tensor | None = None,
 ) -> LossAssemblyResult:
     """Assemble full GRPO loss with all components (surrogate + KL + entropy + penalties).
 
@@ -1100,13 +1101,16 @@ def assemble_grpo_loss(
         input_ids: Input token IDs (prompt + response)
         attention_mask: Attention mask
         prompt_lengths: Length of prompts (for masking)
-        actor_logits: Current actor logits (for computing log π_θ)
+        actor_logits: Current actor logits (for computing log π_θ or entropy)
         ref_logits: Reference model logits (for computing KL divergence)
         rollout_response_log_probs: Old policy log probs from inference engine (π^infer_old)
         training_response_log_probs: Old policy log probs from training backend (π^train_old)
                                      Required for GLM-5 IcePop gate, optional for other presets
         advantages: Advantage estimates A (computed from rewards)
         config: GRPO configuration (clipping mode, KL mode, penalties, etc.)
+        current_policy_log_probs: Precomputed current-policy token log probs for
+            low-memory training paths. When provided, ``actor_logits`` may be
+            omitted if entropy regularization is disabled.
 
     Returns:
         LossAssemblyResult with:
@@ -1126,9 +1130,16 @@ def assemble_grpo_loss(
     # Common preprocessing
     # Note: log_pi_theta (current policy) must be computed during training
     #       log_pi_old (old policy) comes from rollout and is already computed
-    log_pi_theta, shift_ids, shift_mask = get_current_policy_log_probs(
-        input_ids, attention_mask, actor_logits
-    )
+    if current_policy_log_probs is not None:
+        shift_ids = input_ids[:, 1:]
+        shift_mask = attention_mask[:, 1:].float()
+        log_pi_theta = current_policy_log_probs
+    else:
+        if actor_logits is None:
+            raise ValueError("actor_logits is required when current_policy_log_probs is not provided.")
+        log_pi_theta, shift_ids, shift_mask = get_current_policy_log_probs(
+            input_ids, attention_mask, actor_logits
+        )
     response_mask, response_token_count, response_tokens_total, response_mask_bool = (
         _build_response_mask(shift_mask, prompt_lengths)
     )
@@ -1214,9 +1225,18 @@ def assemble_grpo_loss(
     )
 
     # Compute entropy bonus
-    entropy_loss = _compute_entropy_loss(
-        actor_logits, response_mask, response_token_count, resolved_config
-    )
+    if resolved_config.entropy_coefficient == 0.0:
+        entropy_loss = torch.tensor(
+            0.0,
+            device=log_pi_theta.device,
+            dtype=log_pi_theta.dtype,
+        )
+    else:
+        if actor_logits is None:
+            raise ValueError("actor_logits is required when entropy regularization is enabled.")
+        entropy_loss = _compute_entropy_loss(
+            actor_logits, response_mask, response_token_count, resolved_config
+        )
 
     # Assemble final loss
     total_loss = (

@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import gc
 from dataclasses import dataclass
 import inspect
 import time
@@ -12,11 +11,16 @@ import torch
 import torch.nn.functional as F
 
 from flashrl.framework.data_models import LearnerBatch
-from flashrl.framework.memory import capture_memory_snapshot, memory_pressure_tags
+from flashrl.framework.memory import (
+    capture_memory_snapshot,
+    memory_pressure_tags,
+    release_device_cache,
+)
 from flashrl.framework.observability import StageResult, timed_call
 from flashrl.framework.controller.grpo.loss_variants import (
     LossAssemblyResult,
     assemble_grpo_loss,
+    get_current_policy_log_probs,
 )
 from flashrl.framework.utils import mean
 
@@ -67,16 +71,6 @@ def backward_step(optimizer: torch.optim.Optimizer, loss: torch.Tensor):
         loss.backward()
 
     return run
-
-
-def _release_device_cache(device: torch.device | Any) -> None:
-    """Best-effort allocator cleanup for backends with aggressive caching."""
-    device_type = getattr(device, "type", str(device))
-    if device_type != "mps":
-        return
-    gc.collect()
-    if hasattr(torch, "mps") and hasattr(torch.mps, "empty_cache"):
-        torch.mps.empty_cache()
 
 
 def prepare_learner_inputs(
@@ -268,6 +262,8 @@ def optimize_grpo_batch(
     ref_logits: torch.Tensor | None = None
     advantages: torch.Tensor | None = None
     training_old_response_log_probs: list[list[float]] | None = None
+    current_policy_log_probs: torch.Tensor | None = None
+    resolved_grpo_config = grpo_config.get_resolved_config()
 
     try:
         (
@@ -289,6 +285,22 @@ def optimize_grpo_batch(
             device=actor_backend.device,
             operation=lambda: actor_backend.forward_logits(input_ids, attention_mask),
         )
+
+        if resolved_grpo_config.entropy_coefficient == 0.0:
+            (
+                (current_policy_log_probs, _, _),
+                logprob_seconds,
+            ) = timed_call(
+                lambda: get_current_policy_log_probs(
+                    input_ids,
+                    attention_mask,
+                    actor_logits,
+                )
+            )
+            actor_forward_seconds += logprob_seconds
+            del actor_logits
+            actor_logits = None
+            actor_forward_memory_after = capture_memory_snapshot(actor_backend.device)
 
         # Compute π^train_old logprobs BEFORE optimizer update
         # This is critical for GLM-5 IcePop token gate.
@@ -332,6 +344,7 @@ def optimize_grpo_batch(
                 training_response_log_probs=training_old_response_log_probs,  # π^train_old
                 advantages=advantages,
                 config=grpo_config,  # Pass full config instead of individual parameters
+                current_policy_log_probs=current_policy_log_probs,
             ),
         )
 
@@ -457,4 +470,6 @@ def optimize_grpo_batch(
             del advantages
         if training_old_response_log_probs is not None:
             del training_old_response_log_probs
-        _release_device_cache(actor_backend.device)
+        if current_policy_log_probs is not None:
+            del current_policy_log_probs
+        release_device_cache(actor_backend.device)
