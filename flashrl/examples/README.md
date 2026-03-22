@@ -43,10 +43,6 @@ Example config layout is now explicit:
 - `config-vllm.yaml` is the managed local vLLM variant when the example ships one
 - cluster smoke configs live under `flashrl/platform/dev/`, not under public examples
 
-On macOS and other local low-memory setups, the shipped local Hugging Face
-configs are CPU-first by default. Explicit `device: mps` is still available as
-an advanced opt-in, but it is not the recommended local path.
-
 When a selected example config uses `framework.serving.backend: vllm`, the
 entrypoint will try to auto-fill `FLASHRL_VLLM_PYTHON` when a prepared runtime
 is available.

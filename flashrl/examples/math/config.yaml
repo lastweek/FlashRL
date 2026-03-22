@@ -2,13 +2,11 @@ framework:
   actor:
     model_name: Qwen/Qwen2.5-0.5B-Instruct
     backend: huggingface
-    device: cpu
     num_threads: 1
 
   serving:
     model_name: Qwen/Qwen2.5-0.5B-Instruct
     backend: huggingface
-    device: cpu
     num_threads: 1
     debug_live_rollout: true
 

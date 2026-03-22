@@ -176,31 +176,6 @@ def _render_system_prefixed_prompt(prompt_text: str, system_prompt: str | None) 
     return f"System: {system_prompt}\n\nUser: {prompt_text}"
 
 
-def _math_rollout_prompt_identity(prompt: Prompt) -> str:
-    """Return one short stable prompt identity for console progress lines."""
-    task_id = str(prompt.metadata.get("task_id") or "").strip()
-    if task_id:
-        return task_id
-    raw_identity = str(prompt.metadata.get("problem") or prompt.text).strip()
-    normalized = re.sub(r"\s+", " ", raw_identity)
-    if len(normalized) <= 72:
-        return normalized
-    return normalized[:69] + "..."
-
-
-def _print_math_rollout_progress(
-    *,
-    prompt: Prompt,
-    rollout_mode: str,
-    status: str,
-) -> None:
-    """Emit one concise example-owned prompt progress line."""
-    print(
-        f"math rollout  mode={rollout_mode}  status={status}  "
-        f"prompt={_math_rollout_prompt_identity(prompt)}"
-    )
-
-
 def _resolve_math_training_mode(
     *,
     explicit_training_mode: str | None = None,
@@ -279,43 +254,30 @@ def build_math_whitebox_agent(
     resolved_system_prompt = system_prompt or build_math_system_prompt(training_mode)
 
     def run(agent: Agent) -> None:
-        _print_math_rollout_progress(
-            prompt=agent.prompt,
-            rollout_mode="whitebox",
-            status="start",
-        )
-        try:
-            agent.add_message("system", resolved_system_prompt)
-            while not agent.done:
-                available_tools = agent.available_tools()
-                sample = agent.generate(agent.build_prompt(tools=available_tools))
-                decision = _parse_math_whitebox_response(sample.text)
-                if decision.kind == "action":
-                    if decision.parse_error:
-                        agent.record_generation(sample)
-                        agent.add_message(
-                            "tool",
-                            decision.parse_error,
-                            metadata={
-                                "tool_name": "invalid_action",
-                                "tool_id": uuid4().hex,
-                                "error": True,
-                                "status": "parse_error",
-                            },
-                        )
-                        continue
-                    agent.record_generation(sample, tool_calls=decision.tool_calls)
-                    agent.run_tools(decision.tool_calls, tools=available_tools)
+        agent.add_message("system", resolved_system_prompt)
+        while not agent.done:
+            available_tools = agent.available_tools()
+            sample = agent.generate(agent.build_prompt(tools=available_tools))
+            decision = _parse_math_whitebox_response(sample.text)
+            if decision.kind == "action":
+                if decision.parse_error:
+                    agent.record_generation(sample)
+                    agent.add_message(
+                        "tool",
+                        decision.parse_error,
+                        metadata={
+                            "tool_name": "invalid_action",
+                            "tool_id": uuid4().hex,
+                            "error": True,
+                            "status": "parse_error",
+                        },
+                    )
                     continue
-                agent.record_generation(sample)
-                agent.finish(decision.final_text)
-        finally:
-            if agent.done:
-                _print_math_rollout_progress(
-                    prompt=agent.prompt,
-                    rollout_mode="whitebox",
-                    status="done",
-                )
+                agent.record_generation(sample, tool_calls=decision.tool_calls)
+                agent.run_tools(decision.tool_calls, tools=available_tools)
+                continue
+            agent.record_generation(sample)
+            agent.finish(decision.final_text)
 
     return Agent(
         run_fn=run,
@@ -837,12 +799,6 @@ def reasoning_rollout_fn(
     system_prompt: str | None = None,
 ) -> list[RolloutOutput]:
     """Generate one rollout per prompt with prompt metadata attached."""
-    for prompt in prompts:
-        _print_math_rollout_progress(
-            prompt=prompt,
-            rollout_mode="blackbox",
-            status="start",
-        )
     rendered_prompts = [
         _render_system_prefixed_prompt(prompt.text, system_prompt)
         for prompt in prompts
@@ -874,11 +830,6 @@ def reasoning_rollout_fn(
                 },
                 conversation=Conversation(messages=messages),
             )
-        )
-        _print_math_rollout_progress(
-            prompt=prompt,
-            rollout_mode="blackbox",
-            status="done",
         )
     return rollouts
 

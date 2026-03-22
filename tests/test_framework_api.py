@@ -12,7 +12,6 @@ from types import SimpleNamespace
 
 import pytest
 
-import flashrl.framework.flashrl as flashrl_module
 from flashrl.framework import FlashRL, GrpoConfig, ServingConfig, TrainingConfig
 
 
@@ -218,7 +217,6 @@ def test_run_logger_uses_direct_internal_imports() -> None:
 def test_flashrl_emits_shared_mps_guardrail_warning_for_explicit_shared_mps() -> None:
     """Explicit shared-MPS Hugging Face runs should emit a reliability warning."""
     flashrl = FlashRL.__new__(FlashRL)
-    flashrl.reference_config = None
     flashrl.actor_config = TrainingConfig(model_name="fake/model", device="mps")
     flashrl.serving_config = ServingConfig(model_name="fake/model", device="mps", backend="huggingface")
     flashrl.grpo_config = GrpoConfig(group_size=2, max_new_tokens=384)
@@ -238,53 +236,3 @@ def test_flashrl_emits_shared_mps_guardrail_warning_for_explicit_shared_mps() ->
     assert component == "mps_guardrail"
     assert "device=cpu" in message
     assert "lower grpo.max_new_tokens" in message
-
-
-def test_flashrl_emits_local_mps_policy_warning_on_macos_for_explicit_mps(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """macOS local explicit Hugging Face MPS usage should emit the broader policy warning."""
-    monkeypatch.setattr(flashrl_module.sys, "platform", "darwin")
-    flashrl = FlashRL.__new__(FlashRL)
-    flashrl.actor_config = TrainingConfig(model_name="fake/model", device="mps")
-    flashrl.reference_config = None
-    flashrl.serving_config = ServingConfig(model_name="fake/model", device="cpu", backend="huggingface")
-
-    recorded: list[tuple[str, str, str]] = []
-    flashrl._emit_bootstrap_stage = lambda label, component, message: recorded.append(
-        (label, component, message)
-    )
-
-    flashrl._emit_local_mps_policy_warning()
-
-    assert len(recorded) == 1
-    label, component, message = recorded[0]
-    assert label == "warn"
-    assert component == "mps_local_policy"
-    assert "macOS" in message
-    assert "device=mps" in message
-    assert "device=cpu" in message
-
-
-def test_flashrl_skips_local_mps_policy_warning_outside_macos_or_without_explicit_mps(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    """The local MPS policy warning should stay limited to explicit macOS MPS opt-in."""
-    flashrl = FlashRL.__new__(FlashRL)
-    flashrl.actor_config = TrainingConfig(model_name="fake/model", device="mps")
-    flashrl.reference_config = None
-    flashrl.serving_config = ServingConfig(model_name="fake/model", device="cpu", backend="huggingface")
-
-    recorded: list[tuple[str, str, str]] = []
-    flashrl._emit_bootstrap_stage = lambda label, component, message: recorded.append(
-        (label, component, message)
-    )
-
-    monkeypatch.setattr(flashrl_module.sys, "platform", "linux")
-    flashrl._emit_local_mps_policy_warning()
-    assert recorded == []
-
-    monkeypatch.setattr(flashrl_module.sys, "platform", "darwin")
-    flashrl.actor_config = TrainingConfig(model_name="fake/model", device="cpu")
-    flashrl._emit_local_mps_policy_warning()
-    assert recorded == []
