@@ -45,12 +45,19 @@ python3 -m flashrl.examples.agent_harness.train
 python3 -m flashrl.examples.agent_harness.eval
 ```
 
+The default local config is CPU-first for reliability on Apple Silicon and
+other low-memory local setups. Explicit `device: mps` remains an advanced
+opt-in, not the recommended local path.
+
 Managed local vLLM:
 
 ```bash
 python3 -m flashrl.examples.agent_harness.train --config flashrl/examples/agent_harness/config-vllm.yaml
 python3 -m flashrl.examples.agent_harness.eval --config flashrl/examples/agent_harness/config-vllm.yaml
 ```
+
+`config-vllm.yaml` is the performance-oriented local serving variant. It still
+keeps the local actor on `cpu` by default.
 
 ## Notes
 

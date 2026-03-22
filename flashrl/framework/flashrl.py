@@ -253,6 +253,42 @@ class FlashRL:
         """Print one concise bootstrap stage line."""
         self._emit_bootstrap_console(f"  {label:<8} {component:<17} {message}")
 
+    def _local_mps_policy_message(self) -> str | None:
+        """Return one macOS-local warning for explicit Hugging Face MPS usage."""
+        if sys.platform != "darwin":
+            return None
+
+        explicit_mps_components: list[str] = []
+        for component_name, config in (
+            ("actor", self.actor_config),
+            ("reference", self.reference_config),
+            ("serving", self.serving_config),
+        ):
+            if config is None:
+                continue
+            backend_name = str(getattr(config, "backend", "huggingface"))
+            device_name = str(getattr(config, "device", "") or "").lower()
+            if backend_name != "huggingface" or device_name != "mps":
+                continue
+            explicit_mps_components.append(component_name)
+
+        if not explicit_mps_components:
+            return None
+
+        components = ", ".join(explicit_mps_components)
+        return (
+            "macOS local Hugging Face "
+            f"{components} device=mps is an explicit opt-in and may be slower or less reliable than "
+            "device=cpu on Apple Silicon; prefer device=cpu for local runs."
+        )
+
+    def _emit_local_mps_policy_warning(self) -> None:
+        """Emit one startup warning for explicit macOS-local MPS opt-in usage."""
+        message = self._local_mps_policy_message()
+        if message is None:
+            return
+        self._emit_bootstrap_stage("warn", "mps_local_policy", message)
+
     def _shared_mps_guardrail_message(self) -> str | None:
         """Return one warning message for explicit shared-MPS local training."""
         actor_device = str(self.actor_config.device or "").lower()
@@ -326,6 +362,7 @@ class FlashRL:
         startup_total_seconds = 0.0
         self._apply_random_seed()
         self._emit_bootstrap_banner()
+        self._emit_local_mps_policy_warning()
         self._startup_artifact_dir = Path(
             tempfile.mkdtemp(prefix="flashrl-runtime-")
         ).resolve()

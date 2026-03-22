@@ -33,6 +33,10 @@ Use explicit configuration parameters for full control.
 
 See individual YAML files for complete examples of each preset.
 
+These local preset YAMLs now pin their Hugging Face actor/reference/serving
+sections to `cpu` for reliable local runs. Explicit `device: mps` remains an
+advanced opt-in rather than the recommended default on macOS.
+
 ## Research Paper Reference
 
 These implementations are based on techniques from:

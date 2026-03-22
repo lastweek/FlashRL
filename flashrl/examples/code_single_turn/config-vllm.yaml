@@ -2,6 +2,7 @@ framework:
   actor:
     model_name: Qwen/Qwen2.5-Coder-0.5B
     backend: huggingface
+    device: cpu
     num_threads: 1
 
   serving:

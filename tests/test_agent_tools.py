@@ -644,7 +644,9 @@ def test_math_example_supports_blackbox_and_whitebox_rollout_builders() -> None:
     assert module.calculator_tool({"expression": "20 + 22"}, Prompt(text="prompt")) == "42"
 
 
-def test_math_whitebox_rollout_runs_end_to_end_offline() -> None:
+def test_math_whitebox_rollout_runs_end_to_end_offline(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
     """The math whitebox rollout should execute one tool step then one final step."""
     module = load_script_module(
         "flashrl_reasoning_math_train_whitebox_smoke",
@@ -659,10 +661,13 @@ def test_math_whitebox_rollout_runs_end_to_end_offline() -> None:
     prompt = Prompt(text="Solve 20 + 22", metadata={"final_answer": "42"})
     rollout = module.build_math_whitebox_agent(training_mode="reasoning")([prompt], backend)[0]
     reward = module.math_reward_fn(rollout, training_mode="reasoning")
+    output = capsys.readouterr().out
 
     assert rollout.text == "<think>Use the calculator.</think><answer>42</answer>"
     assert rollout.metadata["assistant_turn_count"] == 2
     assert reward.reward == pytest.approx(1.1)
+    assert "math rollout  mode=whitebox  status=start  prompt=Solve 20 + 22" in output
+    assert "math rollout  mode=whitebox  status=done  prompt=Solve 20 + 22" in output
 
 
 def test_agent_tools_example_runs_and_prints_rollout_json(capsys: pytest.CaptureFixture[str]) -> None:

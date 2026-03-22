@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from flashrl.framework import FlashRL
 from flashrl.framework.agent import (
@@ -294,3 +295,50 @@ def test_agent_harness_examples_do_not_use_private_flashrl_fields() -> None:
 
     assert "_serving_backend" not in eval_text
     assert "_run_logger" not in ablation_train_text
+
+
+def test_local_example_and_preset_configs_pin_cpu_for_mac_friendly_runs() -> None:
+    """Local examples and preset YAMLs should pin local Hugging Face sections to CPU."""
+    framework_yaml_paths = [
+        "flashrl/examples/code_single_turn/config.yaml",
+        "flashrl/examples/code_single_turn/config-vllm.yaml",
+        "flashrl/examples/math/config.yaml",
+        "flashrl/examples/math/config-vllm.yaml",
+        "flashrl/examples/agent_harness/config.yaml",
+        "flashrl/examples/agent_harness/config-vllm.yaml",
+        "flashrl/examples/agent_harness_ablation/config.yaml",
+        "flashrl/examples/agent_harness_ablation/config-vllm.yaml",
+    ]
+    for path in framework_yaml_paths:
+        payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        assert payload["framework"]["actor"]["device"] == "cpu"
+        if payload["framework"]["serving"]["backend"] == "huggingface":
+            assert payload["framework"]["serving"]["device"] == "cpu"
+
+    preset_yaml_paths = [
+        "flashrl/examples/presets/grpo_naive.yaml",
+        "flashrl/examples/presets/deepseek_v3.2.yaml",
+        "flashrl/examples/presets/kimi_k2.5.yaml",
+        "flashrl/examples/presets/glm_5.yaml",
+        "flashrl/examples/presets/custom.yaml",
+    ]
+    for path in preset_yaml_paths:
+        payload = yaml.safe_load(Path(path).read_text(encoding="utf-8"))
+        assert payload["actor"]["device"] == "cpu"
+        if "reference" in payload:
+            assert payload["reference"]["device"] == "cpu"
+        assert payload["serving"]["device"] == "cpu"
+
+
+def test_agent_harness_docs_describe_cpu_first_local_policy() -> None:
+    """Harness and preset docs should match the CPU-first local Mac policy."""
+    harness_readme = Path("flashrl/examples/agent_harness/README.md").read_text(encoding="utf-8")
+    ablation_readme = Path("flashrl/examples/agent_harness_ablation/README.md").read_text(encoding="utf-8")
+    presets_readme = Path("flashrl/examples/presets/README.md").read_text(encoding="utf-8")
+
+    assert "CPU-first" in harness_readme
+    assert "device: mps" in harness_readme
+    assert "CPU-first" in ablation_readme
+    assert "device: mps" in ablation_readme
+    assert "Hugging Face actor/reference/serving" in presets_readme
+    assert "sections to `cpu`" in presets_readme

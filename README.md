@@ -36,6 +36,10 @@ python3 -m flashrl.examples.code_single_turn.train --config flashrl/examples/cod
 python3 -m flashrl.examples.code_single_turn.eval --config flashrl/examples/code_single_turn/config-vllm.yaml
 ```
 
+For macOS local runs, the shipped Hugging Face example configs are CPU-first by
+default. Explicit `device: mps` remains an advanced opt-in and is not the
+recommended local path.
+
 Example docs:
 
 - [flashrl/examples/README.md](flashrl/examples/README.md)

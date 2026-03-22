@@ -2,12 +2,14 @@ framework:
   actor:
     model_name: sshleifer/tiny-gpt2
     backend: huggingface
+    device: cpu
     num_threads: 1
     max_length: 256
 
   serving:
     model_name: sshleifer/tiny-gpt2
     backend: huggingface
+    device: cpu
     num_threads: 1
     max_length: 256
     debug_live_rollout: false

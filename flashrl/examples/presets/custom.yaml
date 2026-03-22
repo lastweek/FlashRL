@@ -7,18 +7,21 @@
 
 actor:
   model_name: Qwen/Qwen2.5-0.5B
+  device: cpu
   num_threads: 1
   backend: huggingface
   dp_size: 1
 
 reference:
   model_name: Qwen/Qwen2.5-0.5B
+  device: cpu
   num_threads: 1
   backend: huggingface
   dp_size: 1
 
 serving:
   model_name: Qwen/Qwen2.5-0.5B
+  device: cpu
   num_threads: 1
   debug_live_rollout: true
 

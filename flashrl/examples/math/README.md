@@ -29,12 +29,20 @@ Default local Hugging Face path:
 python3 -m flashrl.examples.math.train
 ```
 
+The default local config is CPU-first for reliability on Apple Silicon and
+other low-memory local setups. Explicit `device: mps` remains an advanced
+opt-in, not the recommended local path. During rollout, the example also
+prints one concise `math rollout ...` progress line per prompt rollout.
+
 Managed local vLLM:
 
 ```bash
 python3 -m flashrl.examples.math.train --config flashrl/examples/math/config-vllm.yaml
 python3 -m flashrl.examples.math.eval --config flashrl/examples/math/config-vllm.yaml
 ```
+
+`config-vllm.yaml` remains the faster managed-local path when you want serving
+performance over the CPU-first local default.
 
 Whitebox rollout:
 

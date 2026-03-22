@@ -2166,6 +2166,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "code_single_turn/README.md" in docs
     assert "http://localhost:3000" in docs
     assert "tensorboard --logdir logs" in docs
+    assert "CPU-first by default" in docs
     assert "python3 -m flashrl.examples.math.train" in reasoning_docs
     assert "python3 -m flashrl.examples.math.eval" in reasoning_docs
     assert "--profile" not in reasoning_docs
@@ -2180,13 +2181,18 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "rollout_mode: whitebox" in reasoning_docs
     assert "dataset_fn.kwargs.training_mode" in reasoning_docs
     assert "rollout and reward inherit it from prompt metadata by default" in reasoning_docs
+    assert "CPU-first" in reasoning_docs
+    assert "device: mps" in reasoning_docs
+    assert "math rollout" in reasoning_docs
     assert "python3 -m flashrl.examples.code_single_turn.train" in code_basic_docs
     assert "python3 -m flashrl.examples.code_single_turn.eval" in code_basic_docs
-    assert "strict R1-style Codeforces prototype" in code_basic_docs
+    assert "single-turn Codeforces baseline" in code_basic_docs
     assert "--profile" not in code_basic_docs
     assert "--run-timeout-seconds" in code_basic_docs
     assert "config.yaml" in code_basic_docs
     assert "config-vllm.yaml" in code_basic_docs
+    assert "CPU-first" in root_docs
+    assert "device: mps" in root_docs
     assert "http://localhost:9090" in docs
     assert "http://localhost:9091" in docs
     assert "./dev.sh metrics down" in docs
@@ -2224,6 +2230,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "platform:" in example_yaml
     assert "profiles:" not in example_yaml
     assert "Qwen/Qwen2.5-0.5B-Instruct" in example_yaml
+    assert "device: cpu" in example_yaml
     assert "Platform runs take math-example overrides from YAML here" in example_yaml
     assert "rollout and reward inherit `training_mode` from prompt metadata by default" in example_yaml
     assert "whitebox = agentic/traced rollout" in example_yaml
@@ -2231,6 +2238,7 @@ def test_observability_stack_files_and_docs_exist() -> None:
     assert "rollout_mode: whitebox" in example_yaml
     assert "training_mode: math" in example_yaml
     assert example_yaml.count("training_mode:") == 1
+    assert "device: cpu" in example_vllm_yaml
     assert "runtime_python: ${FLASHRL_VLLM_PYTHON}" in example_vllm_yaml
     assert "framework:" in code_example_yaml
     assert "profiles:" not in code_example_yaml

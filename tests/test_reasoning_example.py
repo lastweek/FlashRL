@@ -10,6 +10,7 @@ import sys
 from types import SimpleNamespace
 
 import pytest
+import yaml
 
 from flashrl.framework.data_models import Conversation, Message, Prompt, RolloutOutput
 
@@ -495,6 +496,54 @@ def test_build_math_rollout_infers_training_mode_from_prompt_metadata(
     rollout_fn([prompt], object())
 
     assert seen["system_prompt"] == reasoning_example.build_math_system_prompt("reasoning")
+
+
+def test_math_blackbox_rollout_emits_prompt_progress_lines(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The blackbox math rollout should print one start/done line per prompt rollout."""
+
+    class FakeServingBackend:
+        def generate_batch(self, prompts, **kwargs):
+            del kwargs
+            return [
+                SimpleNamespace(
+                    text="42",
+                    prompt_token_ids=[1, 2, 3],
+                    response_token_ids=[4],
+                    response_token_logprobs=[-0.1],
+                    log_prob=-0.1,
+                    metadata={"finish_reason": "stop"},
+                )
+                for _ in prompts
+            ]
+
+    prompt = make_prompt(training_mode="math")
+    rollout_fn = reasoning_example.build_math_rollout(
+        rollout_mode="blackbox",
+        training_mode="math",
+    )
+
+    rollouts = rollout_fn([prompt], FakeServingBackend())
+    output = capsys.readouterr().out
+
+    assert len(rollouts) == 1
+    assert "math rollout  mode=blackbox  status=start  prompt=gsm8k-train-000000" in output
+    assert "math rollout  mode=blackbox  status=done  prompt=gsm8k-train-000000" in output
+
+
+def test_math_example_default_local_config_is_cpu_first_and_documents_progress() -> None:
+    """The math example should document and configure the reliable local CPU path."""
+    config_payload = yaml.safe_load(
+        Path("flashrl/examples/math/config.yaml").read_text(encoding="utf-8")
+    )
+    framework = config_payload["framework"]
+    assert framework["actor"]["device"] == "cpu"
+    assert framework["serving"]["device"] == "cpu"
+
+    readme = Path("flashrl/examples/math/README.md").read_text(encoding="utf-8")
+    assert "CPU-first" in readme
+    assert "math rollout" in readme
 
 
 def test_extract_answer_block_requires_exactly_one_non_empty_block() -> None:
