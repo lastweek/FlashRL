@@ -2,6 +2,9 @@
 
 This directory contains example configurations demonstrating the new GRPO loss preset system. Each preset implements techniques from different research papers.
 
+For a code-authoritative summary of the implemented building blocks and preset
+behavior, see [docs/grpo-loss-presets.md](../../../docs/grpo-loss-presets.md).
+
 ## Available Presets
 
 ### `grpo_naive` (default)
