@@ -507,30 +507,6 @@ def test_make_code_reward_fn_keeps_absolute_override_outside_run_dir(
     assert not (run_dir / absolute_log_dir.name).exists()
 
 
-def test_make_code_reward_fn_preserves_cwd_default_without_run_dir_resolver(
-    monkeypatch: pytest.MonkeyPatch,
-    tmp_path: Path,
-) -> None:
-    """Eval-style usage should keep the cwd-relative generated_code default."""
-    monkeypatch.chdir(tmp_path)
-    prompt = make_prompt(task_id="codeforces-test-cwd-default", training_mode="reasoning-code")
-    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
-    reward_fn = code_basic.make_code_reward_fn(
-        run_timeout_seconds=1.0,
-        memory_limit_mb=256,
-        training_mode="reasoning-code",
-    )
-
-    reward_fn(
-        make_rollout(
-            prompt,
-            "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
-        )
-    )
-
-    assert len(list((tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))) == 1
-
-
 def test_make_code_reward_fn_rejects_missing_run_dir_when_resolver_is_configured(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -630,6 +606,7 @@ def test_code_basic_cli_help_uses_explicit_flag_surface() -> None:
     assert "--run-timeout-seconds" in eval_help
     assert "--memory-limit-mb" in eval_help
     assert "--max-tests-per-problem" in eval_help
+    assert "--log-dir" in eval_help
 
 
 def test_prepare_code_basic_environment_sets_default_vllm_runtime(
@@ -726,6 +703,200 @@ def test_code_basic_main_reward_fn_resolves_active_run_dir(
     assert len(list((run_dir / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))) == 1
 
 
+def test_code_basic_eval_main_reuses_checkpoint_run_dir_for_generated_code(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Eval should reuse the training run directory recorded in checkpoint metadata."""
+    monkeypatch.chdir(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    run_dir = tmp_path / "logs" / "000123-20260322-010203-fake-model-abcd1234"
+    prompt = make_prompt(task_id="codeforces-test-run-dir", training_mode="reasoning-code")
+    rollout = make_rollout(
+        prompt,
+        "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+    )
+    captured: dict[str, object] = {}
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeFlashRL:
+        def __init__(self, **kwargs) -> None:
+            captured.update(kwargs)
+            self.logging_config = SimpleNamespace(log_dir=tmp_path / "logs")
+            self.actor_config = SimpleNamespace(model_name="fake/model")
+            self._controller = SimpleNamespace(
+                read_checkpoint_metadata=lambda path: {
+                    "run": {"run_dir": str(run_dir)} if path == str(checkpoint_path) else {}
+                }
+            )
+
+        def load_checkpoint(self, path: str) -> None:
+            captured["checkpoint"] = path
+
+        def close(self) -> None:
+            return None
+
+    def fake_evaluate_model(
+        flashrl,
+        rollout_agent,
+        *,
+        dataset,
+        batch_size,
+        reward_fn,
+    ) -> dict[str, float | int]:
+        del flashrl, rollout_agent, dataset, batch_size
+        captured["evaluate_reward_fn"] = reward_fn
+        reward_fn(rollout)
+        return {"sample_count": 1, "reward_mean": 1.1, "pass_rate_mean": 1.0, "solve_rate": 1.0, "format_pass_rate": 1.0, "truncation_rate": 0.0}
+
+    monkeypatch.setattr(code_basic_eval.code_example, "prepare_reasoning_code_environment", lambda config: None)
+    monkeypatch.setattr(code_basic_eval, "FlashRL", FakeFlashRL)
+    monkeypatch.setattr(code_basic_eval.code_example, "build_code_eval_dataset", lambda **kwargs: [prompt])
+    monkeypatch.setattr(code_basic_eval, "evaluate_model", fake_evaluate_model)
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+
+    exit_code = code_basic_eval.main(
+        [
+            "--config",
+            "unused-config.yaml",
+            "--checkpoint",
+            str(checkpoint_path),
+        ]
+    )
+
+    assert exit_code == 0
+    assert captured["reward_fn"] is captured["evaluate_reward_fn"]
+    assert captured["checkpoint"] == str(checkpoint_path)
+    assert len(list((run_dir / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).glob("*.txt"))) == 1
+    assert not (tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).exists()
+
+
+def test_code_basic_eval_main_falls_back_to_new_logs_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Eval should allocate its own logs run directory when no checkpoint run dir is available."""
+    monkeypatch.chdir(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    prompt = make_prompt(task_id="codeforces-test-fallback-run-dir", training_mode="reasoning-code")
+    rollout = make_rollout(
+        prompt,
+        "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+    )
+
+    class FakeFlashRL:
+        def __init__(self, **kwargs) -> None:
+            self.logging_config = SimpleNamespace(log_dir=tmp_path / "logs")
+            self.actor_config = SimpleNamespace(model_name="fake/model")
+            self._controller = SimpleNamespace(read_checkpoint_metadata=lambda path: None)
+
+        def load_checkpoint(self, path: str) -> None:
+            assert path == str(checkpoint_path)
+
+        def close(self) -> None:
+            return None
+
+    def fake_evaluate_model(
+        flashrl,
+        rollout_agent,
+        *,
+        dataset,
+        batch_size,
+        reward_fn,
+    ) -> dict[str, float | int]:
+        del flashrl, rollout_agent, dataset, batch_size
+        reward_fn(rollout)
+        return {"sample_count": 1, "reward_mean": 1.1, "pass_rate_mean": 1.0, "solve_rate": 1.0, "format_pass_rate": 1.0, "truncation_rate": 0.0}
+
+    monkeypatch.setattr(code_basic_eval.code_example, "prepare_reasoning_code_environment", lambda config: None)
+    monkeypatch.setattr(code_basic_eval, "FlashRL", FakeFlashRL)
+    monkeypatch.setattr(code_basic_eval.code_example, "build_code_eval_dataset", lambda **kwargs: [prompt])
+    monkeypatch.setattr(code_basic_eval, "evaluate_model", fake_evaluate_model)
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+
+    exit_code = code_basic_eval.main(
+        [
+            "--config",
+            "unused-config.yaml",
+            "--checkpoint",
+            str(checkpoint_path),
+        ]
+    )
+
+    generated_logs = list((tmp_path / "logs").glob("*/generated_code/*.txt"))
+    assert exit_code == 0
+    assert len(generated_logs) == 1
+    assert "-eval-" in generated_logs[0].parts[-3]
+    assert not (tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).exists()
+
+
+def test_code_basic_eval_main_absolute_log_dir_bypasses_checkpoint_run_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Eval absolute log-dir overrides should bypass any resolved run directory."""
+    monkeypatch.chdir(tmp_path)
+    checkpoint_path = tmp_path / "checkpoint.pt"
+    run_dir = tmp_path / "logs" / "000123-20260322-010203-fake-model-abcd1234"
+    absolute_log_dir = tmp_path / "absolute-eval-output"
+    prompt = make_prompt(task_id="codeforces-test-absolute-log-dir", training_mode="reasoning-code")
+    rollout = make_rollout(
+        prompt,
+        "<think>Use print.</think><answer>```python\nprint(42)\n```</answer>",
+    )
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    class FakeFlashRL:
+        def __init__(self, **kwargs) -> None:
+            self.logging_config = SimpleNamespace(log_dir=tmp_path / "logs")
+            self.actor_config = SimpleNamespace(model_name="fake/model")
+            self._controller = SimpleNamespace(
+                read_checkpoint_metadata=lambda path: {
+                    "run": {"run_dir": str(run_dir)} if path == str(checkpoint_path) else {}
+                }
+            )
+
+        def load_checkpoint(self, path: str) -> None:
+            assert path == str(checkpoint_path)
+
+        def close(self) -> None:
+            return None
+
+    def fake_evaluate_model(
+        flashrl,
+        rollout_agent,
+        *,
+        dataset,
+        batch_size,
+        reward_fn,
+    ) -> dict[str, float | int]:
+        del flashrl, rollout_agent, dataset, batch_size
+        reward_fn(rollout)
+        return {"sample_count": 1, "reward_mean": 1.1, "pass_rate_mean": 1.0, "solve_rate": 1.0, "format_pass_rate": 1.0, "truncation_rate": 0.0}
+
+    monkeypatch.setattr(code_basic_eval.code_example, "prepare_reasoning_code_environment", lambda config: None)
+    monkeypatch.setattr(code_basic_eval, "FlashRL", FakeFlashRL)
+    monkeypatch.setattr(code_basic_eval.code_example, "build_code_eval_dataset", lambda **kwargs: [prompt])
+    monkeypatch.setattr(code_basic_eval, "evaluate_model", fake_evaluate_model)
+    configure_passing_code_execution(monkeypatch, task_id=prompt.metadata["task_id"])
+
+    exit_code = code_basic_eval.main(
+        [
+            "--config",
+            "unused-config.yaml",
+            "--checkpoint",
+            str(checkpoint_path),
+            "--log-dir",
+            str(absolute_log_dir),
+        ]
+    )
+
+    assert exit_code == 0
+    assert len(list(absolute_log_dir.glob("*.txt"))) == 1
+    assert not (run_dir / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).exists()
+    assert not (tmp_path / code_basic.DEFAULT_GENERATED_CODE_LOG_DIR).exists()
+
+
 def test_code_basic_modules_hold_the_actual_logic() -> None:
     """The canonical modules should hold the implementation directly."""
     train_source = Path("flashrl/examples/code_single_turn/train.py").read_text(encoding="utf-8")
@@ -755,6 +926,7 @@ def test_code_basic_default_local_config_is_cpu_first() -> None:
 
 def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """Held-out evaluation should aggregate solve-rate style metrics."""
     prompts = [
@@ -840,15 +1012,19 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
         rollout_config=SimpleNamespace(max_new_tokens=96),
     )
     rollout_agent = code_basic.build_code_agent()
+    reward_fn = code_basic.make_code_reward_fn(
+        run_timeout_seconds=1.0,
+        memory_limit_mb=256,
+        training_mode="reasoning-code",
+        log_dir=tmp_path / "eval-artifacts",
+    )
 
     metrics = code_basic_eval.evaluate_model(
         flashrl,
         rollout_agent,
         dataset=prompts,
         batch_size=2,
-        run_timeout_seconds=1.0,
-        memory_limit_mb=256,
-        training_mode="reasoning-code",
+        reward_fn=reward_fn,
     )
 
     assert flashrl._serving_backend.generation_defaults == {
@@ -866,3 +1042,4 @@ def test_evaluate_model_reports_pass_rate_solve_rate_and_truncation(
         "format_pass_rate": pytest.approx(0.5),
         "truncation_rate": pytest.approx(0.5),
     }
+    assert len(list((tmp_path / "eval-artifacts").glob("*.txt"))) == 2

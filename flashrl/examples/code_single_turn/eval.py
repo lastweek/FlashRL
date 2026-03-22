@@ -3,9 +3,12 @@
 from __future__ import annotations
 
 import argparse
+from datetime import datetime
 import json
 from pathlib import Path
 import sys
+from typing import Any, Callable
+from uuid import uuid4
 
 EXAMPLE_DIR = Path(__file__).resolve().parent
 REPO_ROOT = EXAMPLE_DIR.parents[3]
@@ -17,9 +20,11 @@ for candidate in (REPO_ROOT, EXAMPLE_DIR):
 
 from flashrl.examples.code_single_turn import train as code_example
 
-from flashrl.framework import FlashRL
+from flashrl.framework import FlashRL, log_paths
 from flashrl.framework.agent import Agent
-from flashrl.framework.data_models import Prompt
+from flashrl.framework.data_models import Prompt, RewardOutput, RolloutOutput
+
+EvalRewardFn = Callable[[RolloutOutput], RewardOutput]
 
 
 def evaluate_model(
@@ -28,9 +33,7 @@ def evaluate_model(
     *,
     dataset: list[Prompt],
     batch_size: int,
-    run_timeout_seconds: float,
-    memory_limit_mb: int | None,
-    training_mode: str = "code",
+    reward_fn: EvalRewardFn,
 ) -> dict[str, float | int]:
     """Run held-out evaluation against the current serving backend."""
     if batch_size < 1:
@@ -45,12 +48,6 @@ def evaluate_model(
         top_p=1.0,
         top_k=0,
         do_sample=False,
-    )
-
-    reward_fn = code_example.make_code_reward_fn(
-        run_timeout_seconds=run_timeout_seconds,
-        memory_limit_mb=memory_limit_mb,
-        training_mode=training_mode,
     )
     total_reward = 0.0
     solved = 0
@@ -89,6 +86,58 @@ def evaluate_model(
         "format_pass_rate": format_passes / sample_count,
         "truncation_rate": truncations / sample_count,
     }
+
+
+def _checkpoint_run_dir_from_metadata(checkpoint_metadata: dict[str, Any] | None) -> Path | None:
+    """Return the recorded training run directory when checkpoint metadata exposes it."""
+    if not isinstance(checkpoint_metadata, dict):
+        return None
+    run_info = checkpoint_metadata.get("run")
+    if not isinstance(run_info, dict):
+        return None
+    run_dir = run_info.get("run_dir")
+    if not isinstance(run_dir, str) or not run_dir:
+        return None
+    resolved_run_dir = Path(run_dir)
+    if not resolved_run_dir.exists():
+        return None
+    return resolved_run_dir
+
+
+def _allocate_eval_run_dir(*, log_root: str | Path, model_name: str) -> Path:
+    """Create one per-invocation eval run directory under the configured log root."""
+    resolved_log_root = Path(log_root).expanduser()
+    run_index = log_paths.allocate_run_index(resolved_log_root)
+    run_id = (
+        f"{log_paths.format_run_index(run_index)}-"
+        f"{datetime.now().strftime('%Y%m%d-%H%M%S')}-"
+        f"{log_paths.sanitize_model_name(model_name)}-"
+        f"eval-{uuid4().hex[:8]}"
+    )
+    run_dir = resolved_log_root / run_id
+    run_dir.mkdir(parents=True, exist_ok=True)
+    return run_dir
+
+
+def _resolve_eval_run_dir(
+    flashrl: FlashRL,
+    *,
+    checkpoint: str | None,
+) -> Path:
+    """Resolve the eval artifact run directory from checkpoint metadata or a fresh log run."""
+    if checkpoint:
+        controller = getattr(flashrl, "_controller", None)
+        read_checkpoint_metadata = getattr(controller, "read_checkpoint_metadata", None)
+        if callable(read_checkpoint_metadata):
+            checkpoint_run_dir = _checkpoint_run_dir_from_metadata(
+                read_checkpoint_metadata(str(checkpoint))
+            )
+            if checkpoint_run_dir is not None:
+                return checkpoint_run_dir
+    return _allocate_eval_run_dir(
+        log_root=flashrl.logging_config.log_dir,
+        model_name=flashrl.actor_config.model_name,
+    )
 
 
 def build_argument_parser() -> argparse.ArgumentParser:
@@ -154,6 +203,12 @@ def build_argument_parser() -> argparse.ArgumentParser:
         default="code",
         help="Training mode: 'code' for pure code capability, 'reasoning-code' for reasoning + code",
     )
+    parser.add_argument(
+        "--log-dir",
+        type=str,
+        default=None,
+        help="Directory to save generated code and rewards. Eval defaults to '<run_dir>/generated_code/' under logs/; absolute paths stay absolute.",
+    )
     return parser
 
 
@@ -164,6 +219,11 @@ def main(argv: list[str] | None = None) -> int:
     code_example.prepare_reasoning_code_environment(args.config)
 
     flashrl: FlashRL | None = None
+    resolved_eval_run_dir: Path | None = None
+
+    def resolve_eval_run_dir() -> Path | None:
+        return resolved_eval_run_dir
+
     try:
         rollout_agent = code_example.build_code_agent()
         dataset = code_example.build_code_eval_dataset(
@@ -179,15 +239,24 @@ def main(argv: list[str] | None = None) -> int:
             if default_checkpoint.exists():
                 checkpoint = str(default_checkpoint)
 
+        reward_fn = code_example.make_code_reward_fn(
+            run_timeout_seconds=float(args.run_timeout_seconds),
+            memory_limit_mb=args.memory_limit_mb,
+            training_mode=args.training_mode,
+            log_dir=args.log_dir,
+            run_dir_resolver=resolve_eval_run_dir,
+        )
         flashrl = FlashRL(
             config_path=args.config,
             rollout_fn=rollout_agent,
-            reward_fn=code_example.make_code_reward_fn(
-                run_timeout_seconds=float(args.run_timeout_seconds),
-                memory_limit_mb=args.memory_limit_mb,
-                training_mode=args.training_mode,
-            ),
+            reward_fn=reward_fn,
         )
+        configured_log_dir = Path(args.log_dir) if args.log_dir is not None else None
+        if configured_log_dir is None or not configured_log_dir.is_absolute():
+            resolved_eval_run_dir = _resolve_eval_run_dir(
+                flashrl,
+                checkpoint=checkpoint,
+            )
         if checkpoint:
             flashrl.load_checkpoint(checkpoint)
         metrics = evaluate_model(
@@ -195,9 +264,7 @@ def main(argv: list[str] | None = None) -> int:
             rollout_agent,
             dataset=dataset,
             batch_size=args.batch_size,
-            run_timeout_seconds=float(args.run_timeout_seconds),
-            memory_limit_mb=args.memory_limit_mb,
-            training_mode=args.training_mode,
+            reward_fn=reward_fn,
         )
         print(json.dumps(metrics, ensure_ascii=True, sort_keys=True))
     except Exception as exc:

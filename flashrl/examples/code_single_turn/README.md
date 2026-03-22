@@ -105,9 +105,14 @@ If `--checkpoint` is omitted, evaluation will automatically load
 Outputs:
 
 - training logs are written under `logs/`
-- generated code and reward artifacts go under
+- training generated code and reward artifacts go under
   `logs/<run-id>/generated_code/` by default
-- `--log-dir` overrides only the generated-code artifact location
+- evaluation reuses the checkpoint's training run directory for generated code
+  when checkpoint metadata exposes it; otherwise it creates its own per-run
+  directory under `logs/`
+- `--log-dir` overrides only the generated-code artifact location for both
+  training and eval; absolute paths stay absolute
+- repo-root `generated_code/` is no longer used
 - evaluation prints compact JSON metrics such as solve rate, pass rate, and
   truncation rate
 
